@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch NodePing Agent remote update requests
+
+[Path]
+PathExists=/var/lib/nodeping-agent/update-request.json
+PathChanged=/var/lib/nodeping-agent/update-request.json
+Unit=nodeping-agent-update.service
+
+[Install]
+WantedBy=multi-user.target

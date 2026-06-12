@@ -1,0 +1,10 @@
+[Unit]
+Description=Update NodePing Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/nodeping-agent/nodeping-agent.env
+EnvironmentFile=-/etc/nodeping-agent/nodeping-agent-update.env
+ExecStart=/opt/nodeping-agent/nodeping-agent-update

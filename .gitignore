@@ -1,5 +1,5 @@
 dist/
 .env
-nodeping-agent
+/nodeping-agent
 *.log
 *.tmp
