@@ -97,7 +97,7 @@ fi
 
 if [ ! -f "$ETC_DIR/nodeping-agent-update.env" ]; then
 	install -m 0600 "$SCRIPT_DIR/nodeping-agent-update.env.example" "$ETC_DIR/nodeping-agent-update.env"
-	echo "created $ETC_DIR/nodeping-agent-update.env; edit NODEPING_AGENT_RELEASE_BASE_URL before enabling updates"
+	echo "created $ETC_DIR/nodeping-agent-update.env; edit only if using a custom release source"
 fi
 
 if [ -f "$SCRIPT_DIR/nodeping-agent-docker-update.env.example" ] && [ ! -f "$ETC_DIR/nodeping-agent-docker-update.env" ]; then

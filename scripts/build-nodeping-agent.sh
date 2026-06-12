@@ -52,6 +52,7 @@ mkdir -p "$DIST_DIR"
 rm -f "$DIST_DIR"/nodeping-agent_"$VERSION"_*.tar.gz
 rm -f "$DIST_DIR"/nodeping-agent_"$VERSION"_checksums.txt
 rm -f "$DIST_DIR"/nodeping-agent_"$VERSION"_manifest.json
+rm -f "$DIST_DIR"/latest.txt
 rm -f "$DIST_DIR"/install-release.sh
 rm -f "$DIST_DIR"/compose.yml
 rm -f "$DIST_DIR"/docker.env.example
@@ -141,15 +142,9 @@ EOF
 	echo "built $artifact"
 done
 
-printf '%s\n' "$VERSION" > "$DIST_DIR/latest.txt"
 printf '%s\n' "$VERSION" > "$DIST_DIR/VERSION"
-cp "$ROOT_DIR/deploy/nodeping-agent/install-release.sh" "$DIST_DIR/install-release.sh"
-cp "$ROOT_DIR/deploy/nodeping-agent/compose.yml" "$DIST_DIR/compose.yml"
-cp "$ROOT_DIR/deploy/nodeping-agent/docker.env.example" "$DIST_DIR/docker.env.example"
-cp "$ROOT_DIR/deploy/nodeping-agent/update-docker.sh" "$DIST_DIR/update-docker.sh"
 write_platforms_file "$DIST_DIR/PLATFORMS.md"
 write_release_notes_file "$DIST_DIR/RELEASE_NOTES.md"
-chmod 0755 "$DIST_DIR/install-release.sh" "$DIST_DIR/update-docker.sh"
 {
 	printf '{\n'
 	printf '  "name": "nodeping-agent",\n'

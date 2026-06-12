@@ -1,6 +1,6 @@
 services:
   nodeping-agent:
-    image: ${NODEPING_AGENT_IMAGE:-nodeping-agent}:${NODEPING_AGENT_IMAGE_VERSION:-latest}
+    image: ${NODEPING_AGENT_IMAGE:-ghcr.io/lcy0828/nodeping-agent}:${NODEPING_AGENT_IMAGE_VERSION:-latest}
     restart: unless-stopped
     cap_add:
       - NET_RAW

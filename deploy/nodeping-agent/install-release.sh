@@ -8,9 +8,11 @@ fi
 
 SERVER_URL="${NODEPING_SERVER_URL:-}"
 BINDING_TOKEN="${NODEPING_TOKEN:-}"
-RELEASE_BASE_URL="${NODEPING_AGENT_RELEASE_BASE_URL:-}"
+CUSTOM_RELEASE_BASE_URL="${NODEPING_AGENT_RELEASE_BASE_URL:-}"
+RELEASE_BASE_URL="$CUSTOM_RELEASE_BASE_URL"
 REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
 GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
+GITHUB_API_BASE_URL="${NODEPING_AGENT_GITHUB_API_BASE_URL:-https://api.github.com}"
 AGENT_ID="${NODEPING_AGENT_ID:-$(hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')}"
 AGENT_NAME="${NODEPING_AGENT_NAME:-$(hostname)}"
 ETC_DIR="${ETC_DIR:-/etc/nodeping-agent}"
@@ -111,21 +113,33 @@ env_quote() {
 }
 
 normalize_version() {
-	case "$1" in
-		latest|v*) printf '%s' "$1" ;;
-		[0-9]*) printf 'v%s' "$1" ;;
-		*) printf '%s' "$1" ;;
+	local raw="${1#nodeping-agent/}"
+	case "$raw" in
+		latest|v*) printf '%s' "$raw" ;;
+		[0-9]*) printf 'v%s' "$raw" ;;
+		*) printf '%s' "$raw" ;;
 	esac
 }
 
 default_release_base_url() {
 	local version="$1"
 	local repository="${GITHUB_REPOSITORY#/}"
-	if [ "$version" = "latest" ]; then
-		printf 'https://github.com/%s/releases/latest/download' "$repository"
-	else
-		printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
+	printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
+}
+
+latest_release_version() {
+	local dest="$1/latest-release.json"
+	local repository="${GITHUB_REPOSITORY#/}"
+	local api_base="${GITHUB_API_BASE_URL%/}"
+	download "$api_base/repos/$repository/releases/latest" "$dest"
+	local tag
+	tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
+	tag="$(normalize_version "$tag")"
+	if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
+		echo "failed to resolve latest release from GitHub API for $repository" >&2
+		return 1
 	fi
+	printf '%s' "$tag"
 }
 
 if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
@@ -134,21 +148,26 @@ if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
 fi
 
 REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
-if [ -z "$RELEASE_BASE_URL" ]; then
-	RELEASE_BASE_URL="$(default_release_base_url "$REQUESTED_VERSION")"
-fi
 
 preflight
 
-RELEASE_BASE_URL="${RELEASE_BASE_URL%/}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 version="$REQUESTED_VERSION"
 if [ "$version" = "latest" ]; then
-	download "$RELEASE_BASE_URL/latest.txt" "$tmp_dir/latest.txt"
-	version="$(tr -d '[:space:]' < "$tmp_dir/latest.txt")"
+	version="$(latest_release_version "$tmp_dir")"
 fi
+
+if [ -z "$version" ]; then
+	echo "empty release version" >&2
+	exit 2
+fi
+
+if [ -z "$RELEASE_BASE_URL" ]; then
+	RELEASE_BASE_URL="$(default_release_base_url "$version")"
+fi
+RELEASE_BASE_URL="${RELEASE_BASE_URL%/}"
 
 os="$(detect_os)"
 arch="$(detect_arch)"
@@ -191,7 +210,9 @@ install -m 0600 /dev/null "$ETC_DIR/nodeping-agent.env"
 chmod 0600 "$ETC_DIR/nodeping-agent.env"
 
 {
-	printf 'NODEPING_AGENT_RELEASE_BASE_URL="%s"\n' "$(env_quote "$RELEASE_BASE_URL")"
+	printf 'NODEPING_AGENT_GITHUB_REPOSITORY="%s"\n' "$(env_quote "$GITHUB_REPOSITORY")"
+	printf 'NODEPING_AGENT_GITHUB_API_BASE_URL="%s"\n' "$(env_quote "$GITHUB_API_BASE_URL")"
+	printf 'NODEPING_AGENT_RELEASE_BASE_URL="%s"\n' "$(env_quote "$CUSTOM_RELEASE_BASE_URL")"
 	printf 'NODEPING_AGENT_VERSION="latest"\n'
 	printf 'NODEPING_AGENT_INSTALL_PATH="/opt/nodeping-agent/nodeping-agent"\n'
 	printf 'NODEPING_AGENT_SERVICE="nodeping-agent.service"\n'

@@ -4,6 +4,7 @@ set -euo pipefail
 BASE_URL="${NODEPING_AGENT_RELEASE_BASE_URL:-}"
 REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
 GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
+GITHUB_API_BASE_URL="${NODEPING_AGENT_GITHUB_API_BASE_URL:-https://api.github.com}"
 INSTALL_PATH="${NODEPING_AGENT_INSTALL_PATH:-/opt/nodeping-agent/nodeping-agent}"
 SERVICE_NAME="${NODEPING_AGENT_SERVICE:-nodeping-agent.service}"
 RESTART_SERVICE="${NODEPING_AGENT_RESTART:-1}"
@@ -158,21 +159,33 @@ detect_arch() {
 }
 
 normalize_version() {
-	case "$1" in
-		latest|v*) printf '%s' "$1" ;;
-		[0-9]*) printf 'v%s' "$1" ;;
-		*) printf '%s' "$1" ;;
+	local raw="${1#nodeping-agent/}"
+	case "$raw" in
+		latest|v*) printf '%s' "$raw" ;;
+		[0-9]*) printf 'v%s' "$raw" ;;
+		*) printf '%s' "$raw" ;;
 	esac
 }
 
 default_release_base_url() {
 	local version="$1"
 	local repository="${GITHUB_REPOSITORY#/}"
-	if [ "$version" = "latest" ]; then
-		printf 'https://github.com/%s/releases/latest/download' "$repository"
-	else
-		printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
+	printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
+}
+
+latest_release_version() {
+	local dest="$1/latest-release.json"
+	local repository="${GITHUB_REPOSITORY#/}"
+	local api_base="${GITHUB_API_BASE_URL%/}"
+	download "$api_base/repos/$repository/releases/latest" "$dest"
+	local tag
+	tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
+	tag="$(normalize_version "$tag")"
+	if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
+		echo "failed to resolve latest release from GitHub API for $repository" >&2
+		return 1
 	fi
+	printf '%s' "$tag"
 }
 
 json_file_value() {
@@ -200,24 +213,23 @@ consume_update_request() {
 consume_update_request
 
 REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
-if [ -z "$BASE_URL" ]; then
-	BASE_URL="$(default_release_base_url "$REQUESTED_VERSION")"
-fi
-
-BASE_URL="${BASE_URL%/}"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
 version="$REQUESTED_VERSION"
 if [ "$version" = "latest" ]; then
-	download "$BASE_URL/latest.txt" "$tmp_dir/latest.txt"
-	version="$(tr -d '[:space:]' < "$tmp_dir/latest.txt")"
+	version="$(latest_release_version "$tmp_dir")"
 fi
 
 if [ -z "$version" ]; then
 	echo "empty release version" >&2
 	exit 2
 fi
+
+if [ -z "$BASE_URL" ]; then
+	BASE_URL="$(default_release_base_url "$version")"
+fi
+BASE_URL="${BASE_URL%/}"
 
 TARGET_VERSION="nodeping-agent/$version"
 CURRENT_VERSION="$(current_agent_version || true)"
