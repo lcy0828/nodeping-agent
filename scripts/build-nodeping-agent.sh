@@ -91,7 +91,6 @@ for platform in $PLATFORMS; do
 	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-docker-update.env.example" "$package_dir/nodeping-agent/nodeping-agent-docker-update.env.example"
 	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-docker-update.service" "$package_dir/nodeping-agent/nodeping-agent-docker-update.service"
 	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-docker-update.timer" "$package_dir/nodeping-agent/nodeping-agent-docker-update.timer"
-	cp "$ROOT_DIR/deploy/nodeping-agent/docker-compose.yml" "$package_dir/nodeping-agent/docker-compose.yml"
 	cp "$ROOT_DIR/deploy/nodeping-agent/compose.yml" "$package_dir/nodeping-agent/compose.yml"
 	cp "$ROOT_DIR/deploy/nodeping-agent/docker.env.example" "$package_dir/nodeping-agent/docker.env.example"
 	cp "$ROOT_DIR/deploy/nodeping-agent/install-release.sh" "$package_dir/nodeping-agent/install-release.sh"
