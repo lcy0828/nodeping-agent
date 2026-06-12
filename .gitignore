@@ -1,0 +1,5 @@
+dist/
+.env
+nodeping-agent
+*.log
+*.tmp

@@ -1,0 +1,49 @@
+name: Agent Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: ./scripts/build-nodeping-agent.sh
+
+      - name: Upload GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/nodeping-agent/${{ github.ref_name }}/*
+          generate_release_notes: true
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        env:
+          VERSION: ${{ github.ref_name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          PUSH: "1"
+          PLATFORMS: linux/amd64,linux/arm64
+        run: ./scripts/build-nodeping-agent-image.sh
