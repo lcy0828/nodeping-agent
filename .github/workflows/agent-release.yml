@@ -35,6 +35,26 @@ jobs:
             dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_checksums.txt
           generate_release_notes: true
 
+      - name: Prune non-release assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = context.ref.replace('refs/tags/', '');
+            const release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            const keep = new RegExp(`^nodeping-agent_${tag}_(?:.+\\.tar\\.gz|checksums\\.txt)$`);
+            for (const asset of release.data.assets) {
+              if (!keep.test(asset.name)) {
+                core.info(`Deleting release asset ${asset.name}`);
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: asset.id,
+                });
+              }
+            }
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
