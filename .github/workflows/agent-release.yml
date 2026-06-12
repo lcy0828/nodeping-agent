@@ -30,7 +30,9 @@ jobs:
       - name: Upload GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/nodeping-agent/${{ github.ref_name }}/*
+          files: |
+            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_*.tar.gz
+            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_checksums.txt
           generate_release_notes: true
 
       - name: Set up QEMU

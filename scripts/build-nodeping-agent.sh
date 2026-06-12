@@ -88,7 +88,6 @@ EOF
 	archive_ext="tar.gz"
 	binary_name="nodeping-agent"
 	if [ "$goos" = "windows" ]; then
-		archive_ext="zip"
 		binary_name="nodeping-agent.exe"
 	fi
 	artifact="nodeping-agent_${VERSION}_${target_id}.${archive_ext}"
@@ -132,18 +131,7 @@ EOF
 		"$package_dir/nodeping-agent/update-nodeping-agent.sh" \
 		"$package_dir/nodeping-agent/update-docker.sh"
 
-	if [ "$goos" = "windows" ]; then
-		if ! command -v zip >/dev/null 2>&1; then
-			echo "zip is required to package Windows artifacts" >&2
-			exit 1
-		fi
-		(
-			cd "$package_dir"
-			zip -qr "$DIST_DIR/$artifact" nodeping-agent
-		)
-	else
-		tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
-	fi
+	tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
 	(
 		cd "$DIST_DIR"
 		sha256_file "$artifact"
