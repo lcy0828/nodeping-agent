@@ -173,10 +173,32 @@ default_release_base_url() {
 	printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
 }
 
+latest_redirect_version() {
+	local repository="${GITHUB_REPOSITORY#/}"
+	local latest_url="https://github.com/$repository/releases/latest"
+	local effective tag
+	if command -v curl >/dev/null 2>&1; then
+		effective="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$latest_url" 2>/dev/null || true)"
+	elif command -v wget >/dev/null 2>&1; then
+		effective="$(wget -qS --max-redirect=10 --spider "$latest_url" 2>&1 | awk '/^  Location: / { value=$2 } END { print value }' || true)"
+	fi
+	tag="${effective##*/}"
+	tag="$(normalize_version "$tag")"
+	if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+		printf '%s' "$tag"
+		return 0
+	fi
+	return 1
+}
+
 latest_release_version() {
 	local dest="$1/latest-release.json"
 	local repository="${GITHUB_REPOSITORY#/}"
 	local api_base="${GITHUB_API_BASE_URL%/}"
+	if tag="$(latest_redirect_version)"; then
+		printf '%s' "$tag"
+		return 0
+	fi
 	download "$api_base/repos/$repository/releases/latest" "$dest"
 	local tag
 	tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"

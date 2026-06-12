@@ -34,4 +34,4 @@ jobs:
 
       - name: Build Docker image
         run: |
-          VERSION=ci-${GITHUB_SHA::7} IMAGE=nodeping-agent ./scripts/build-nodeping-agent-image.sh
+          VERSION=ci-${GITHUB_SHA::7} IMAGE=ghcr.io/lcy0828/nodeping-agent ./scripts/build-nodeping-agent-image.sh
