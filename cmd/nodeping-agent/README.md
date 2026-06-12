@@ -75,6 +75,20 @@ dist/nodeping-agent/0.1.0/
 
 默认安装到 `/opt/nodeping-agent/nodeping-agent`，配置保存在 `/etc/nodeping-agent`，运行状态和长期 agent token 保存在 `/var/lib/nodeping-agent`。
 
+从 GitHub Releases 一键安装最新版：
+
+```bash
+curl -fsSL https://github.com/lcy0828/nodeping-agent/releases/latest/download/install-release.sh \
+  | sudo env NODEPING_SERVER_URL='https://your-nodeping.example' NODEPING_TOKEN='np_xxx' bash
+```
+
+安装指定版本：
+
+```bash
+curl -fsSL https://github.com/lcy0828/nodeping-agent/releases/download/v0.0.1/install-release.sh \
+  | sudo env NODEPING_SERVER_URL='https://your-nodeping.example' NODEPING_TOKEN='np_xxx' NODEPING_AGENT_VERSION='v0.0.1' bash
+```
+
 解压 Linux 包后执行：
 
 ```bash

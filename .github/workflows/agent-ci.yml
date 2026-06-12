@@ -29,6 +29,9 @@ jobs:
         run: |
           VERSION=ci-${GITHUB_SHA::7} ./scripts/build-nodeping-agent.sh
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker image
         run: |
           VERSION=ci-${GITHUB_SHA::7} IMAGE=nodeping-agent ./scripts/build-nodeping-agent-image.sh

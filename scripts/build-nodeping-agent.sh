@@ -6,7 +6,7 @@ VERSION="${VERSION:-$(git -C "$ROOT_DIR" describe --tags --always --dirty 2>/dev
 COMMIT="${COMMIT:-$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist/nodeping-agent/$VERSION}"
-PLATFORMS="${PLATFORMS:-linux/amd64 linux/arm64 darwin/amd64 darwin/arm64}"
+PLATFORMS="${PLATFORMS:-linux/amd64 linux/arm64 linux/arm/v7 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64}"
 
 sha256_file() {
 	if command -v sha256sum >/dev/null 2>&1; then
@@ -25,8 +25,11 @@ write_platforms_file() {
 		printf '| --- | --- | --- |\n'
 		printf '| linux | amd64 | systemd and Docker supported |\n'
 		printf '| linux | arm64 | systemd and Docker supported |\n'
+		printf '| linux | armv7 | systemd supported |\n'
 		printf '| darwin | amd64 | manual run only |\n'
-		printf '| darwin | arm64 | manual run only |\n\n'
+		printf '| darwin | arm64 | manual run only |\n'
+		printf '| windows | amd64 | manual run only |\n'
+		printf '| windows | arm64 | manual run only |\n\n'
 		printf 'The agent uses the system `ping` command for ICMP checks. Linux hosts need `iputils-ping` or an equivalent package.\n'
 	} > "$path"
 }
@@ -62,19 +65,43 @@ checksums_file="$DIST_DIR/nodeping-agent_${VERSION}_checksums.txt"
 echo "building nodeping-agent version=$VERSION commit=$COMMIT date=$BUILD_DATE"
 
 for platform in $PLATFORMS; do
-	goos="${platform%/*}"
-	goarch="${platform#*/}"
-	artifact="nodeping-agent_${VERSION}_${goos}_${goarch}.tar.gz"
+	IFS=/ read -r goos goarch variant extra <<EOF
+$platform
+EOF
+	if [ -n "${extra:-}" ] || [ -z "$goos" ] || [ -z "$goarch" ]; then
+		echo "invalid platform: $platform" >&2
+		exit 1
+	fi
+	goarm=""
+	target_id="${goos}_${goarch}"
+	if [ "$goarch" = "arm" ]; then
+		case "${variant:-}" in
+			v*) goarm="${variant#v}" ;;
+			"") goarm=7 ;;
+			*) echo "invalid arm variant in platform: $platform" >&2; exit 1 ;;
+		esac
+		target_id="${goos}_${goarch}v${goarm}"
+	elif [ -n "${variant:-}" ]; then
+		echo "unexpected platform variant: $platform" >&2
+		exit 1
+	fi
+	archive_ext="tar.gz"
+	binary_name="nodeping-agent"
+	if [ "$goos" = "windows" ]; then
+		archive_ext="zip"
+		binary_name="nodeping-agent.exe"
+	fi
+	artifact="nodeping-agent_${VERSION}_${target_id}.${archive_ext}"
 	package_dir="$(mktemp -d)"
 	trap 'rm -rf "$package_dir"' EXIT
 
 	mkdir -p "$package_dir/nodeping-agent"
 	(
 		cd "$ROOT_DIR"
-		GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build \
+		GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=0 go build \
 			-trimpath \
 			-ldflags="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE" \
-			-o "$package_dir/nodeping-agent/nodeping-agent" \
+			-o "$package_dir/nodeping-agent/$binary_name" \
 			./cmd/nodeping-agent
 	)
 
@@ -98,14 +125,25 @@ for platform in $PLATFORMS; do
 	cp "$ROOT_DIR/deploy/nodeping-agent/uninstall-systemd.sh" "$package_dir/nodeping-agent/uninstall-systemd.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/update-nodeping-agent.sh" "$package_dir/nodeping-agent/update-nodeping-agent.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/update-docker.sh" "$package_dir/nodeping-agent/update-docker.sh"
-	chmod 0755 "$package_dir/nodeping-agent/nodeping-agent" \
+	chmod 0755 "$package_dir/nodeping-agent/$binary_name" \
 		"$package_dir/nodeping-agent/install-release.sh" \
 		"$package_dir/nodeping-agent/install-systemd.sh" \
 		"$package_dir/nodeping-agent/uninstall-systemd.sh" \
 		"$package_dir/nodeping-agent/update-nodeping-agent.sh" \
 		"$package_dir/nodeping-agent/update-docker.sh"
 
-	tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
+	if [ "$goos" = "windows" ]; then
+		if ! command -v zip >/dev/null 2>&1; then
+			echo "zip is required to package Windows artifacts" >&2
+			exit 1
+		fi
+		(
+			cd "$package_dir"
+			zip -qr "$DIST_DIR/$artifact" nodeping-agent
+		)
+	else
+		tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
+	fi
 	(
 		cd "$DIST_DIR"
 		sha256_file "$artifact"

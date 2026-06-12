@@ -3,6 +3,7 @@ set -euo pipefail
 
 BASE_URL="${NODEPING_AGENT_RELEASE_BASE_URL:-}"
 REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
+GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
 INSTALL_PATH="${NODEPING_AGENT_INSTALL_PATH:-/opt/nodeping-agent/nodeping-agent}"
 SERVICE_NAME="${NODEPING_AGENT_SERVICE:-nodeping-agent.service}"
 RESTART_SERVICE="${NODEPING_AGENT_RESTART:-1}"
@@ -151,8 +152,27 @@ detect_arch() {
 	case "$(uname -m)" in
 		x86_64|amd64) echo amd64 ;;
 		aarch64|arm64) echo arm64 ;;
+		armv7l|armv7*) echo armv7 ;;
 		*) echo "unsupported arch: $(uname -m)" >&2; return 1 ;;
 	esac
+}
+
+normalize_version() {
+	case "$1" in
+		latest|v*) printf '%s' "$1" ;;
+		[0-9]*) printf 'v%s' "$1" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+default_release_base_url() {
+	local version="$1"
+	local repository="${GITHUB_REPOSITORY#/}"
+	if [ "$version" = "latest" ]; then
+		printf 'https://github.com/%s/releases/latest/download' "$repository"
+	else
+		printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
+	fi
 }
 
 json_file_value() {
@@ -179,9 +199,9 @@ consume_update_request() {
 
 consume_update_request
 
+REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
 if [ -z "$BASE_URL" ]; then
-	echo "NODEPING_AGENT_RELEASE_BASE_URL is required" >&2
-	exit 2
+	BASE_URL="$(default_release_base_url "$REQUESTED_VERSION")"
 fi
 
 BASE_URL="${BASE_URL%/}"

@@ -10,6 +10,7 @@ SERVER_URL="${NODEPING_SERVER_URL:-}"
 BINDING_TOKEN="${NODEPING_TOKEN:-}"
 RELEASE_BASE_URL="${NODEPING_AGENT_RELEASE_BASE_URL:-}"
 REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
+GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
 AGENT_ID="${NODEPING_AGENT_ID:-$(hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')}"
 AGENT_NAME="${NODEPING_AGENT_NAME:-$(hostname)}"
 ETC_DIR="${ETC_DIR:-/etc/nodeping-agent}"
@@ -100,6 +101,7 @@ detect_arch() {
 	case "$(uname -m)" in
 		x86_64|amd64) echo amd64 ;;
 		aarch64|arm64) echo arm64 ;;
+		armv7l|armv7*) echo armv7 ;;
 		*) echo "unsupported arch: $(uname -m)" >&2; return 1 ;;
 	esac
 }
@@ -108,14 +110,32 @@ env_quote() {
 	printf '%s' "$1" | sed 's/[\\"]/\\&/g'
 }
 
+normalize_version() {
+	case "$1" in
+		latest|v*) printf '%s' "$1" ;;
+		[0-9]*) printf 'v%s' "$1" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+default_release_base_url() {
+	local version="$1"
+	local repository="${GITHUB_REPOSITORY#/}"
+	if [ "$version" = "latest" ]; then
+		printf 'https://github.com/%s/releases/latest/download' "$repository"
+	else
+		printf 'https://github.com/%s/releases/download/%s' "$repository" "$version"
+	fi
+}
+
 if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
 	echo "NODEPING_SERVER_URL and NODEPING_TOKEN are required" >&2
 	exit 2
 fi
 
+REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
 if [ -z "$RELEASE_BASE_URL" ]; then
-	echo "NODEPING_AGENT_RELEASE_BASE_URL is required" >&2
-	exit 2
+	RELEASE_BASE_URL="$(default_release_base_url "$REQUESTED_VERSION")"
 fi
 
 preflight

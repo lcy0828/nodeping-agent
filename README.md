@@ -20,6 +20,20 @@ The release installer installs the binary to:
 Configuration is stored in `/etc/nodeping-agent`, and runtime state is stored in
 `/var/lib/nodeping-agent`.
 
+Install from GitHub Releases:
+
+```bash
+curl -fsSL https://github.com/lcy0828/nodeping-agent/releases/latest/download/install-release.sh \
+  | sudo env NODEPING_SERVER_URL='https://your-nodeping.example' NODEPING_TOKEN='np_xxx' bash
+```
+
+Install a pinned version:
+
+```bash
+curl -fsSL https://github.com/lcy0828/nodeping-agent/releases/download/v0.0.1/install-release.sh \
+  | sudo env NODEPING_SERVER_URL='https://your-nodeping.example' NODEPING_TOKEN='np_xxx' NODEPING_AGENT_VERSION='v0.0.1' bash
+```
+
 ## Docker
 
 Release Docker deployments use the standard Docker Compose file name:
