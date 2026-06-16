@@ -21,7 +21,11 @@ RELEASE_BASE_URL="$CUSTOM_RELEASE_BASE_URL"
 REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
 GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
 GITHUB_API_BASE_URL="${NODEPING_AGENT_GITHUB_API_BASE_URL:-https://api.github.com}"
-AGENT_ID="${NODEPING_AGENT_ID:-$(hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')}"
+default_agent_id() {
+	hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | awk 'NF { print; exit } END { if (NR == 0) print "nodeping-agent" }'
+}
+
+AGENT_ID="${NODEPING_AGENT_ID:-$(default_agent_id)}"
 AGENT_NAME="${NODEPING_AGENT_NAME:-$(hostname)}"
 ETC_DIR="${ETC_DIR:-/etc/nodeping-agent}"
 STATE_DIR="${STATE_DIR:-/var/lib/nodeping-agent}"
