@@ -167,19 +167,21 @@ latest_release_version() {
 	local dest="$1/latest-release.json"
 	local repository="${GITHUB_REPOSITORY#/}"
 	local api_base="${GITHUB_API_BASE_URL%/}"
+	local tag
+	if download "$api_base/repos/$repository/releases/latest" "$dest"; then
+		tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
+		tag="$(normalize_version "$tag")"
+		if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
+			printf '%s' "$tag"
+			return 0
+		fi
+	fi
 	if tag="$(latest_redirect_version)"; then
 		printf '%s' "$tag"
 		return 0
 	fi
-	download "$api_base/repos/$repository/releases/latest" "$dest"
-	local tag
-	tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
-	tag="$(normalize_version "$tag")"
-	if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
-		say_err "无法从 GitHub API 解析最新版本：$repository" "failed to resolve latest release from GitHub API for $repository"
-		return 1
-	fi
-	printf '%s' "$tag"
+	say_err "无法从 GitHub API 或 latest 跳转解析最新版本：$repository" "failed to resolve latest release from GitHub API or latest redirect for $repository"
+	return 1
 }
 
 if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
