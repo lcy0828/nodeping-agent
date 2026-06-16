@@ -80,6 +80,17 @@ type registerResponse struct {
 	AgentToken string `json:"agent_token"`
 }
 
+type agentStatusResponse struct {
+	OK           bool      `json:"ok"`
+	Registered   bool      `json:"registered"`
+	StreamOnline bool      `json:"stream_online"`
+	NodeID       int64     `json:"node_id"`
+	NodeStatus   string    `json:"node_status"`
+	AgentStatus  string    `json:"agent_status"`
+	ServerTime   time.Time `json:"server_time"`
+	Message      string    `json:"message"`
+}
+
 type doctorCheck struct {
 	Name    string `json:"name"`
 	Status  string `json:"status"`
@@ -239,6 +250,8 @@ func doctorCheckName(name string) string {
 		return "Token 文件 / token file"
 	case "backend health":
 		return "后端健康 / backend health"
+	case "agent registration":
+		return "Agent 注册 / agent registration"
 	case "upgrade control":
 		return "升级控制 / upgrade control"
 	default:
@@ -312,6 +325,10 @@ func doctorCheckMessage(check doctorCheck) string {
 		return "后端地址为空 / server URL is empty"
 	case strings.HasPrefix(message, "status "):
 		return "HTTP 状态 " + strings.TrimPrefix(message, "status ") + " / " + message
+	case strings.HasPrefix(message, "registered node "):
+		return "已注册节点 / registered node " + strings.TrimPrefix(message, "registered node ")
+	case message == "agent is not registered on this endpoint":
+		return "Agent 尚未注册到当前 Endpoint / agent is not registered on this endpoint"
 	default:
 		return message
 	}
@@ -327,6 +344,7 @@ func collectDoctorChecks(ctx context.Context, cfg config) []doctorCheck {
 		checkPublicIP(ctx),
 		checkAgentTokenFile(cfg),
 		checkBackendHealth(ctx, cfg),
+		checkAgentRegistration(ctx, cfg),
 		checkUpgradeControl(cfg),
 	}
 }
@@ -558,19 +576,65 @@ func heartbeatLoop(ctx context.Context, cfg config) {
 	ticker := time.NewTicker(cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
-		_ = postJSONWithToken(ctx, cfg, cfg.Token, "/api/agent/v1/heartbeat", map[string]any{
+		if err := postAgentJSON(ctx, cfg, "/api/agent/v1/heartbeat", map[string]any{
 			"agent_id":     cfg.AgentID,
 			"agent_token":  cfg.AgentToken,
 			"name":         cfg.Name,
 			"version":      cfg.Version,
 			"capabilities": capabilities,
-		}, nil)
+		}, nil); err != nil {
+			log.Printf("heartbeat failed: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
 	}
+}
+
+func checkAgentRegistration(ctx context.Context, cfg config) doctorCheck {
+	if cfg.ServerURL == "" || cfg.Token == "" || cfg.AgentID == "" {
+		return doctorCheck{Name: "agent registration", Status: "fail", Message: "missing NODEPING_SERVER_URL, NODEPING_TOKEN, or NODEPING_AGENT_ID"}
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	defer cancel()
+	var status agentStatusResponse
+	var lastErr error
+	for attempt := 0; attempt < 6; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-statusCtx.Done():
+				return doctorCheck{Name: "agent registration", Status: "fail", Message: statusCtx.Err().Error()}
+			case <-time.After(2 * time.Second):
+			}
+		}
+		status, lastErr = getAgentStatus(statusCtx, cfg)
+		if lastErr != nil {
+			continue
+		}
+		if status.Registered {
+			message := fmt.Sprintf("registered node %d status=%s agent_status=%s stream=%t", status.NodeID, status.NodeStatus, status.AgentStatus, status.StreamOnline)
+			if !status.StreamOnline {
+				return doctorCheck{Name: "agent registration", Status: "warn", Message: message}
+			}
+			return doctorCheck{Name: "agent registration", Status: "ok", Message: message}
+		}
+		lastErr = errors.New(status.Message)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("agent is not registered on this endpoint")
+	}
+	return doctorCheck{Name: "agent registration", Status: "fail", Message: lastErr.Error()}
+}
+
+func getAgentStatus(ctx context.Context, cfg config) (agentStatusResponse, error) {
+	var out agentStatusResponse
+	path := "/api/agent/v1/status?agent_id=" + url.QueryEscape(cfg.AgentID)
+	if err := getJSONWithToken(ctx, cfg, cfg.Token, path, &out); err != nil {
+		return agentStatusResponse{}, err
+	}
+	return out, nil
 }
 
 func publicIPLoop(ctx context.Context, cfg config) {
@@ -2149,6 +2213,27 @@ func postJSON(ctx context.Context, cfg config, path string, payload any, out any
 
 func postAgentJSON(ctx context.Context, cfg config, path string, payload any, out any) error {
 	return postJSONWithToken(ctx, cfg, cfg.AgentToken, path, payload, out)
+}
+
+func getJSONWithToken(ctx context.Context, cfg config, token string, path string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.ServerURL+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := cfg.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if out != nil {
+		return json.Unmarshal(body, out)
+	}
+	return nil
 }
 
 func postJSONWithToken(ctx context.Context, cfg config, token string, path string, payload any, out any) error {

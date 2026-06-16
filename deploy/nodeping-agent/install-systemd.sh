@@ -141,6 +141,9 @@ if ! grep -Eq 'your-nodeping\.example|np_xxx' "$ETC_DIR/nodeping-agent.env"; the
 		say "nodeping-agent 自检通过" "nodeping-agent doctor passed"
 	else
 		say_err "nodeping-agent 自检发现问题；请检查配置并查看 journalctl -u nodeping-agent" "nodeping-agent doctor reported issues; check configuration and journalctl -u nodeping-agent"
+		systemctl status nodeping-agent.service --no-pager -l >&2 || true
+		journalctl -u nodeping-agent.service -n 60 --no-pager >&2 || true
+		exit 1
 	fi
 else
 	say "nodeping-agent.service 已启用，但因环境文件仍包含占位值未启动" "nodeping-agent.service enabled but not started because env still contains placeholders"
