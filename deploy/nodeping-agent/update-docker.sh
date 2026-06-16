@@ -9,8 +9,16 @@ COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_DIRECTORY/compose.yml}"
 SERVER_URL="${NODEPING_SERVER_URL:-}"
 AGENT_ID="${NODEPING_AGENT_ID:-agent-docker-1}"
 
+say() {
+	printf '%s / %s\n' "$1" "$2"
+}
+
+say_err() {
+	printf '%s / %s\n' "$1" "$2" >&2
+}
+
 if [ ! -f "$ENV_FILE" ]; then
-	echo "env file not found: $ENV_FILE" >&2
+	say_err "未找到环境文件：$ENV_FILE" "env file not found: $ENV_FILE"
 	exit 1
 fi
 
@@ -131,4 +139,5 @@ else
 	emit_upgrade_event "update_succeeded" "$CURRENT_VERSION" "${NEW_VERSION:-$TARGET_VERSION}" "docker deployment updated"
 fi
 
+say "Docker 部署已更新" "docker deployment updated"
 compose ps "$SERVICE"

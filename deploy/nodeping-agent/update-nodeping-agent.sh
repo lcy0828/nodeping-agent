@@ -18,6 +18,14 @@ AGENT_TOKEN="${NODEPING_AGENT_TOKEN:-}"
 AGENT_TOKEN_FILE="${NODEPING_AGENT_TOKEN_FILE:-/var/lib/nodeping-agent/agent-token}"
 UPDATE_REQUEST_FILE="${NODEPING_AGENT_UPDATE_REQUEST_FILE:-${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/var/lib/nodeping-agent/update-request.json}}"
 
+say() {
+	printf '%s / %s\n' "$1" "$2"
+}
+
+say_err() {
+	printf '%s / %s\n' "$1" "$2" >&2
+}
+
 download() {
 	local url="$1"
 	local dest="$2"
@@ -26,7 +34,7 @@ download() {
 	elif command -v wget >/dev/null 2>&1; then
 		wget -qO "$dest" "$url"
 	else
-		echo "curl or wget is required" >&2
+		say_err "需要安装 curl 或 wget" "curl or wget is required"
 		return 1
 	fi
 }
@@ -75,13 +83,13 @@ verify_signature() {
 	local signature_path="$2"
 	if [ -z "$SIGNING_PUBLIC_KEY" ]; then
 		if signature_required; then
-			echo "NODEPING_AGENT_REQUIRE_SIGNATURE=1 but NODEPING_AGENT_MINISIGN_PUBLIC_KEY is empty" >&2
+			say_err "已要求签名校验，但 NODEPING_AGENT_MINISIGN_PUBLIC_KEY 为空" "NODEPING_AGENT_REQUIRE_SIGNATURE=1 but NODEPING_AGENT_MINISIGN_PUBLIC_KEY is empty"
 			return 1
 		fi
 		return 0
 	fi
 	if ! command -v minisign >/dev/null 2>&1; then
-		echo "minisign is required when NODEPING_AGENT_MINISIGN_PUBLIC_KEY is configured" >&2
+		say_err "配置 NODEPING_AGENT_MINISIGN_PUBLIC_KEY 时需要安装 minisign" "minisign is required when NODEPING_AGENT_MINISIGN_PUBLIC_KEY is configured"
 		return 1
 	fi
 	minisign -Vm "$artifact_path" -x "$signature_path" -P "$SIGNING_PUBLIC_KEY"
@@ -114,10 +122,10 @@ restart_with_rollback() {
 	fi
 	systemctl restart "$SERVICE_NAME"
 	if wait_service_active "$SERVICE_NAME" "$START_TIMEOUT_SECONDS"; then
-		echo "restarted $SERVICE_NAME"
+		say "已重启 $SERVICE_NAME" "restarted $SERVICE_NAME"
 		return 0
 	fi
-	echo "$SERVICE_NAME did not become active after update; rolling back" >&2
+	say_err "$SERVICE_NAME 升级后未变为 active，正在回滚" "$SERVICE_NAME did not become active after update; rolling back"
 	emit_upgrade_event "update_failed" "$CURRENT_VERSION" "$TARGET_VERSION" "service did not become active after update"
 	emit_upgrade_event "rollback_started" "$CURRENT_VERSION" "$TARGET_VERSION" "service did not become active"
 	if [ -x "$BACKUP_PATH" ]; then
@@ -145,7 +153,7 @@ detect_os() {
 	case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
 		linux) echo linux ;;
 		darwin) echo darwin ;;
-		*) echo "unsupported OS: $(uname -s)" >&2; return 1 ;;
+		*) say_err "不支持当前系统：$(uname -s)" "unsupported OS: $(uname -s)"; return 1 ;;
 	esac
 }
 
@@ -154,7 +162,7 @@ detect_arch() {
 		x86_64|amd64) echo amd64 ;;
 		aarch64|arm64) echo arm64 ;;
 		armv7l|armv7*) echo armv7 ;;
-		*) echo "unsupported arch: $(uname -m)" >&2; return 1 ;;
+		*) say_err "不支持当前架构：$(uname -m)" "unsupported arch: $(uname -m)"; return 1 ;;
 	esac
 }
 
@@ -204,7 +212,7 @@ latest_release_version() {
 	tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
 	tag="$(normalize_version "$tag")"
 	if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
-		echo "failed to resolve latest release from GitHub API for $repository" >&2
+		say_err "无法从 GitHub API 解析最新版本：$repository" "failed to resolve latest release from GitHub API for $repository"
 		return 1
 	fi
 	printf '%s' "$tag"
@@ -244,7 +252,7 @@ if [ "$version" = "latest" ]; then
 fi
 
 if [ -z "$version" ]; then
-	echo "empty release version" >&2
+	say_err "发布版本为空" "empty release version"
 	exit 2
 fi
 
@@ -270,13 +278,13 @@ fi
 
 expected="$(awk -v file="$artifact" '$2 == file { print $1 }' "$tmp_dir/$checksums")"
 if [ -z "$expected" ]; then
-	echo "checksum for $artifact not found in $checksums" >&2
+	say_err "校验和文件 $checksums 中找不到 $artifact" "checksum for $artifact not found in $checksums"
 	exit 1
 fi
 
 actual="$(sha256_value "$tmp_dir/$artifact")"
 if [ "$actual" != "$expected" ]; then
-	echo "checksum mismatch for $artifact" >&2
+	say_err "$artifact 校验和不匹配" "checksum mismatch for $artifact"
 	exit 1
 fi
 
@@ -284,12 +292,12 @@ mkdir -p "$tmp_dir/extract"
 tar -xzf "$tmp_dir/$artifact" -C "$tmp_dir/extract"
 new_bin="$(find "$tmp_dir/extract" -type f -name nodeping-agent -perm -111 | head -n 1)"
 if [ -z "$new_bin" ]; then
-	echo "nodeping-agent binary not found in $artifact" >&2
+	say_err "$artifact 中未找到 nodeping-agent 二进制" "nodeping-agent binary not found in $artifact"
 	exit 1
 fi
 
 if [ -x "$INSTALL_PATH" ] && cmp -s "$new_bin" "$INSTALL_PATH"; then
-	echo "nodeping-agent is already up to date: $version"
+	say "nodeping-agent 已是最新版本：$version" "nodeping-agent is already up to date: $version"
 	emit_upgrade_event "up_to_date" "$CURRENT_VERSION" "$TARGET_VERSION" "binary already matches requested version"
 	exit 0
 fi
@@ -298,12 +306,12 @@ emit_upgrade_event "update_started" "$CURRENT_VERSION" "$TARGET_VERSION" "instal
 
 if [ -x "$INSTALL_PATH" ]; then
 	install -m 0755 "$INSTALL_PATH" "$BACKUP_PATH"
-	echo "backed up previous nodeping-agent to $BACKUP_PATH"
+	say "已备份旧版 nodeping-agent 到 $BACKUP_PATH" "backed up previous nodeping-agent to $BACKUP_PATH"
 fi
 
 install -m 0755 "$new_bin" "$INSTALL_PATH.new"
 mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
-echo "installed nodeping-agent $version to $INSTALL_PATH"
+say "已安装 nodeping-agent $version 到 $INSTALL_PATH" "installed nodeping-agent $version to $INSTALL_PATH"
 
 if restart_with_rollback; then
 	emit_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$TARGET_VERSION" "update completed"

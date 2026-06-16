@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+say() {
+	printf '%s / %s\n' "$1" "$2"
+}
+
+say_err() {
+	printf '%s / %s\n' "$1" "$2" >&2
+}
+
+systemctl_quiet() {
+	local output
+	if ! output="$(systemctl "$@" 2>&1)"; then
+		if [ -n "$output" ]; then
+			printf '%s\n' "$output" >&2
+		fi
+		return 1
+	fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
-	echo "run this installer as root, for example: curl ... | sudo env NODEPING_SERVER_URL=... NODEPING_TOKEN=... bash" >&2
+	say_err "请以 root 运行安装器，例如：curl ... | sudo env NODEPING_SERVER_URL=... NODEPING_TOKEN=... bash" "run this installer as root, for example: curl ... | sudo env NODEPING_SERVER_URL=... NODEPING_TOKEN=... bash"
 	exit 1
 fi
 
@@ -21,7 +39,7 @@ STATE_DIR="${STATE_DIR:-/var/lib/nodeping-agent}"
 require_command() {
 	local name="$1"
 	if ! command -v "$name" >/dev/null 2>&1; then
-		echo "required command not found: $name" >&2
+		say_err "缺少必需命令：$name" "required command not found: $name"
 		exit 1
 	fi
 }
@@ -31,11 +49,11 @@ preflight() {
 	require_command awk
 	require_command systemctl
 	if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-		echo "curl or wget is required" >&2
+		say_err "需要安装 curl 或 wget" "curl or wget is required"
 		exit 1
 	fi
 	if ! command -v ping >/dev/null 2>&1; then
-		echo "ping command not found; install iputils-ping/iputils before running ICMP checks" >&2
+		say_err "未找到 ping 命令；运行 ICMP 检测前请安装 iputils-ping/iputils" "ping command not found; install iputils-ping/iputils before running ICMP checks"
 		exit 1
 	fi
 }
@@ -48,7 +66,7 @@ download() {
 	elif command -v wget >/dev/null 2>&1; then
 		wget -qO "$dest" "$url"
 	else
-		echo "curl or wget is required" >&2
+		say_err "需要安装 curl 或 wget" "curl or wget is required"
 		return 1
 	fi
 }
@@ -69,14 +87,14 @@ verify_signature() {
 	if [ -z "$public_key" ]; then
 		case "$(printf '%s' "$require_signature" | tr '[:upper:]' '[:lower:]')" in
 			1|true|yes|on)
-			echo "NODEPING_AGENT_REQUIRE_SIGNATURE=1 but NODEPING_AGENT_MINISIGN_PUBLIC_KEY is empty" >&2
+			say_err "已要求签名校验，但 NODEPING_AGENT_MINISIGN_PUBLIC_KEY 为空" "NODEPING_AGENT_REQUIRE_SIGNATURE=1 but NODEPING_AGENT_MINISIGN_PUBLIC_KEY is empty"
 			return 1
 			;;
 		esac
 		return 0
 	fi
 	if ! command -v minisign >/dev/null 2>&1; then
-		echo "minisign is required when NODEPING_AGENT_MINISIGN_PUBLIC_KEY is configured" >&2
+		say_err "配置 NODEPING_AGENT_MINISIGN_PUBLIC_KEY 时需要安装 minisign" "minisign is required when NODEPING_AGENT_MINISIGN_PUBLIC_KEY is configured"
 		return 1
 	fi
 	minisign -Vm "$artifact_path" -x "$signature_path" -P "$public_key"
@@ -95,7 +113,7 @@ signature_required() {
 detect_os() {
 	case "$(uname -s | tr '[:upper:]' '[:lower:]')" in
 		linux) echo linux ;;
-		*) echo "unsupported OS for systemd installer: $(uname -s)" >&2; return 1 ;;
+		*) say_err "systemd 安装器不支持当前系统：$(uname -s)" "unsupported OS for systemd installer: $(uname -s)"; return 1 ;;
 	esac
 }
 
@@ -104,7 +122,7 @@ detect_arch() {
 		x86_64|amd64) echo amd64 ;;
 		aarch64|arm64) echo arm64 ;;
 		armv7l|armv7*) echo armv7 ;;
-		*) echo "unsupported arch: $(uname -m)" >&2; return 1 ;;
+		*) say_err "不支持当前架构：$(uname -m)" "unsupported arch: $(uname -m)"; return 1 ;;
 	esac
 }
 
@@ -158,14 +176,14 @@ latest_release_version() {
 	tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
 	tag="$(normalize_version "$tag")"
 	if [ -z "$tag" ] || [ "$tag" = "latest" ]; then
-		echo "failed to resolve latest release from GitHub API for $repository" >&2
+		say_err "无法从 GitHub API 解析最新版本：$repository" "failed to resolve latest release from GitHub API for $repository"
 		return 1
 	fi
 	printf '%s' "$tag"
 }
 
 if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
-	echo "NODEPING_SERVER_URL and NODEPING_TOKEN are required" >&2
+	say_err "必须提供 NODEPING_SERVER_URL 和 NODEPING_TOKEN" "NODEPING_SERVER_URL and NODEPING_TOKEN are required"
 	exit 2
 fi
 
@@ -182,7 +200,7 @@ if [ "$version" = "latest" ]; then
 fi
 
 if [ -z "$version" ]; then
-	echo "empty release version" >&2
+	say_err "发布版本为空" "empty release version"
 	exit 2
 fi
 
@@ -204,13 +222,13 @@ fi
 
 expected="$(awk -v file="$artifact" '$2 == file { print $1 }' "$tmp_dir/$checksums")"
 if [ -z "$expected" ]; then
-	echo "checksum for $artifact not found in $checksums" >&2
+	say_err "校验和文件 $checksums 中找不到 $artifact" "checksum for $artifact not found in $checksums"
 	exit 1
 fi
 
 actual="$(sha256_value "$tmp_dir/$artifact")"
 if [ "$actual" != "$expected" ]; then
-	echo "checksum mismatch for $artifact" >&2
+	say_err "$artifact 校验和不匹配" "checksum mismatch for $artifact"
 	exit 1
 fi
 
@@ -246,5 +264,6 @@ chmod 0600 "$ETC_DIR/nodeping-agent.env"
 chmod 0600 "$ETC_DIR/nodeping-agent-update.env"
 
 "$tmp_dir/nodeping-agent/install-systemd.sh" "$tmp_dir/nodeping-agent/nodeping-agent"
-systemctl enable --now nodeping-agent-update.timer
-echo "nodeping-agent installed and auto update timer enabled"
+systemctl_quiet enable --now nodeping-agent-update.timer
+say "自动升级 timer 已启用" "auto update timer enabled"
+say "nodeping-agent 已安装，自动升级已启用" "nodeping-agent installed and auto update timer enabled"

@@ -1,8 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+say() {
+	printf '%s / %s\n' "$1" "$2"
+}
+
+say_err() {
+	printf '%s / %s\n' "$1" "$2" >&2
+}
+
+systemctl_quiet() {
+	local output
+	if ! output="$(systemctl "$@" 2>&1)"; then
+		if [ -n "$output" ]; then
+			printf '%s\n' "$output" >&2
+		fi
+		return 1
+	fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
-	echo "run this installer as root, for example: sudo ./install-systemd.sh" >&2
+	say_err "请以 root 运行安装器，例如：sudo ./install-systemd.sh" "run this installer as root, for example: sudo ./install-systemd.sh"
 	exit 1
 fi
 
@@ -18,7 +36,7 @@ SERVICE_GROUP="${SERVICE_GROUP:-nodeping-agent}"
 require_command() {
 	local name="$1"
 	if ! command -v "$name" >/dev/null 2>&1; then
-		echo "required command not found: $name" >&2
+		say_err "缺少必需命令：$name" "required command not found: $name"
 		exit 1
 	fi
 }
@@ -30,26 +48,28 @@ preflight() {
 	require_command useradd
 	require_command install
 	if ! command -v ping >/dev/null 2>&1; then
-		echo "ping command not found; install iputils-ping/iputils before running ICMP checks" >&2
+		say_err "未找到 ping 命令；运行 ICMP 检测前请安装 iputils-ping/iputils" "ping command not found; install iputils-ping/iputils before running ICMP checks"
 		exit 1
 	fi
 	if ! systemctl list-unit-files >/dev/null 2>&1; then
-		echo "systemd is required for this installer" >&2
+		say_err "此安装器需要 systemd" "systemd is required for this installer"
 		exit 1
 	fi
 }
 
 if [ ! -x "$SOURCE_BIN" ]; then
-	echo "agent binary not found or not executable: $SOURCE_BIN" >&2
+	say_err "未找到 agent 二进制或文件不可执行：$SOURCE_BIN" "agent binary not found or not executable: $SOURCE_BIN"
 	exit 1
 fi
 
 preflight
 
 if [ -x "$INSTALL_BIN" ]; then
-	echo "current installed version: $("$INSTALL_BIN" -version 2>/dev/null || true)"
+	current_version="$("$INSTALL_BIN" -version 2>/dev/null || true)"
+	say "当前已安装版本：$current_version" "current installed version: $current_version"
 fi
-echo "installing version: $("$SOURCE_BIN" -version 2>/dev/null || true)"
+installing_version="$("$SOURCE_BIN" -version 2>/dev/null || true)"
+say "正在安装版本：$installing_version" "installing version: $installing_version"
 
 if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
 	groupadd --system "$SERVICE_GROUP"
@@ -92,42 +112,43 @@ fi
 
 if [ ! -f "$ETC_DIR/nodeping-agent.env" ]; then
 	install -m 0600 "$SCRIPT_DIR/nodeping-agent.env.example" "$ETC_DIR/nodeping-agent.env"
-	echo "created $ETC_DIR/nodeping-agent.env; edit NODEPING_SERVER_URL and NODEPING_TOKEN before starting"
+	say "已创建 $ETC_DIR/nodeping-agent.env；启动前请编辑 NODEPING_SERVER_URL 和 NODEPING_TOKEN" "created $ETC_DIR/nodeping-agent.env; edit NODEPING_SERVER_URL and NODEPING_TOKEN before starting"
 fi
 
 if [ ! -f "$ETC_DIR/nodeping-agent-update.env" ]; then
 	install -m 0600 "$SCRIPT_DIR/nodeping-agent-update.env.example" "$ETC_DIR/nodeping-agent-update.env"
-	echo "created $ETC_DIR/nodeping-agent-update.env; edit only if using a custom release source"
+	say "已创建 $ETC_DIR/nodeping-agent-update.env；仅在使用自定义发布源时需要编辑" "created $ETC_DIR/nodeping-agent-update.env; edit only if using a custom release source"
 fi
 
 if [ -f "$SCRIPT_DIR/nodeping-agent-docker-update.env.example" ] && [ ! -f "$ETC_DIR/nodeping-agent-docker-update.env" ]; then
 	install -m 0600 "$SCRIPT_DIR/nodeping-agent-docker-update.env.example" "$ETC_DIR/nodeping-agent-docker-update.env"
 fi
 
-systemctl daemon-reload
-systemctl enable nodeping-agent.service
-systemctl enable --now nodeping-agent-update.path
+systemctl_quiet daemon-reload
+systemctl_quiet enable nodeping-agent.service
+say "nodeping-agent.service 已启用" "nodeping-agent.service enabled"
+systemctl_quiet enable --now nodeping-agent-update.path
+say "远程升级监听已启用：nodeping-agent-update.path" "remote update watcher enabled: nodeping-agent-update.path"
 
 if ! grep -Eq 'your-nodeping\.example|np_xxx' "$ETC_DIR/nodeping-agent.env"; then
-	systemctl restart nodeping-agent.service
-	echo "nodeping-agent.service started"
+	systemctl_quiet restart nodeping-agent.service
+	say "nodeping-agent.service 已启动" "nodeping-agent.service started"
 	set -a
 	# shellcheck disable=SC1090
 	. "$ETC_DIR/nodeping-agent.env"
 	set +a
 	if "$INSTALL_BIN" -doctor; then
-		echo "nodeping-agent doctor passed"
+		say "nodeping-agent 自检通过" "nodeping-agent doctor passed"
 	else
-		echo "nodeping-agent doctor reported issues; check configuration and journalctl -u nodeping-agent" >&2
+		say_err "nodeping-agent 自检发现问题；请检查配置并查看 journalctl -u nodeping-agent" "nodeping-agent doctor reported issues; check configuration and journalctl -u nodeping-agent"
 	fi
 else
-	echo "nodeping-agent.service enabled but not started because env still contains placeholders"
+	say "nodeping-agent.service 已启用，但因环境文件仍包含占位值未启动" "nodeping-agent.service enabled but not started because env still contains placeholders"
 fi
 
 if [ "${ENABLE_UPDATER:-0}" = "1" ]; then
-	systemctl enable --now nodeping-agent-update.timer
-	echo "nodeping-agent-update.timer enabled"
+	systemctl_quiet enable --now nodeping-agent-update.timer
+	say "nodeping-agent-update.timer 已启用" "nodeping-agent-update.timer enabled"
 else
-	echo "auto update units installed; enable with: systemctl enable --now nodeping-agent-update.timer"
+	say "自动升级单元已安装；可执行 systemctl enable --now nodeping-agent-update.timer 启用" "auto update units installed; enable with: systemctl enable --now nodeping-agent-update.timer"
 fi
-echo "remote update watcher enabled: nodeping-agent-update.path"

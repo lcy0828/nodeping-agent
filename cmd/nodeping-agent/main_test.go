@@ -60,6 +60,20 @@ func TestDoctorConfigReportsMissingRequiredValues(t *testing.T) {
 	}
 }
 
+func TestFormatDoctorCheckBilingual(t *testing.T) {
+	line := formatDoctorCheck(doctorCheck{Name: "backend health", Status: "ok", Message: "http://127.0.0.1:8099"})
+	for _, want := range []string{"后端健康", "backend health", "正常", "ok", "http://127.0.0.1:8099"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("formatDoctorCheck()=%q, missing %q", line, want)
+		}
+	}
+
+	missingLine := formatDoctorCheck(doctorCheck{Name: "config", Status: "fail", Message: "missing NODEPING_SERVER_URL, NODEPING_TOKEN"})
+	if !strings.Contains(missingLine, "缺少 NODEPING_SERVER_URL, NODEPING_TOKEN") || !strings.Contains(missingLine, "missing NODEPING_SERVER_URL, NODEPING_TOKEN") {
+		t.Fatalf("missing config line is not bilingual: %q", missingLine)
+	}
+}
+
 func TestDoctorAgentTokenFileWritable(t *testing.T) {
 	check := checkAgentTokenFile(config{AgentTokenFile: filepath.Join(t.TempDir(), "agent-token")})
 	if check.Status != "ok" {

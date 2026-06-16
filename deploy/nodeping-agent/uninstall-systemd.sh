@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+say() {
+	printf '%s / %s\n' "$1" "$2"
+}
+
+say_err() {
+	printf '%s / %s\n' "$1" "$2" >&2
+}
+
 if [ "$(id -u)" -ne 0 ]; then
-	echo "run this uninstaller as root, for example: sudo ./uninstall-systemd.sh" >&2
+	say_err "请以 root 运行卸载器，例如：sudo ./uninstall-systemd.sh" "run this uninstaller as root, for example: sudo ./uninstall-systemd.sh"
 	exit 1
 fi
 
@@ -40,17 +48,17 @@ systemctl daemon-reload
 if [ "$REMOVE_CONFIG" = "1" ]; then
 	rm -rf "$ETC_DIR"
 else
-	echo "kept config directory: $ETC_DIR"
+	say "已保留配置目录：$ETC_DIR" "kept config directory: $ETC_DIR"
 fi
 
 if [ "$REMOVE_STATE" = "1" ]; then
 	rm -rf "$STATE_DIR"
 else
-	echo "kept state directory: $STATE_DIR"
+	say "已保留状态目录：$STATE_DIR" "kept state directory: $STATE_DIR"
 fi
 
 if [ "$REMOVE_USER" = "1" ] && id -u "$SERVICE_USER" >/dev/null 2>&1; then
 	userdel "$SERVICE_USER" >/dev/null 2>&1 || true
 fi
 
-echo "nodeping-agent systemd deployment removed"
+say "nodeping-agent systemd 部署已移除" "nodeping-agent systemd deployment removed"
