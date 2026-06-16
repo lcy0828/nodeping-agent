@@ -9,16 +9,6 @@ say_err() {
 	printf '%s / %s\n' "$1" "$2" >&2
 }
 
-systemctl_quiet() {
-	local output
-	if ! output="$(systemctl "$@" 2>&1)"; then
-		if [ -n "$output" ]; then
-			printf '%s\n' "$output" >&2
-		fi
-		return 1
-	fi
-}
-
 if [ "$(id -u)" -ne 0 ]; then
 	say_err "请以 root 运行安装器，例如：curl ... | sudo env NODEPING_SERVER_URL=... NODEPING_TOKEN=... bash" "run this installer as root, for example: curl ... | sudo env NODEPING_SERVER_URL=... NODEPING_TOKEN=... bash"
 	exit 1
@@ -67,6 +57,18 @@ download() {
 		wget -qO "$dest" "$url"
 	else
 		say_err "需要安装 curl 或 wget" "curl or wget is required"
+		return 1
+	fi
+}
+
+download_quiet() {
+	local url="$1"
+	local dest="$2"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL "$url" -o "$dest" 2>/dev/null
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$dest" "$url" 2>/dev/null
+	else
 		return 1
 	fi
 }
@@ -168,7 +170,7 @@ latest_release_version() {
 	local repository="${GITHUB_REPOSITORY#/}"
 	local api_base="${GITHUB_API_BASE_URL%/}"
 	local tag
-	if download "$api_base/repos/$repository/releases/latest" "$dest"; then
+	if download_quiet "$api_base/repos/$repository/releases/latest" "$dest"; then
 		tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
 		tag="$(normalize_version "$tag")"
 		if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
@@ -265,7 +267,5 @@ chmod 0600 "$ETC_DIR/nodeping-agent.env"
 } > "$ETC_DIR/nodeping-agent-update.env"
 chmod 0600 "$ETC_DIR/nodeping-agent-update.env"
 
-"$tmp_dir/nodeping-agent/install-systemd.sh" "$tmp_dir/nodeping-agent/nodeping-agent"
-systemctl_quiet enable --now nodeping-agent-update.timer
-say "自动升级 timer 已启用" "auto update timer enabled"
+ENABLE_UPDATER=1 "$tmp_dir/nodeping-agent/install-systemd.sh" "$tmp_dir/nodeping-agent/nodeping-agent"
 say "nodeping-agent 已安装，自动升级已启用" "nodeping-agent installed and auto update timer enabled"

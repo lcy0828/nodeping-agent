@@ -39,6 +39,18 @@ download() {
 	fi
 }
 
+download_quiet() {
+	local url="$1"
+	local dest="$2"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL "$url" -o "$dest" 2>/dev/null
+	elif command -v wget >/dev/null 2>&1; then
+		wget -qO "$dest" "$url" 2>/dev/null
+	else
+		return 1
+	fi
+}
+
 current_agent_version() {
 	if [ -x "$INSTALL_PATH" ]; then
 		"$INSTALL_PATH" -version 2>/dev/null | sed -n 's/.*version=\([^ ]*\).*/nodeping-agent\/\1/p' | head -n 1
@@ -204,7 +216,7 @@ latest_release_version() {
 	local repository="${GITHUB_REPOSITORY#/}"
 	local api_base="${GITHUB_API_BASE_URL%/}"
 	local tag
-	if download "$api_base/repos/$repository/releases/latest" "$dest"; then
+	if download_quiet "$api_base/repos/$repository/releases/latest" "$dest"; then
 		tag="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$dest" | head -n 1)"
 		tag="$(normalize_version "$tag")"
 		if [ -n "$tag" ] && [ "$tag" != "latest" ]; then
