@@ -7,7 +7,7 @@ SERVICE="${SERVICE:-nodeping-agent}"
 PROJECT_DIRECTORY="${PROJECT_DIRECTORY:-$SCRIPT_DIR}"
 COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_DIRECTORY/compose.yml}"
 SERVER_URL="${NODEPING_SERVER_URL:-}"
-AGENT_ID="${NODEPING_AGENT_ID:-agent-docker-1}"
+AGENT_ID="${NODEPING_AGENT_ID:-}"
 
 say() {
 	printf '%s / %s\n' "$1" "$2"
@@ -37,7 +37,7 @@ dotenv_value() {
 if [ -z "$SERVER_URL" ]; then
 	SERVER_URL="$(dotenv_value NODEPING_SERVER_URL)"
 fi
-if [ "$AGENT_ID" = "agent-docker-1" ]; then
+if [ -z "$AGENT_ID" ]; then
 	env_agent_id="$(dotenv_value NODEPING_AGENT_ID)"
 	if [ -n "$env_agent_id" ]; then
 		AGENT_ID="$env_agent_id"
@@ -88,6 +88,14 @@ container_agent_token() {
 	fi
 }
 
+container_agent_id() {
+	local id="$1"
+	if [ -z "$id" ]; then
+		return 0
+	fi
+	docker exec "$id" /bin/sh -c 'printf "%s" "$NODEPING_AGENT_ID"' 2>/dev/null || true
+}
+
 json_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g; s/\n/ /g'
 }
@@ -99,11 +107,15 @@ emit_upgrade_event() {
 	local message="${4:-}"
 	local token
 	token="$(container_agent_token "$(container_id)" || true)"
-	if [ -z "$SERVER_URL" ] || [ -z "$token" ]; then
+	local agent_id="$AGENT_ID"
+	if [ -z "$agent_id" ]; then
+		agent_id="$(container_agent_id "$(container_id)" || true)"
+	fi
+	if [ -z "$SERVER_URL" ] || [ -z "$token" ] || [ -z "$agent_id" ]; then
 		return 0
 	fi
 	local payload
-	payload="{\"agent_id\":\"$(json_escape "$AGENT_ID")\",\"event\":\"$(json_escape "$event")\",\"from_version\":\"$(json_escape "$from_version")\",\"to_version\":\"$(json_escape "$to_version")\",\"message\":\"$(json_escape "$message")\"}"
+	payload="{\"agent_id\":\"$(json_escape "$agent_id")\",\"event\":\"$(json_escape "$event")\",\"from_version\":\"$(json_escape "$from_version")\",\"to_version\":\"$(json_escape "$to_version")\",\"message\":\"$(json_escape "$message")\"}"
 	if command -v curl >/dev/null 2>&1; then
 		curl -fsS -m 8 -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
 	elif command -v wget >/dev/null 2>&1; then

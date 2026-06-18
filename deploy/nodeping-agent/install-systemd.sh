@@ -41,6 +41,65 @@ require_command() {
 	fi
 }
 
+systemd_version() {
+	local version
+	version="$(systemctl --version 2>/dev/null | awk 'NR==1 { print $2 }')"
+	case "$version" in
+		''|*[!0-9]*) printf '0\n' ;;
+		*) printf '%s\n' "$version" ;;
+	esac
+}
+
+write_agent_service() {
+	local target="$1"
+	local version="$2"
+	{
+		cat <<UNIT
+[Unit]
+Description=NodePing Agent
+Documentation=file:$ETC_DIR/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP
+EnvironmentFile=$ETC_DIR/nodeping-agent.env
+ExecStart=$INSTALL_BIN
+Restart=always
+RestartSec=5s
+WorkingDirectory=$STATE_DIR
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+UNIT
+		if [ "$version" -ge 231 ]; then
+			printf 'RuntimeDirectory=nodeping-agent\n'
+			printf 'CapabilityBoundingSet=CAP_NET_RAW\n'
+			printf 'AmbientCapabilities=CAP_NET_RAW\n'
+		fi
+		if [ "$version" -ge 232 ]; then
+			printf 'ProtectSystem=strict\n'
+			printf 'ReadWritePaths=%s\n' "$STATE_DIR"
+		else
+			printf 'ProtectSystem=full\n'
+		fi
+		if [ "$version" -ge 235 ]; then
+			printf 'StateDirectory=nodeping-agent\n'
+		fi
+		if [ "$version" -ge 242 ]; then
+			printf 'LockPersonality=true\n'
+		fi
+		cat <<'UNIT'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+	} > "$target"
+}
+
 preflight() {
 	require_command systemctl
 	require_command getent
@@ -87,7 +146,10 @@ install -d -m 0755 "$ETC_DIR"
 install -d -m 0755 "$INSTALL_DIR"
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$STATE_DIR"
 install -m 0755 "$SOURCE_BIN" "$INSTALL_BIN"
-install -m 0644 "$SCRIPT_DIR/nodeping-agent.service" /etc/systemd/system/nodeping-agent.service
+if command -v setcap >/dev/null 2>&1; then
+	setcap cap_net_raw+ep "$INSTALL_BIN" >/dev/null 2>&1 || true
+fi
+write_agent_service /etc/systemd/system/nodeping-agent.service "$(systemd_version)"
 install -m 0644 "$SCRIPT_DIR/nodeping-agent-update.service" /etc/systemd/system/nodeping-agent-update.service
 install -m 0644 "$SCRIPT_DIR/nodeping-agent-update.timer" /etc/systemd/system/nodeping-agent-update.timer
 install -m 0644 "$SCRIPT_DIR/nodeping-agent-update.path" /etc/systemd/system/nodeping-agent-update.path
@@ -141,6 +203,7 @@ if ! grep -Eq 'your-nodeping\.example|np_xxx' "$ETC_DIR/nodeping-agent.env"; the
 		say "nodeping-agent 自检通过" "nodeping-agent doctor passed"
 	else
 		say_err "nodeping-agent 自检发现问题；请检查配置并查看 journalctl -u nodeping-agent" "nodeping-agent doctor reported issues; check configuration and journalctl -u nodeping-agent"
+		systemctl_quiet stop nodeping-agent.service || true
 		systemctl status nodeping-agent.service --no-pager -l >&2 || true
 		journalctl -u nodeping-agent.service -n 60 --no-pager >&2 || true
 		exit 1

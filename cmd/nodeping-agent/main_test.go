@@ -81,6 +81,54 @@ func TestDoctorAgentTokenFileWritable(t *testing.T) {
 	}
 }
 
+func TestAgentIDFilePersistsStableValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-id")
+	if got := readAgentIDFile(path); got != "" {
+		t.Fatalf("empty agent id file read = %q", got)
+	}
+	if err := writeAgentIDFile(path, "agent-test-123"); err != nil {
+		t.Fatalf("writeAgentIDFile: %v", err)
+	}
+	if got := readAgentIDFile(path); got != "agent-test-123" {
+		t.Fatalf("readAgentIDFile()=%q", got)
+	}
+	if got := sanitizeAgentIDPart(" Host.Name 01 "); got != "host.name-01" {
+		t.Fatalf("sanitizeAgentIDPart()=%q", got)
+	}
+}
+
+func TestAgentTokenCanContinueWhenBindingTokenInvalid(t *testing.T) {
+	var statusAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/agent/v1/status":
+			statusAuth = r.Header.Get("Authorization")
+			if statusAuth != "Bearer agent-token-ok" {
+				http.Error(w, `{"error":{"code":"UNAUTHORIZED","message":"invalid agent token"}}`, http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"registered":true,"node_id":42,"node_status":"active","agent_status":"online"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	ok := agentTokenCanContinue(context.Background(), config{
+		ServerURL:  server.URL,
+		Token:      "deleted-binding-token",
+		AgentToken: "agent-token-ok",
+		AgentID:    "agent-existing",
+		HTTPClient: server.Client(),
+	})
+	if !ok {
+		t.Fatal("expected stored agent token to allow continue")
+	}
+	if statusAuth != "Bearer agent-token-ok" {
+		t.Fatalf("status auth=%q", statusAuth)
+	}
+}
+
 func TestRunAgentDoctorReturnsStructuredChecks(t *testing.T) {
 	dir := t.TempDir()
 	result, err := runAgentDoctor(context.Background(), config{
@@ -239,8 +287,25 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
 	}
-	if latency <= 0 || result["status_code"] != 200 || result["http3_advertised"] != true {
+	if latency <= 0 || result["status_code"] != 200 || result["http3_advertised"] != true || result["body"] != "nodeping-ok" {
 		t.Fatalf("unexpected http result latency=%v result=%+v", latency, result)
+	}
+}
+
+func TestRunHTTPRequestReturnsTruncatedBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("nodeping-body"))
+	}))
+	defer server.Close()
+
+	_, _, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
+		"max_body_bytes": 4,
+	})
+	if err != nil {
+		t.Fatalf("runHTTPRequest: %v", err)
+	}
+	if result["body"] != "node" || result["body_truncated"] != true || result["body_bytes"] != 4 {
+		t.Fatalf("unexpected truncated body result: %+v", result)
 	}
 }
 

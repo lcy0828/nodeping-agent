@@ -13,7 +13,7 @@ SIGNING_PUBLIC_KEY="${NODEPING_AGENT_MINISIGN_PUBLIC_KEY:-}"
 REQUIRE_SIGNATURE="${NODEPING_AGENT_REQUIRE_SIGNATURE:-auto}"
 START_TIMEOUT_SECONDS="${NODEPING_AGENT_START_TIMEOUT_SECONDS:-20}"
 SERVER_URL="${NODEPING_SERVER_URL:-}"
-AGENT_ID="${NODEPING_AGENT_ID:-$(hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-')}"
+AGENT_ID="${NODEPING_AGENT_ID:-}"
 AGENT_TOKEN="${NODEPING_AGENT_TOKEN:-}"
 AGENT_TOKEN_FILE="${NODEPING_AGENT_TOKEN_FILE:-/var/lib/nodeping-agent/agent-token}"
 UPDATE_REQUEST_FILE="${NODEPING_AGENT_UPDATE_REQUEST_FILE:-${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/var/lib/nodeping-agent/update-request.json}}"
@@ -78,7 +78,7 @@ emit_upgrade_event() {
 	local message="${4:-}"
 	local token
 	token="$(agent_token || true)"
-	if [ -z "$SERVER_URL" ] || [ -z "$token" ]; then
+	if [ -z "$SERVER_URL" ] || [ -z "$token" ] || [ -z "$AGENT_ID" ]; then
 		return 0
 	fi
 	local payload
@@ -325,6 +325,9 @@ fi
 
 install -m 0755 "$new_bin" "$INSTALL_PATH.new"
 mv -f "$INSTALL_PATH.new" "$INSTALL_PATH"
+if command -v setcap >/dev/null 2>&1; then
+	setcap cap_net_raw+ep "$INSTALL_PATH" >/dev/null 2>&1 || true
+fi
 say "已安装 nodeping-agent $version 到 $INSTALL_PATH" "installed nodeping-agent $version to $INSTALL_PATH"
 
 if restart_with_rollback; then

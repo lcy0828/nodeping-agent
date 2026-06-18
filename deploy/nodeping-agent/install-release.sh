@@ -22,13 +22,46 @@ REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
 GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
 GITHUB_API_BASE_URL="${NODEPING_AGENT_GITHUB_API_BASE_URL:-https://api.github.com}"
 default_agent_id() {
-	hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-' | sed 's/^-*//; s/-*$//' | awk 'NF { print; exit } END { if (NR == 0) print "nodeping-agent" }'
+	host="$(hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
+	if [ -z "$host" ]; then
+		host="nodeping-agent"
+	fi
+	seed=""
+	for path in /etc/machine-id /var/lib/dbus/machine-id /sys/class/dmi/id/product_uuid; do
+		if [ -r "$path" ]; then
+			seed="$(tr -d '[:space:]' < "$path")"
+			if [ -n "$seed" ]; then
+				break
+			fi
+		fi
+	done
+	if [ -z "$seed" ]; then
+		seed="$(date +%s%N)-$$"
+	fi
+	if command -v sha256sum >/dev/null 2>&1; then
+		suffix="$(printf '%s:%s' "$host" "$seed" | sha256sum | awk '{print substr($1,1,12)}')"
+	else
+		suffix="$(printf '%s:%s' "$host" "$seed" | shasum -a 256 | awk '{print substr($1,1,12)}')"
+	fi
+	printf 'agent-%s-%s\n' "$host" "$suffix"
 }
 
-AGENT_ID="${NODEPING_AGENT_ID:-$(default_agent_id)}"
-AGENT_NAME="${NODEPING_AGENT_NAME:-$(hostname)}"
 ETC_DIR="${ETC_DIR:-/etc/nodeping-agent}"
 STATE_DIR="${STATE_DIR:-/var/lib/nodeping-agent}"
+existing_env_value() {
+	local key="$1"
+	local file="$ETC_DIR/nodeping-agent.env"
+	if [ ! -f "$file" ]; then
+		return 0
+	fi
+	awk -F= -v key="$key" '$1 == key { value=$0; sub(/^[^=]*=/, "", value); gsub(/^["'\'']|["'\'']$/, "", value); print value; exit }' "$file"
+}
+
+AGENT_ID="${NODEPING_AGENT_ID:-$(existing_env_value NODEPING_AGENT_ID)}"
+if [ -z "$AGENT_ID" ]; then
+	AGENT_ID="$(default_agent_id)"
+fi
+AGENT_NAME="${NODEPING_AGENT_NAME:-$(hostname)}"
 
 require_command() {
 	local name="$1"

@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -130,7 +133,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.Token, "token", env("NODEPING_TOKEN", ""), "NodePing binding token")
 	flag.StringVar(&cfg.AgentToken, "agent-token", env("NODEPING_AGENT_TOKEN", ""), "NodePing agent token")
 	flag.StringVar(&cfg.AgentTokenFile, "agent-token-file", env("NODEPING_AGENT_TOKEN_FILE", defaultAgentTokenFile()), "NodePing agent token file")
-	flag.StringVar(&cfg.AgentID, "agent-id", env("NODEPING_AGENT_ID", hostnameID()), "stable agent id")
+	flag.StringVar(&cfg.AgentID, "agent-id", env("NODEPING_AGENT_ID", ""), "stable agent id")
 	flag.StringVar(&cfg.Name, "name", env("NODEPING_AGENT_NAME", hostname()), "agent display name")
 	flag.StringVar(&cfg.UpgradeMode, "upgrade-mode", env("NODEPING_AGENT_UPGRADE_MODE", "auto"), "remote upgrade mode: auto, request_file, systemd, script, or disabled")
 	flag.StringVar(&cfg.UpgradeUnit, "upgrade-unit", env("NODEPING_AGENT_UPGRADE_UNIT", "nodeping-agent-update.service"), "fixed systemd unit used for remote upgrades")
@@ -159,15 +162,15 @@ func loadConfig() config {
 	if cfg.PrintVersion {
 		return cfg
 	}
+	if cfg.AgentID == "" {
+		cfg.AgentID = defaultAgentID()
+	}
 	if cfg.ServerURL == "" || cfg.Token == "" {
 		if cfg.Doctor {
 			cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 			return cfg
 		}
 		log.Fatal("NODEPING_SERVER_URL and NODEPING_TOKEN are required")
-	}
-	if cfg.AgentID == "" {
-		cfg.AgentID = hostnameID()
 	}
 	if cfg.Name == "" {
 		cfg.Name = cfg.AgentID
@@ -185,9 +188,13 @@ func loadConfig() config {
 func run(ctx context.Context, cfg config) error {
 	registerResp, err := registerAgent(ctx, cfg)
 	if err != nil {
-		return err
+		if cfg.AgentToken == "" || !agentTokenCanContinue(ctx, cfg) {
+			return err
+		}
+		log.Printf("binding token register failed, continuing with stored agent token: %v", err)
+	} else {
+		cfg.AgentToken = strings.TrimSpace(registerResp.AgentToken)
 	}
-	cfg.AgentToken = strings.TrimSpace(registerResp.AgentToken)
 	if cfg.AgentToken == "" {
 		return errors.New("register response did not include agent_token")
 	}
@@ -324,6 +331,9 @@ func doctorCheckMessage(check doctorCheck) string {
 	case message == "server URL is empty":
 		return "后端地址为空 / server URL is empty"
 	case strings.HasPrefix(message, "status "):
+		if strings.Contains(message, "invalid binding token") {
+			return "安装 token 已失效；请在用户页重新获取 Agent 安装命令 / binding token is invalid; get a fresh Agent install command from the user page"
+		}
 		return "HTTP 状态 " + strings.TrimPrefix(message, "status ") + " / " + message
 	case strings.HasPrefix(message, "registered node "):
 		return "已注册节点 / registered node " + strings.TrimPrefix(message, "registered node ")
@@ -572,6 +582,20 @@ func registerAgent(ctx context.Context, cfg config) (registerResponse, error) {
 	return out, nil
 }
 
+func agentTokenCanContinue(ctx context.Context, cfg config) bool {
+	if cfg.AgentToken == "" || cfg.AgentID == "" {
+		return false
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	status, err := getAgentStatusWithToken(statusCtx, cfg, cfg.AgentToken)
+	if err != nil {
+		log.Printf("stored agent token status check failed: %v", err)
+		return false
+	}
+	return status.Registered
+}
+
 func heartbeatLoop(ctx context.Context, cfg config) {
 	ticker := time.NewTicker(cfg.HeartbeatInterval)
 	defer ticker.Stop()
@@ -610,6 +634,9 @@ func checkAgentRegistration(ctx context.Context, cfg config) doctorCheck {
 			}
 		}
 		status, lastErr = getAgentStatus(statusCtx, cfg)
+		if lastErr != nil && cfg.AgentToken != "" {
+			status, lastErr = getAgentStatusWithToken(statusCtx, cfg, cfg.AgentToken)
+		}
 		if lastErr != nil {
 			continue
 		}
@@ -629,9 +656,13 @@ func checkAgentRegistration(ctx context.Context, cfg config) doctorCheck {
 }
 
 func getAgentStatus(ctx context.Context, cfg config) (agentStatusResponse, error) {
+	return getAgentStatusWithToken(ctx, cfg, cfg.Token)
+}
+
+func getAgentStatusWithToken(ctx context.Context, cfg config, token string) (agentStatusResponse, error) {
 	var out agentStatusResponse
 	path := "/api/agent/v1/status?agent_id=" + url.QueryEscape(cfg.AgentID)
-	if err := getJSONWithToken(ctx, cfg, cfg.Token, path, &out); err != nil {
+	if err := getJSONWithToken(ctx, cfg, token, path, &out); err != nil {
 		return agentStatusResponse{}, err
 	}
 	return out, nil
@@ -1142,6 +1173,13 @@ func runHTTPRequest(ctx context.Context, method string, target string, headers m
 		"status_code":  resp.StatusCode,
 		"http_request": latency,
 		"body_bytes":   len(readBody),
+	}
+	bodyForResult := readBody
+	if len(readBody) > maxBodyBytes {
+		bodyForResult = readBody[:maxBodyBytes]
+	}
+	if maxBodyBytes > 0 && len(readBody) > 0 {
+		result["body"] = string(bodyForResult)
 	}
 	for key, value := range trace.timings(started) {
 		result[key] = value
@@ -2667,6 +2705,44 @@ func defaultAgentTokenFile() string {
 	return dir + string(os.PathSeparator) + "nodeping" + string(os.PathSeparator) + "agent-token"
 }
 
+func defaultAgentIDFile() string {
+	if runtime.GOOS == "linux" {
+		return "/var/lib/nodeping-agent/agent-id"
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, "nodeping", "agent-id")
+}
+
+func defaultAgentID() string {
+	if value := readAgentIDFile(defaultAgentIDFile()); value != "" {
+		return value
+	}
+	host := sanitizeAgentIDPart(hostname())
+	seed := strings.Join([]string{
+		host,
+		readFirstExistingFile("/etc/machine-id", "/var/lib/dbus/machine-id", "/sys/class/dmi/id/product_uuid"),
+	}, ":")
+	if strings.Trim(seed, ":") == "" {
+		raw := make([]byte, 16)
+		if _, err := rand.Read(raw); err == nil {
+			seed = hex.EncodeToString(raw)
+		} else {
+			seed = strconv.FormatInt(time.Now().UnixNano(), 36)
+		}
+	}
+	sum := sha256.Sum256([]byte(seed))
+	suffix := hex.EncodeToString(sum[:])[:12]
+	if host == "" {
+		host = "nodeping-agent"
+	}
+	value := "agent-" + host + "-" + suffix
+	_ = writeAgentIDFile(defaultAgentIDFile(), value)
+	return value
+}
+
 func defaultUpgradeRequestFile() string {
 	if runtime.GOOS == "linux" {
 		return "/var/lib/nodeping-agent/update-request.json"
@@ -2676,6 +2752,47 @@ func defaultUpgradeRequestFile() string {
 		return ""
 	}
 	return filepath.Join(dir, "nodeping", "update-request.json")
+}
+
+func readAgentIDFile(path string) string {
+	value := readAgentTokenFile(path)
+	if strings.HasPrefix(value, "agent-") {
+		return value
+	}
+	return ""
+}
+
+func writeAgentIDFile(path string, agentID string) error {
+	return writeAgentTokenFile(path, agentID)
+}
+
+func readFirstExistingFile(paths ...string) string {
+	for _, path := range paths {
+		raw, err := os.ReadFile(path)
+		if err == nil && strings.TrimSpace(string(raw)) != "" {
+			return strings.TrimSpace(string(raw))
+		}
+	}
+	return ""
+}
+
+func sanitizeAgentIDPart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range value {
+		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_'
+		if ok {
+			builder.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
 }
 
 func readAgentTokenFile(path string) string {
@@ -2713,5 +2830,9 @@ func hostname() string {
 }
 
 func hostnameID() string {
-	return "agent-" + strings.ToLower(strings.NewReplacer(" ", "-", ".", "-").Replace(hostname()))
+	host := sanitizeAgentIDPart(hostname())
+	if host == "" {
+		host = "nodeping-agent"
+	}
+	return "agent-" + host
 }
