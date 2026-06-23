@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -126,6 +127,39 @@ func TestAgentTokenCanContinueWhenBindingTokenInvalid(t *testing.T) {
 	}
 	if statusAuth != "Bearer agent-token-ok" {
 		t.Fatalf("status auth=%q", statusAuth)
+	}
+}
+
+func TestRegisterAgentReportsServerURL(t *testing.T) {
+	var payload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/v1/register" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer binding-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"agent_id":"agent-test","agent_token":"agent-token","server_time":"2026-06-23T00:00:00Z"}`))
+	}))
+	defer server.Close()
+
+	_, err := registerAgent(context.Background(), config{
+		ServerURL:  server.URL,
+		Token:      "binding-token",
+		AgentID:    "agent-test",
+		Name:       "agent-test",
+		Version:    "nodeping-agent/test",
+		HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatalf("registerAgent: %v", err)
+	}
+	if payload["server_url"] != server.URL {
+		t.Fatalf("server_url = %#v, want %q; payload=%+v", payload["server_url"], server.URL, payload)
 	}
 }
 

@@ -570,6 +570,7 @@ func registerAgent(ctx context.Context, cfg config) (registerResponse, error) {
 	if err := postJSONWithToken(ctx, cfg, cfg.Token, "/api/agent/v1/register", map[string]any{
 		"agent_id":     cfg.AgentID,
 		"agent_token":  cfg.AgentToken,
+		"server_url":   cfg.ServerURL,
 		"name":         cfg.Name,
 		"version":      cfg.Version,
 		"hostname":     hostname(),
@@ -603,6 +604,7 @@ func heartbeatLoop(ctx context.Context, cfg config) {
 		if err := postAgentJSON(ctx, cfg, "/api/agent/v1/heartbeat", map[string]any{
 			"agent_id":     cfg.AgentID,
 			"agent_token":  cfg.AgentToken,
+			"server_url":   cfg.ServerURL,
 			"name":         cfg.Name,
 			"version":      cfg.Version,
 			"capabilities": capabilities,
@@ -803,41 +805,50 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	var latency float64
 	var response map[string]any
 	var responseIP string
+	targetSummary := ""
 	switch task.TaskType {
 	case "ping":
 		target, _ := payloadString(payload, "ping")
+		targetSummary = target
 		latency, err = runPing(ctx, target)
 		response = map[string]any{"ping": latency}
 		responseIP = literalIP(target)
 	case "tcp_ping":
 		target, _ := payloadString(payload, "tcp_ping")
+		targetSummary = target
 		latency, err = runTCPPing(ctx, target)
 		response = map[string]any{"tcp_ping": latency}
 		responseIP = hostLiteralIP(target)
 	case "long_ping":
 		target, _ := payloadString(payload, "long_ping")
+		targetSummary = target
 		response, err = runLongPing(ctx, target, task.Options)
 		latency = floatFromMap(response, "avg_latency_ms")
 		responseIP = literalIP(target)
 	case "long_tcp_ping":
 		target, _ := payloadString(payload, "long_tcp_ping")
+		targetSummary = target
 		response, err = runLongTCPPing(ctx, target, task.Options)
 		latency = floatFromMap(response, "avg_latency_ms")
 		responseIP = hostLiteralIP(target)
 	case "udp_probe":
 		target, _ := payloadString(payload, "udp_probe")
+		targetSummary = target
 		response, err = runUDPProbe(ctx, target, task.Options)
 		latency = floatFromMap(response, "udp_probe")
 		responseIP = hostLiteralIP(target)
 	case "http_ping":
 		target, _ := payloadString(payload, "http_ping")
+		targetSummary = target
 		latency, responseIP, err = runHTTPPing(ctx, target)
 		response = map[string]any{"http_ping": latency}
 	case "http_request":
 		target, method, headers, body := httpRequestPayload(payload)
+		targetSummary = target
 		latency, responseIP, response, err = runHTTPRequest(ctx, method, target, headers, body, task.Options)
 	case "http3_check":
 		target, _ := payloadString(payload, "http3_check")
+		targetSummary = target
 		response, err = runHTTP3Check(ctx, target, task.Options)
 		latency = floatFromMap(response, "http3_check")
 		responseIP = stringFromMap(response, "response_ip")
@@ -846,12 +857,14 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		if dnsPayload == nil {
 			dnsPayload, _ = payload["dns_lookup"].(map[string]any)
 		}
+		targetSummary = dnsTargetSummary(dnsPayload)
 		response, err = runDNSLookup(ctx, dnsPayload)
 	case "dns_compare":
 		dnsPayload, _ := payload["dns_compare"].(map[string]any)
 		if dnsPayload == nil {
 			dnsPayload = payload
 		}
+		targetSummary = dnsTargetSummary(dnsPayload)
 		response, err = runDNSCompare(ctx, dnsPayload, task.Options)
 	case "tls_check":
 		tlsPayload := map[string]any{}
@@ -863,14 +876,17 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		default:
 			tlsPayload = payload
 		}
+		targetSummary = strings.TrimSpace(fmt.Sprint(tlsPayload["target"]))
 		response, err = runTLSCheck(ctx, tlsPayload)
 		responseIP = stringFromMap(response, "response_ip")
 	case "traceroute":
 		target, _ := payloadString(payload, "traceroute")
+		targetSummary = target
 		response, err = runTraceroute(ctx, target, task.Options)
 		responseIP = stringFromMap(response, "target_ip")
 	case "mtr":
 		target, _ := payloadString(payload, "mtr")
+		targetSummary = target
 		response, err = runMTR(ctx, target, task.Options)
 		responseIP = stringFromMap(response, "target_ip")
 	case "node_status":
@@ -896,6 +912,7 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		result.ErrorCode = "TASK_FAILED"
 		result.ErrorMessage = err.Error()
 		result.LatencyMS = elapsedMS(started)
+		result.Extra = taskResultExtra(task, targetSummary)
 		return result
 	}
 	if latency <= 0 {
@@ -906,7 +923,33 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	result.LatencyMS = latency
 	result.ResponseIP = responseIP
 	result.Result = response
+	result.Extra = taskResultExtra(task, targetSummary)
 	return result
+}
+
+func taskResultExtra(task taskRequest, target string) map[string]any {
+	extra := map[string]any{
+		"task_type": task.TaskType,
+	}
+	if target = strings.TrimSpace(target); target != "" {
+		extra["target"] = target
+	}
+	if task.NodeID > 0 {
+		extra["node_id"] = task.NodeID
+	}
+	return extra
+}
+
+func dnsTargetSummary(payload map[string]any) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	for _, key := range []string{"domain", "host", "target", "name"} {
+		if value := strings.TrimSpace(fmt.Sprint(payload[key])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	return ""
 }
 
 func failTask(taskID string, code string, message string) taskResult {
