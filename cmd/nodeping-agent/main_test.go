@@ -281,6 +281,24 @@ func TestRunLongProbeSummarizesSamples(t *testing.T) {
 	}
 }
 
+func TestRunLongProbeAllowsSustainedSampleCount(t *testing.T) {
+	originalWait := waitLongProbeInterval
+	waitLongProbeInterval = func(context.Context, time.Duration) error { return nil }
+	defer func() { waitLongProbeInterval = originalWait }()
+
+	calls := 0
+	result, err := runLongProbe(context.Background(), "long_ping", "example.com", map[string]any{"sample_count": 125, "interval_ms": 200}, func(context.Context, string) (float64, error) {
+		calls++
+		return 1, nil
+	})
+	if err != nil {
+		t.Fatalf("runLongProbe: %v", err)
+	}
+	if result["sample_count"] != 125 || result["completed_count"] != 125 || calls != 125 {
+		t.Fatalf("unexpected sustained sample count: calls=%d result=%+v", calls, result)
+	}
+}
+
 func TestRunUDPProbe(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

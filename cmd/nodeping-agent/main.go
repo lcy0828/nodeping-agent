@@ -79,6 +79,15 @@ type taskResult struct {
 	FinishedAt   time.Time      `json:"finished_at"`
 }
 
+type taskEvent struct {
+	TaskID    string         `json:"task_id"`
+	Status    string         `json:"status"`
+	Message   string         `json:"message,omitempty"`
+	Progress  int            `json:"progress,omitempty"`
+	Extra     map[string]any `json:"extra,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
 type registerResponse struct {
 	AgentToken string `json:"agent_token"`
 }
@@ -822,13 +831,13 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	case "long_ping":
 		target, _ := payloadString(payload, "long_ping")
 		targetSummary = target
-		response, err = runLongPing(ctx, target, task.Options)
+		response, err = runLongPingWithProgress(ctx, cfg, task, target)
 		latency = floatFromMap(response, "avg_latency_ms")
 		responseIP = literalIP(target)
 	case "long_tcp_ping":
 		target, _ := payloadString(payload, "long_tcp_ping")
 		targetSummary = target
-		response, err = runLongTCPPing(ctx, target, task.Options)
+		response, err = runLongTCPPingWithProgress(ctx, cfg, task, target)
 		latency = floatFromMap(response, "avg_latency_ms")
 		responseIP = hostLiteralIP(target)
 	case "udp_probe":
@@ -929,13 +938,11 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 
 func taskResultExtra(task taskRequest, target string) map[string]any {
 	extra := map[string]any{
-		"task_type": task.TaskType,
+		"agent_task_id": task.ID,
+		"task_type":     task.TaskType,
 	}
 	if target = strings.TrimSpace(target); target != "" {
 		extra["target"] = target
-	}
-	if task.NodeID > 0 {
-		extra["node_id"] = task.NodeID
 	}
 	return extra
 }
@@ -1017,17 +1024,36 @@ func runLongTCPPing(ctx context.Context, target string, options map[string]any) 
 	return runLongProbe(ctx, "long_tcp_ping", target, options, runTCPPing)
 }
 
-func runLongProbe(ctx context.Context, taskKey string, target string, options map[string]any, probe func(context.Context, string) (float64, error)) (map[string]any, error) {
+func runLongPingWithProgress(ctx context.Context, cfg config, task taskRequest, target string) (map[string]any, error) {
+	return runLongProbe(ctx, "long_ping", target, task.Options, runPing, longProbeProgressReporter(ctx, cfg, task, "long_ping"))
+}
+
+func runLongTCPPingWithProgress(ctx context.Context, cfg config, task taskRequest, target string) (map[string]any, error) {
+	return runLongProbe(ctx, "long_tcp_ping", target, task.Options, runTCPPing, longProbeProgressReporter(ctx, cfg, task, "long_tcp_ping"))
+}
+
+var waitLongProbeInterval = func(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func runLongProbe(ctx context.Context, taskKey string, target string, options map[string]any, probe func(context.Context, string) (float64, error), onProgress ...func(map[string]any)) (map[string]any, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, fmt.Errorf("%s target is required", taskKey)
 	}
-	count := intOption(options, "sample_count", 10)
+	count := intOption(options, "sample_count", 100)
 	if count < 2 {
 		count = 2
 	}
-	if count > 120 {
-		count = 120
+	if count > 5000 {
+		count = 5000
 	}
 	intervalMS := intOption(options, "interval_ms", 1000)
 	if intervalMS < 200 {
@@ -1042,12 +1068,8 @@ func runLongProbe(ctx context.Context, taskKey string, target string, options ma
 	failures := 0
 	for index := 0; index < count; index++ {
 		if index > 0 {
-			timer := time.NewTimer(time.Duration(intervalMS) * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return longProbeSummary(taskKey, started, count, intervalMS, samples, latencies, failures, ctx.Err()), nil
-			case <-timer.C:
+			if err := waitLongProbeInterval(ctx, time.Duration(intervalMS)*time.Millisecond); err != nil {
+				return longProbeSummary(taskKey, started, count, intervalMS, samples, latencies, failures, err), nil
 			}
 		}
 		sampleStarted := time.Now()
@@ -1066,8 +1088,57 @@ func runLongProbe(ctx context.Context, taskKey string, target string, options ma
 			latencies = append(latencies, latency)
 		}
 		samples = append(samples, sample)
+		if len(onProgress) > 0 && onProgress[0] != nil {
+			onProgress[0](longProbeSummary(taskKey, started, count, intervalMS, samples, latencies, failures, nil))
+		}
 	}
 	return longProbeSummary(taskKey, started, count, intervalMS, samples, latencies, failures, nil), nil
+}
+
+func longProbeProgressReporter(ctx context.Context, cfg config, task taskRequest, taskKey string) func(map[string]any) {
+	return func(summary map[string]any) {
+		completed := intFromAnyDefault(summary["completed_count"], 0)
+		total := intFromAnyDefault(summary["sample_count"], 0)
+		if completed <= 0 || total <= 0 {
+			return
+		}
+		progress := int(math.Round(float64(completed) * 100 / float64(total)))
+		if progress < 1 {
+			progress = 1
+		}
+		if progress > 100 {
+			progress = 100
+		}
+		extra := cloneAnyMap(summary)
+		extra["event_kind"] = "long_probe_sample"
+		extra["task_type"] = taskKey
+		event := taskEvent{
+			TaskID:    task.ID,
+			Status:    "running",
+			Message:   fmt.Sprintf("%s sample %d/%d", taskKey, completed, total),
+			Progress:  progress,
+			Extra:     extra,
+			CreatedAt: time.Now().UTC(),
+		}
+		go func() {
+			reportCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			if err := postAgentJSON(reportCtx, cfg, "/api/agent/v1/tasks/"+url.PathEscape(task.ID)+"/events", event, nil); err != nil {
+				log.Printf("report task event failed task_id=%s: %v", task.ID, err)
+			}
+		}()
+	}
+}
+
+func cloneAnyMap(in map[string]any) map[string]any {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func longProbeSummary(taskKey string, started time.Time, requestedCount int, intervalMS int, samples []map[string]any, latencies []float64, failures int, stopErr error) map[string]any {
