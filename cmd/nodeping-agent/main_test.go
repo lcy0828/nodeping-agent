@@ -175,6 +175,22 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	if payload["server_url"] != server.URL {
 		t.Fatalf("server_url = %#v, want %q; payload=%+v", payload["server_url"], server.URL, payload)
 	}
+	if caps, ok := payload["capabilities"].([]any); !ok || len(caps) == 0 {
+		t.Fatalf("capabilities missing from register payload: %+v", payload)
+	}
+	dependencies, ok := payload["dependency_status"].(map[string]any)
+	if !ok {
+		t.Fatalf("dependency_status missing from register payload: %+v", payload)
+	}
+	if dependencies["status"] == "" || dependencies["install_mode"] == "" {
+		t.Fatalf("dependency status missing summary fields: %+v", dependencies)
+	}
+	if caps, ok := dependencies["capabilities"].([]any); !ok || len(caps) == 0 {
+		t.Fatalf("dependency status capabilities missing: %+v", dependencies)
+	}
+	if checks, ok := dependencies["checks"].([]any); !ok || len(checks) == 0 {
+		t.Fatalf("dependency status checks missing: %+v", dependencies)
+	}
 }
 
 func TestRunAgentDoctorReturnsStructuredChecks(t *testing.T) {
@@ -198,7 +214,70 @@ func TestRunAgentDoctorReturnsStructuredChecks(t *testing.T) {
 	if _, ok := result["checks"].([]map[string]any); !ok {
 		t.Fatalf("checks type = %#v", result["checks"])
 	}
+	if caps, ok := result["capabilities"].([]string); !ok || len(caps) == 0 {
+		t.Fatalf("capabilities type = %#v", result["capabilities"])
+	}
+	if result["install_mode"] == "" {
+		t.Fatalf("missing install mode: %+v", result)
+	}
+	checks := result["checks"].([]map[string]any)
+	if checks[0]["key"] == "" || checks[0]["severity"] == "" {
+		t.Fatalf("structured check missing key/severity: %+v", checks[0])
+	}
 	_ = err
+}
+
+func TestDoctorSnapshotCapabilitiesFollowDependencyChecks(t *testing.T) {
+	snapshot := doctorSnapshotFromChecks([]doctorCheck{
+		{Key: "ping_command", Name: "ping command", Status: "fail", Capabilities: []string{"ping", "long_ping"}},
+		{Key: "traceroute_command", Name: "traceroute command", Status: "ok", Path: "/usr/bin/traceroute", Capabilities: []string{"traceroute"}},
+		{Key: "mtr_command", Name: "mtr command", Status: "warn", Path: "/usr/bin/mtr", Capabilities: []string{"mtr"}},
+	}, config{Version: "nodeping-agent/test", AgentID: "agent-test"})
+
+	for _, missing := range []string{"ping", "long_ping"} {
+		if stringSliceContains(snapshot.Capabilities, missing) {
+			t.Fatalf("capability %q should be withheld when ping check fails: %+v", missing, snapshot.Capabilities)
+		}
+	}
+	for _, want := range []string{"traceroute", "mtr", "tcp_ping", "http_ping", "dns_lookup"} {
+		if !stringSliceContains(snapshot.Capabilities, want) {
+			t.Fatalf("capability %q missing from snapshot: %+v", want, snapshot.Capabilities)
+		}
+	}
+	if snapshot.Status != "fail" || snapshot.FailedCount != 1 || snapshot.WarningCount != 1 {
+		t.Fatalf("unexpected snapshot status/counts: %+v", snapshot)
+	}
+}
+
+func TestDoctorSnapshotSkipsMissingOptionalCommandCapabilities(t *testing.T) {
+	snapshot := doctorSnapshotFromChecks([]doctorCheck{
+		{Key: "ping_command", Name: "ping command", Status: "ok", Path: "/bin/ping", Capabilities: []string{"ping", "long_ping"}},
+		{Key: "traceroute_command", Name: "traceroute command", Status: "warn", Message: "traceroute not found", Capabilities: []string{"traceroute"}},
+		{Key: "mtr_command", Name: "mtr command", Status: "warn", Message: "mtr not found", Capabilities: []string{"mtr"}},
+	}, config{Version: "nodeping-agent/test", AgentID: "agent-test"})
+
+	for _, missing := range []string{"traceroute", "mtr"} {
+		if stringSliceContains(snapshot.Capabilities, missing) {
+			t.Fatalf("capability %q should be withheld when command is missing: %+v", missing, snapshot.Capabilities)
+		}
+	}
+	for _, want := range []string{"ping", "long_ping", "tcp_ping"} {
+		if !stringSliceContains(snapshot.Capabilities, want) {
+			t.Fatalf("capability %q missing from snapshot: %+v", want, snapshot.Capabilities)
+		}
+	}
+	if snapshot.Status != "warn" || snapshot.WarningCount != 2 {
+		t.Fatalf("unexpected snapshot status/counts: %+v", snapshot)
+	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRunAgentUpgradeWritesRequestFile(t *testing.T) {
@@ -480,6 +559,51 @@ func TestRunHTTP3CheckPerformsRealRequest(t *testing.T) {
 		}
 	default:
 		t.Fatalf("server did not receive HTTP/3 request")
+	}
+}
+
+func TestRunMTRFallsBackWhenJSONOptionUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+for arg in "$@"; do
+  if [ "$arg" = "-j" ]; then
+    echo "/usr/sbin/mtr: invalid option -- 'j'" >&2
+    exit 1
+  fi
+done
+cat <<'OUT'
+Start: 2026-06-24T12:00:00+0800
+HOST: test-node                 Loss%   Snt   Last   Avg  Best  Wrst StDev
+  1.|-- 192.0.2.1                0.0%     5    1.2   1.5   1.1   2.0   0.3
+  2.|-- ???                    100.0%     5    0.0   0.0   0.0   0.0   0.0
+  3.|-- 93.184.216.34            0.0%     5   11.0  12.5  10.8  14.0   1.1
+OUT
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result, err := runMTR(context.Background(), "example.com", map[string]any{"report_cycles": 5, "max_hops": 8})
+	if err != nil {
+		t.Fatalf("runMTR: %v result=%+v", err, result)
+	}
+	hops, ok := result["hops"].([]map[string]any)
+	if !ok || len(hops) != 3 {
+		t.Fatalf("hops = %#v", result["hops"])
+	}
+	if hops[0]["ip"] != "192.0.2.1" || hops[0]["loss_percent"] != 0.0 || hops[0]["avg_ms"] != 1.5 {
+		t.Fatalf("first hop not parsed: %+v", hops[0])
+	}
+	if hops[1]["timeout"] != true || hops[1]["loss_percent"] != 100.0 {
+		t.Fatalf("timeout hop not parsed: %+v", hops[1])
+	}
+	if hops[2]["ip"] != "93.184.216.34" || hops[2]["avg_ms"] != 12.5 {
+		t.Fatalf("last hop not parsed: %+v", hops[2])
+	}
+	if result["hop_count"] != 3 || result["protocol"] != "icmp" || result["report_cycles"] != 5 {
+		t.Fatalf("unexpected mtr metadata: %+v", result)
 	}
 }
 

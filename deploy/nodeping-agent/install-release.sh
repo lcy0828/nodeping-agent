@@ -281,6 +281,7 @@ install -m 0600 /dev/null "$ETC_DIR/nodeping-agent.env"
 	printf 'NODEPING_TOKEN="%s"\n' "$(env_quote "$BINDING_TOKEN")"
 	printf 'NODEPING_AGENT_ID="%s"\n' "$(env_quote "$AGENT_ID")"
 	printf 'NODEPING_AGENT_NAME="%s"\n' "$(env_quote "$AGENT_NAME")"
+	printf 'NODEPING_INSTALL_MODE="binary"\n'
 	printf 'NODEPING_AGENT_TOKEN_FILE="%s/agent-token"\n' "$(env_quote "$STATE_DIR")"
 	printf 'NODEPING_HEARTBEAT_INTERVAL="%s"\n' "$(env_quote "${NODEPING_HEARTBEAT_INTERVAL:-20s}")"
 	printf 'NODEPING_PUBLIC_IP_INTERVAL="%s"\n' "$(env_quote "${NODEPING_PUBLIC_IP_INTERVAL:-10m}")"
@@ -305,4 +306,13 @@ chmod 0600 "$ETC_DIR/nodeping-agent.env"
 chmod 0600 "$ETC_DIR/nodeping-agent-update.env"
 
 ENABLE_UPDATER=1 "$tmp_dir/nodeping-agent/install-systemd.sh" "$tmp_dir/nodeping-agent/nodeping-agent"
+if [ -x /opt/nodeping-agent/nodeping-agent ]; then
+	say "正在执行 Agent 环境自检" "running agent dependency doctor"
+	if NODEPING_INSTALL_MODE=binary /opt/nodeping-agent/nodeping-agent --doctor --json >/tmp/nodeping-agent-doctor.json 2>/tmp/nodeping-agent-doctor.err; then
+		NODEPING_INSTALL_MODE=binary /opt/nodeping-agent/nodeping-agent doctor || true
+	else
+		cat /tmp/nodeping-agent-doctor.err >&2 || true
+		say_err "Agent 自检存在失败项，请根据上方提示修复依赖" "agent doctor reported failures; fix dependencies shown above"
+	fi
+fi
 say "nodeping-agent 已安装，自动升级已启用" "nodeping-agent installed and auto update timer enabled"

@@ -199,9 +199,11 @@ if ! grep -Eq 'your-nodeping\.example|np_xxx' "$ETC_DIR/nodeping-agent.env"; the
 	# shellcheck disable=SC1090
 	. "$ETC_DIR/nodeping-agent.env"
 	set +a
-	if "$INSTALL_BIN" -doctor; then
+	if "$INSTALL_BIN" doctor --json >/tmp/nodeping-agent-doctor.json 2>/tmp/nodeping-agent-doctor.err; then
+		"$INSTALL_BIN" doctor || true
 		say "nodeping-agent 自检通过" "nodeping-agent doctor passed"
 	else
+		cat /tmp/nodeping-agent-doctor.err >&2 || true
 		say_err "nodeping-agent 自检发现问题；请检查配置并查看 journalctl -u nodeping-agent" "nodeping-agent doctor reported issues; check configuration and journalctl -u nodeping-agent"
 		systemctl_quiet stop nodeping-agent.service || true
 		systemctl status nodeping-agent.service --no-pager -l >&2 || true

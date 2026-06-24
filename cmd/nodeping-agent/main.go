@@ -53,6 +53,7 @@ type config struct {
 	HTTPClient         *http.Client
 	PrintVersion       bool
 	Doctor             bool
+	DoctorJSON         bool
 }
 
 type taskRequest struct {
@@ -104,9 +105,29 @@ type agentStatusResponse struct {
 }
 
 type doctorCheck struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Message string `json:"message,omitempty"`
+	Key          string   `json:"key,omitempty"`
+	Name         string   `json:"name"`
+	Status       string   `json:"status"`
+	Severity     string   `json:"severity,omitempty"`
+	Message      string   `json:"message,omitempty"`
+	Remediation  string   `json:"remediation,omitempty"`
+	Path         string   `json:"path,omitempty"`
+	Version      string   `json:"version,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Required     bool     `json:"required,omitempty"`
+}
+
+type doctorSnapshot struct {
+	Status       string        `json:"status"`
+	InstallMode  string        `json:"install_mode"`
+	Version      string        `json:"version"`
+	AgentID      string        `json:"agent_id,omitempty"`
+	Capabilities []string      `json:"capabilities"`
+	Checks       []doctorCheck `json:"checks"`
+	CheckCount   int           `json:"check_count"`
+	FailedCount  int           `json:"failed_count"`
+	WarningCount int           `json:"warning_count"`
+	GeneratedAt  time.Time     `json:"generated_at"`
 }
 
 var capabilities = []string{"ping", "tcp_ping", "long_ping", "long_tcp_ping", "udp_probe", "http_ping", "http_request", "http3_check", "dns_lookup", "dns_compare", "tls_check", "traceroute", "mtr", "node_status", "ip"}
@@ -116,6 +137,12 @@ var (
 	commit    = "unknown"
 	buildDate = "unknown"
 )
+
+var dependencySnapshotCache struct {
+	sync.Mutex
+	snapshot doctorSnapshot
+	expires  time.Time
+}
 
 func main() {
 	cfg := loadConfig()
@@ -153,9 +180,15 @@ func loadConfig() config {
 	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("NODEPING_CONCURRENCY", 3), "max concurrent tasks")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.Doctor, "doctor", false, "run diagnostics and exit")
+	flag.BoolVar(&cfg.DoctorJSON, "json", false, "print doctor result as JSON")
 	flag.Parse()
-	if flag.NArg() > 0 && flag.Arg(0) == "doctor" {
-		cfg.Doctor = true
+	for _, arg := range flag.Args() {
+		switch arg {
+		case "doctor":
+			cfg.Doctor = true
+		case "--json", "-json", "json":
+			cfg.DoctorJSON = true
+		}
 	}
 	cfg.ServerURL = strings.TrimRight(strings.TrimSpace(cfg.ServerURL), "/")
 	cfg.Token = strings.TrimSpace(cfg.Token)
@@ -233,12 +266,20 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func runDoctor(ctx context.Context, cfg config) error {
-	checks := collectDoctorChecks(ctx, cfg)
-	failed := doctorHasFailures(checks)
-	for _, check := range checks {
-		fmt.Println(formatDoctorCheck(check))
+	snapshot := collectDoctorSnapshot(ctx, cfg)
+	if cfg.DoctorJSON {
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(snapshot); err != nil {
+			return err
+		}
+	} else {
+		for _, check := range snapshot.Checks {
+			fmt.Println(formatDoctorCheck(check))
+		}
+		fmt.Printf("%-32s %-12s %s\n", "能力 / capabilities", doctorCheckStatus(snapshot.Status), strings.Join(snapshot.Capabilities, ", "))
 	}
-	if failed {
+	if snapshot.FailedCount > 0 {
 		return errors.New("自检发现失败项 / doctor found failed checks")
 	}
 	return nil
@@ -357,14 +398,83 @@ func collectDoctorChecks(ctx context.Context, cfg config) []doctorCheck {
 	return []doctorCheck{
 		checkConfig(cfg),
 		checkPingCommand(ctx),
-		checkOptionalCommand("traceroute", "traceroute command"),
-		checkOptionalCommand("mtr", "mtr command"),
+		checkTracerouteCommand(),
+		checkMTRCommand(),
 		checkDNS(ctx),
 		checkPublicIP(ctx),
 		checkAgentTokenFile(cfg),
 		checkBackendHealth(ctx, cfg),
 		checkAgentRegistration(ctx, cfg),
 		checkUpgradeControl(cfg),
+	}
+}
+
+func collectDoctorSnapshot(ctx context.Context, cfg config) doctorSnapshot {
+	checks := collectDoctorChecks(ctx, cfg)
+	return doctorSnapshotFromChecks(checks, cfg)
+}
+
+func collectDependencySnapshot(ctx context.Context, cfg config) doctorSnapshot {
+	checks := []doctorCheck{
+		checkConfig(cfg),
+		checkPingCommand(ctx),
+		checkTracerouteCommand(),
+		checkMTRCommand(),
+		checkDNS(ctx),
+		checkAgentTokenFile(cfg),
+	}
+	return doctorSnapshotFromChecks(checks, cfg)
+}
+
+func cachedDependencySnapshot(ctx context.Context, cfg config) doctorSnapshot {
+	now := time.Now().UTC()
+	dependencySnapshotCache.Lock()
+	if now.Before(dependencySnapshotCache.expires) && dependencySnapshotCache.snapshot.CheckCount > 0 {
+		snapshot := dependencySnapshotCache.snapshot
+		dependencySnapshotCache.Unlock()
+		return snapshot
+	}
+	dependencySnapshotCache.Unlock()
+
+	checkCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	snapshot := collectDependencySnapshot(checkCtx, cfg)
+
+	dependencySnapshotCache.Lock()
+	dependencySnapshotCache.snapshot = snapshot
+	dependencySnapshotCache.expires = now.Add(5 * time.Minute)
+	dependencySnapshotCache.Unlock()
+	return snapshot
+}
+
+func doctorSnapshotFromChecks(checks []doctorCheck, cfg config) doctorSnapshot {
+	failed := 0
+	warnings := 0
+	for _, check := range checks {
+		if check.Status == "fail" {
+			failed++
+		}
+		if check.Status == "warn" {
+			warnings++
+		}
+	}
+	status := "ok"
+	if failed > 0 {
+		status = "fail"
+	} else if warnings > 0 {
+		status = "warn"
+	}
+	return doctorSnapshot{
+		Status:       status,
+		InstallMode:  detectInstallMode(),
+		Version:      cfg.Version,
+		AgentID:      cfg.AgentID,
+		Capabilities: effectiveCapabilitiesFromChecks(checks),
+		Checks:       checks,
+		CheckCount:   len(checks),
+		FailedCount:  failed,
+		WarningCount: warnings,
+		GeneratedAt:  time.Now().UTC(),
 	}
 }
 
@@ -378,41 +488,37 @@ func doctorHasFailures(checks []doctorCheck) bool {
 }
 
 func runAgentDoctor(ctx context.Context, cfg config) (map[string]any, error) {
-	checks := collectDoctorChecks(ctx, cfg)
-	failed := 0
-	warnings := 0
-	rows := make([]map[string]any, 0, len(checks))
-	for _, check := range checks {
-		if check.Status == "fail" {
-			failed++
-		}
-		if check.Status == "warn" {
-			warnings++
-		}
+	snapshot := collectDoctorSnapshot(ctx, cfg)
+	rows := make([]map[string]any, 0, len(snapshot.Checks))
+	for _, check := range snapshot.Checks {
 		rows = append(rows, map[string]any{
-			"name":    check.Name,
-			"status":  check.Status,
-			"message": check.Message,
+			"key":          check.Key,
+			"name":         check.Name,
+			"status":       check.Status,
+			"severity":     check.Severity,
+			"message":      check.Message,
+			"remediation":  check.Remediation,
+			"path":         check.Path,
+			"version":      check.Version,
+			"capabilities": check.Capabilities,
+			"required":     check.Required,
 		})
 	}
-	status := "ok"
-	if failed > 0 {
-		status = "fail"
-	} else if warnings > 0 {
-		status = "warn"
-	}
 	result := map[string]any{
-		"agent_doctor":  status,
-		"status":        status,
+		"agent_doctor":  snapshot.Status,
+		"status":        snapshot.Status,
+		"install_mode":  snapshot.InstallMode,
+		"capabilities":  snapshot.Capabilities,
 		"checks":        rows,
-		"check_count":   len(checks),
-		"failed_count":  failed,
-		"warning_count": warnings,
+		"check_count":   snapshot.CheckCount,
+		"failed_count":  snapshot.FailedCount,
+		"warning_count": snapshot.WarningCount,
 		"version":       cfg.Version,
 		"agent_id":      cfg.AgentID,
+		"generated_at":  snapshot.GeneratedAt,
 	}
-	if failed > 0 {
-		return result, fmt.Errorf("doctor found %d failed checks", failed)
+	if snapshot.FailedCount > 0 {
+		return result, fmt.Errorf("doctor found %d failed checks", snapshot.FailedCount)
 	}
 	return result, nil
 }
@@ -422,15 +528,15 @@ func checkConfig(cfg config) doctorCheck {
 	if cfg.ServerURL == "" {
 		missing = append(missing, "NODEPING_SERVER_URL")
 	} else if parsed, err := url.Parse(cfg.ServerURL); err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return doctorCheck{Name: "config", Status: "fail", Message: "NODEPING_SERVER_URL is not a valid URL"}
+		return doctorCheck{Key: "config", Name: "config", Status: "fail", Severity: "required", Message: "NODEPING_SERVER_URL is not a valid URL", Required: true}
 	}
 	if cfg.Token == "" {
 		missing = append(missing, "NODEPING_TOKEN")
 	}
 	if len(missing) > 0 {
-		return doctorCheck{Name: "config", Status: "fail", Message: "missing " + strings.Join(missing, ", ")}
+		return doctorCheck{Key: "config", Name: "config", Status: "fail", Severity: "required", Message: "missing " + strings.Join(missing, ", "), Required: true}
 	}
-	return doctorCheck{Name: "config", Status: "ok", Message: "agent_id=" + cfg.AgentID + " version=" + cfg.Version}
+	return doctorCheck{Key: "config", Name: "config", Status: "ok", Severity: "required", Message: "agent_id=" + cfg.AgentID + " version=" + cfg.Version, Required: true}
 }
 
 func checkUpgradeControl(cfg config) doctorCheck {
@@ -492,23 +598,37 @@ func checkUpgradeControl(cfg config) doctorCheck {
 func checkPingCommand(ctx context.Context) doctorCheck {
 	path, err := exec.LookPath("ping")
 	if err != nil {
-		return doctorCheck{Name: "ping command", Status: "fail", Message: "ping command not found"}
+		return doctorCheck{Key: "ping_command", Name: "ping command", Status: "fail", Severity: "required_for_capability", Message: "ping command not found", Remediation: installHint("ping"), Capabilities: []string{"ping", "long_ping"}, Required: true}
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	_, err = runPing(pingCtx, "127.0.0.1")
 	if err != nil {
-		return doctorCheck{Name: "ping command", Status: "fail", Message: err.Error()}
+		return doctorCheck{Key: "ping_command", Name: "ping command", Status: "fail", Severity: "required_for_capability", Message: err.Error(), Path: path, Remediation: "grant CAP_NET_RAW or install a ping binary with the required permission", Capabilities: []string{"ping", "long_ping"}, Required: true}
 	}
-	return doctorCheck{Name: "ping command", Status: "ok", Message: path}
+	return doctorCheck{Key: "ping_command", Name: "ping command", Status: "ok", Severity: "required_for_capability", Message: path, Path: path, Version: commandVersion(ctx, path, "-V"), Capabilities: []string{"ping", "long_ping"}, Required: true}
 }
 
-func checkOptionalCommand(binary string, label string) doctorCheck {
-	path, err := exec.LookPath(binary)
+func checkTracerouteCommand() doctorCheck {
+	path, err := exec.LookPath("traceroute")
 	if err != nil {
-		return doctorCheck{Name: label, Status: "warn", Message: binary + " not found; related diagnostic task will fail until installed"}
+		return doctorCheck{Key: "traceroute_command", Name: "traceroute command", Status: "warn", Severity: "required_for_capability", Message: "traceroute not found; related diagnostic task will fail until installed", Remediation: installHint("traceroute"), Capabilities: []string{"traceroute"}}
 	}
-	return doctorCheck{Name: label, Status: "ok", Message: path}
+	return doctorCheck{Key: "traceroute_command", Name: "traceroute command", Status: "ok", Severity: "required_for_capability", Message: path, Path: path, Version: commandVersion(context.Background(), path, "--version"), Capabilities: []string{"traceroute"}}
+}
+
+func checkMTRCommand() doctorCheck {
+	path, err := exec.LookPath("mtr")
+	if err != nil {
+		return doctorCheck{Key: "mtr_command", Name: "mtr command", Status: "warn", Severity: "required_for_capability", Message: "mtr not found; related diagnostic task will fail until installed", Remediation: installHint("mtr"), Capabilities: []string{"mtr"}}
+	}
+	check := doctorCheck{Key: "mtr_command", Name: "mtr command", Status: "ok", Severity: "required_for_capability", Message: path, Path: path, Version: commandVersion(context.Background(), path, "--version"), Capabilities: []string{"mtr"}}
+	if !mtrSupportsJSON(path) {
+		check.Status = "warn"
+		check.Message = path + " does not support -j; text fallback will be used"
+		check.Remediation = upgradeHint("mtr")
+	}
+	return check
 }
 
 func checkDNS(ctx context.Context) doctorCheck {
@@ -516,9 +636,9 @@ func checkDNS(ctx context.Context) doctorCheck {
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(dnsCtx, "ip", "example.com")
 	if err != nil {
-		return doctorCheck{Name: "dns lookup", Status: "fail", Message: err.Error()}
+		return doctorCheck{Key: "dns_lookup", Name: "dns lookup", Status: "fail", Severity: "required", Message: err.Error(), Remediation: "check /etc/resolv.conf or container DNS settings", Required: true}
 	}
-	return doctorCheck{Name: "dns lookup", Status: "ok", Message: fmt.Sprintf("%d answers", len(ips))}
+	return doctorCheck{Key: "dns_lookup", Name: "dns lookup", Status: "ok", Severity: "required", Message: fmt.Sprintf("%d answers", len(ips)), Required: true}
 }
 
 func checkPublicIP(ctx context.Context) doctorCheck {
@@ -526,66 +646,183 @@ func checkPublicIP(ctx context.Context) doctorCheck {
 	defer cancel()
 	ip := discoverPublicIP(ipCtx)
 	if ip == "" {
-		return doctorCheck{Name: "public ip", Status: "fail", Message: "public IP discovery failed"}
+		return doctorCheck{Key: "public_ip", Name: "public ip", Status: "warn", Severity: "recommended", Message: "public IP discovery failed", Remediation: "allow outbound HTTPS to public IP echo endpoints"}
 	}
-	return doctorCheck{Name: "public ip", Status: "ok", Message: ip}
+	return doctorCheck{Key: "public_ip", Name: "public ip", Status: "ok", Severity: "recommended", Message: ip}
 }
 
 func checkAgentTokenFile(cfg config) doctorCheck {
 	if cfg.AgentTokenFile == "" {
-		return doctorCheck{Name: "token file", Status: "fail", Message: "NODEPING_AGENT_TOKEN_FILE is empty"}
+		return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: "NODEPING_AGENT_TOKEN_FILE is empty", Required: true}
 	}
 	if token := readAgentTokenFile(cfg.AgentTokenFile); token != "" {
-		return doctorCheck{Name: "token file", Status: "ok", Message: "readable"}
+		return doctorCheck{Key: "token_file", Name: "token file", Status: "ok", Severity: "required", Message: "readable", Path: cfg.AgentTokenFile, Required: true}
 	}
 	dir := cfg.AgentTokenFile
 	if index := strings.LastIndex(dir, string(os.PathSeparator)); index > 0 {
 		dir = dir[:index]
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return doctorCheck{Name: "token file", Status: "fail", Message: err.Error()}
+		return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: err.Error(), Path: cfg.AgentTokenFile, Required: true}
 	}
 	testPath := cfg.AgentTokenFile + ".doctor"
 	if err := os.WriteFile(testPath, []byte("ok\n"), 0o600); err != nil {
-		return doctorCheck{Name: "token file", Status: "fail", Message: err.Error()}
+		return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: err.Error(), Path: cfg.AgentTokenFile, Required: true}
 	}
 	_ = os.Remove(testPath)
-	return doctorCheck{Name: "token file", Status: "ok", Message: "writable"}
+	return doctorCheck{Key: "token_file", Name: "token file", Status: "ok", Severity: "required", Message: "writable", Path: cfg.AgentTokenFile, Required: true}
 }
 
 func checkBackendHealth(ctx context.Context, cfg config) doctorCheck {
 	if cfg.ServerURL == "" {
-		return doctorCheck{Name: "backend health", Status: "fail", Message: "server URL is empty"}
+		return doctorCheck{Key: "backend_health", Name: "backend health", Status: "fail", Severity: "required", Message: "server URL is empty", Required: true}
 	}
 	healthCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(healthCtx, http.MethodGet, cfg.ServerURL+"/healthz", nil)
 	if err != nil {
-		return doctorCheck{Name: "backend health", Status: "fail", Message: err.Error()}
+		return doctorCheck{Key: "backend_health", Name: "backend health", Status: "fail", Severity: "required", Message: err.Error(), Required: true}
 	}
 	resp, err := cfg.HTTPClient.Do(req)
 	if err != nil {
-		return doctorCheck{Name: "backend health", Status: "fail", Message: err.Error()}
+		return doctorCheck{Key: "backend_health", Name: "backend health", Status: "fail", Severity: "required", Message: err.Error(), Remediation: "check NODEPING_SERVER_URL and outbound HTTPS connectivity", Required: true}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return doctorCheck{Name: "backend health", Status: "fail", Message: fmt.Sprintf("status %d", resp.StatusCode)}
+		return doctorCheck{Key: "backend_health", Name: "backend health", Status: "fail", Severity: "required", Message: fmt.Sprintf("status %d", resp.StatusCode), Required: true}
 	}
-	return doctorCheck{Name: "backend health", Status: "ok", Message: cfg.ServerURL}
+	return doctorCheck{Key: "backend_health", Name: "backend health", Status: "ok", Severity: "required", Message: cfg.ServerURL, Required: true}
+}
+
+func effectiveCapabilities(ctx context.Context, cfg config) []string {
+	return collectDoctorSnapshot(ctx, cfg).Capabilities
+}
+
+func effectiveCapabilitiesFromChecks(checks []doctorCheck) []string {
+	caps := []string{"tcp_ping", "long_tcp_ping", "udp_probe", "http_ping", "http_request", "http3_check", "dns_lookup", "dns_compare", "tls_check", "node_status", "ip"}
+	if doctorCheckCapabilityAvailable(checks, "ping_command") {
+		caps = append(caps, "ping", "long_ping")
+	}
+	if doctorCheckCapabilityAvailable(checks, "traceroute_command") {
+		caps = append(caps, "traceroute")
+	}
+	if doctorCheckCapabilityAvailable(checks, "mtr_command") {
+		caps = append(caps, "mtr")
+	}
+	return normalizeStringCapabilities(caps)
+}
+
+func doctorCheckCapabilityAvailable(checks []doctorCheck, key string) bool {
+	for _, check := range checks {
+		if check.Key == key {
+			if check.Status == "ok" {
+				return true
+			}
+			return check.Status == "warn" && strings.TrimSpace(check.Path) != ""
+		}
+	}
+	return false
+}
+
+func normalizeStringCapabilities(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func detectInstallMode() string {
+	if strings.TrimSpace(os.Getenv("NODEPING_INSTALL_MODE")) != "" {
+		return strings.ToLower(strings.TrimSpace(os.Getenv("NODEPING_INSTALL_MODE")))
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return "docker"
+	}
+	if strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST")) != "" {
+		return "docker"
+	}
+	if strings.HasPrefix(defaultAgentTokenFile(), "/var/lib/") || strings.HasPrefix(defaultAgentTokenFile(), "/etc/") {
+		return "binary"
+	}
+	return "unknown"
+}
+
+func commandVersion(ctx context.Context, path string, args ...string) string {
+	if path == "" {
+		return ""
+	}
+	versionCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(versionCtx, path, args...).CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func mtrSupportsJSON(path string) bool {
+	if path == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "-r", "-c", "1", "-n", "-j", "127.0.0.1").CombinedOutput()
+	if err != nil && mtrJSONUnsupported(out) {
+		return false
+	}
+	return !mtrJSONUnsupported(out)
+}
+
+func installHint(binary string) string {
+	switch binary {
+	case "ping":
+		return "Debian/Ubuntu: sudo apt install iputils-ping; Alpine: apk add iputils; RHEL/Rocky: sudo dnf install iputils"
+	case "traceroute":
+		return "Debian/Ubuntu: sudo apt install traceroute; Alpine: apk add traceroute; RHEL/Rocky: sudo dnf install traceroute"
+	case "mtr":
+		return "Debian/Ubuntu: sudo apt install mtr-tiny; Alpine: apk add mtr; RHEL/Rocky: sudo dnf install mtr"
+	default:
+		return "install " + binary + " with your system package manager"
+	}
+}
+
+func upgradeHint(binary string) string {
+	switch binary {
+	case "mtr":
+		return "upgrade mtr to enable JSON output; current Agent will use text fallback when -j is unavailable"
+	default:
+		return "upgrade " + binary
+	}
 }
 
 func registerAgent(ctx context.Context, cfg config) (registerResponse, error) {
 	var out registerResponse
+	dependencies := cachedDependencySnapshot(ctx, cfg)
 	if err := postJSONWithToken(ctx, cfg, cfg.Token, "/api/agent/v1/register", map[string]any{
-		"agent_id":     cfg.AgentID,
-		"agent_token":  cfg.AgentToken,
-		"server_url":   cfg.ServerURL,
-		"name":         cfg.Name,
-		"version":      cfg.Version,
-		"hostname":     hostname(),
-		"os":           runtime.GOOS,
-		"arch":         runtime.GOARCH,
-		"capabilities": capabilities,
+		"agent_id":          cfg.AgentID,
+		"agent_token":       cfg.AgentToken,
+		"server_url":        cfg.ServerURL,
+		"name":              cfg.Name,
+		"version":           cfg.Version,
+		"hostname":          hostname(),
+		"os":                runtime.GOOS,
+		"arch":              runtime.GOARCH,
+		"capabilities":      dependencies.Capabilities,
+		"dependency_status": dependencies,
 	}, &out); err != nil {
 		return registerResponse{}, fmt.Errorf("register: %w", err)
 	}
@@ -610,13 +847,15 @@ func heartbeatLoop(ctx context.Context, cfg config) {
 	ticker := time.NewTicker(cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
+		dependencies := cachedDependencySnapshot(ctx, cfg)
 		if err := postAgentJSON(ctx, cfg, "/api/agent/v1/heartbeat", map[string]any{
-			"agent_id":     cfg.AgentID,
-			"agent_token":  cfg.AgentToken,
-			"server_url":   cfg.ServerURL,
-			"name":         cfg.Name,
-			"version":      cfg.Version,
-			"capabilities": capabilities,
+			"agent_id":          cfg.AgentID,
+			"agent_token":       cfg.AgentToken,
+			"server_url":        cfg.ServerURL,
+			"name":              cfg.Name,
+			"version":           cfg.Version,
+			"capabilities":      dependencies.Capabilities,
+			"dependency_status": dependencies,
 		}, nil); err != nil {
 			log.Printf("heartbeat failed: %v", err)
 		}
@@ -2174,26 +2413,37 @@ func runMTR(ctx context.Context, target string, options map[string]any) (map[str
 		maxHops = 64
 	}
 	protocol := strings.ToLower(strings.TrimSpace(stringOptionAny(options, "protocol")))
-	args := []string{"-r", "-c", strconv.Itoa(reportCycles), "-m", strconv.Itoa(maxHops), "-n", "-j"}
+	baseArgs := []string{"-r", "-c", strconv.Itoa(reportCycles), "-m", strconv.Itoa(maxHops), "-n"}
 	switch protocol {
 	case "icmp", "":
 		protocol = "icmp"
 	case "udp":
-		args = append(args, "-u")
+		baseArgs = append(baseArgs, "-u")
 	case "tcp":
-		args = append(args, "-T")
+		baseArgs = append(baseArgs, "-T")
 	default:
 		return nil, fmt.Errorf("unsupported mtr protocol: %s", protocol)
 	}
-	args = append(args, target)
+	args := append(append([]string{}, baseArgs...), "-j", target)
 	started := time.Now()
 	out, cmdErr := exec.CommandContext(ctx, path, args...).CombinedOutput()
 	result, parseErr := parseMTRJSON(out)
 	if parseErr != nil {
+		if cmdErr != nil && mtrJSONUnsupported(out) {
+			textArgs := append(append([]string{}, baseArgs...), target)
+			out, cmdErr = exec.CommandContext(ctx, path, textArgs...).CombinedOutput()
+			result = parseMTRText(out)
+			parseErr = nil
+			if len(result["hops"].([]map[string]any)) == 0 {
+				parseErr = errors.New("mtr text report is missing hops")
+			}
+		}
 		if cmdErr != nil {
 			return nil, fmt.Errorf("mtr failed: %s", strings.TrimSpace(string(out)))
 		}
-		return nil, parseErr
+		if parseErr != nil {
+			return nil, parseErr
+		}
 	}
 	targetIP := firstResolvedIP(ctx, target)
 	hops, _ := result["hops"].([]map[string]any)
@@ -2302,6 +2552,103 @@ func parseMTRJSON(raw []byte) (map[string]any, error) {
 		hops = append(hops, hop)
 	}
 	return map[string]any{"hops": hops}, nil
+}
+
+func mtrJSONUnsupported(raw []byte) bool {
+	text := strings.ToLower(strings.TrimSpace(string(raw)))
+	return strings.Contains(text, "invalid option") &&
+		(strings.Contains(text, "-j") || strings.Contains(text, "'j'") || strings.Contains(text, " j") || strings.Contains(text, "--json") || strings.Contains(text, "json"))
+}
+
+func parseMTRText(raw []byte) map[string]any {
+	hops := make([]map[string]any, 0)
+	for _, line := range strings.Split(string(raw), "\n") {
+		hop := parseMTRTextHop(line)
+		if hop != nil {
+			hops = append(hops, hop)
+		}
+	}
+	return map[string]any{"hops": hops}
+}
+
+func parseMTRTextHop(line string) map[string]any {
+	line = strings.TrimSpace(line)
+	if line == "" || !strings.Contains(line, "|") {
+		return nil
+	}
+	separator := "|--"
+	separatorIndex := strings.Index(line, separator)
+	if separatorIndex < 0 {
+		separator = "|"
+		separatorIndex = strings.Index(line, separator)
+	}
+	left := strings.TrimSpace(line[:separatorIndex])
+	right := strings.TrimSpace(line[separatorIndex+len(separator):])
+	hopToken := strings.TrimSuffix(strings.TrimSpace(left), ".")
+	hopNumber, err := strconv.Atoi(strings.TrimSpace(hopToken))
+	if err != nil || hopNumber <= 0 {
+		return nil
+	}
+	hop := map[string]any{"hop": hopNumber}
+	fields := strings.Fields(right)
+	if len(fields) == 0 {
+		hop["timeout"] = true
+		return hop
+	}
+	metricIndex := mtrTextMetricStart(fields)
+	if metricIndex < 0 {
+		metricIndex = len(fields)
+	}
+	hostText := strings.TrimSpace(strings.Join(fields[:metricIndex], " "))
+	if hostText == "???" || hostText == "" {
+		hop["timeout"] = true
+	} else {
+		host := strings.Fields(hostText)[0]
+		hop["host"] = strings.Trim(host, "()")
+		for _, field := range strings.Fields(hostText) {
+			if ip := net.ParseIP(strings.Trim(field, "()")); ip != nil {
+				hop["ip"] = ip.String()
+				break
+			}
+		}
+	}
+	metrics := fields[metricIndex:]
+	if len(metrics) >= 2 {
+		setMTRTextFloat(hop, "loss_percent", metrics[0])
+		setMTRTextFloat(hop, "sent", metrics[1])
+	}
+	if len(metrics) >= 7 {
+		setMTRTextFloat(hop, "last_ms", metrics[2])
+		setMTRTextFloat(hop, "avg_ms", metrics[3])
+		setMTRTextFloat(hop, "best_ms", metrics[4])
+		setMTRTextFloat(hop, "worst_ms", metrics[5])
+		setMTRTextFloat(hop, "stdev_ms", metrics[6])
+	}
+	return hop
+}
+
+func mtrTextMetricStart(fields []string) int {
+	for index := 0; index < len(fields)-1; index++ {
+		loss := strings.TrimSuffix(strings.TrimSpace(fields[index]), "%")
+		if _, err := strconv.ParseFloat(loss, 64); err != nil {
+			continue
+		}
+		if _, err := strconv.ParseFloat(strings.TrimSpace(fields[index+1]), 64); err == nil {
+			return index
+		}
+	}
+	return -1
+}
+
+func setMTRTextFloat(hop map[string]any, key string, raw string) {
+	value := strings.TrimSpace(strings.TrimSuffix(raw, "%"))
+	if value == "" {
+		return
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err == nil {
+		hop[key] = parsed
+	}
 }
 
 func copyMTRFloat(target map[string]any, key string, raw any) {
