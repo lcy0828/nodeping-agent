@@ -17,6 +17,11 @@ AGENT_ID="${NODEPING_AGENT_ID:-}"
 AGENT_TOKEN="${NODEPING_AGENT_TOKEN:-}"
 AGENT_TOKEN_FILE="${NODEPING_AGENT_TOKEN_FILE:-/var/lib/nodeping-agent/agent-token}"
 UPDATE_REQUEST_FILE="${NODEPING_AGENT_UPDATE_REQUEST_FILE:-${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/var/lib/nodeping-agent/update-request.json}}"
+CURRENT_VERSION=""
+TARGET_VERSION=""
+UPGRADE_STEP="starting updater"
+UPGRADE_EVENT_FINALIZED=0
+tmp_dir=""
 
 say() {
 	printf '%s / %s\n' "$1" "$2"
@@ -76,18 +81,50 @@ emit_upgrade_event() {
 	local from_version="${2:-}"
 	local to_version="${3:-}"
 	local message="${4:-}"
+	local progress="${5:-}"
 	local token
 	token="$(agent_token || true)"
 	if [ -z "$SERVER_URL" ] || [ -z "$token" ] || [ -z "$AGENT_ID" ]; then
 		return 0
 	fi
 	local payload
-	payload="{\"agent_id\":\"$(json_escape "$AGENT_ID")\",\"event\":\"$(json_escape "$event")\",\"from_version\":\"$(json_escape "$from_version")\",\"to_version\":\"$(json_escape "$to_version")\",\"message\":\"$(json_escape "$message")\"}"
+	payload="{\"agent_id\":\"$(json_escape "$AGENT_ID")\",\"event\":\"$(json_escape "$event")\",\"from_version\":\"$(json_escape "$from_version")\",\"to_version\":\"$(json_escape "$to_version")\",\"message\":\"$(json_escape "$message")\""
+	if [ -n "$progress" ]; then
+		payload="$payload,\"progress\":$progress"
+	fi
+	payload="$payload}"
 	if command -v curl >/dev/null 2>&1; then
 		curl -fsS -m 8 -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
 	elif command -v wget >/dev/null 2>&1; then
 		wget -qO- --timeout=8 --header="Authorization: Bearer $token" --header="Content-Type: application/json" --post-data="$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
 	fi
+}
+
+emit_upgrade_progress() {
+	local progress="$1"
+	local message="$2"
+	emit_upgrade_event "update_started" "${CURRENT_VERSION:-}" "${TARGET_VERSION:-}" "$message" "$progress"
+}
+
+emit_terminal_upgrade_event() {
+	local event="$1"
+	local from_version="${2:-}"
+	local to_version="${3:-}"
+	local message="${4:-}"
+	local progress="${5:-100}"
+	UPGRADE_EVENT_FINALIZED=1
+	emit_upgrade_event "$event" "$from_version" "$to_version" "$message" "$progress"
+}
+
+cleanup_and_report_failure() {
+	local code=$?
+	if [ -n "${tmp_dir:-}" ]; then
+		rm -rf "$tmp_dir"
+	fi
+	if [ "$code" -ne 0 ] && [ "${UPGRADE_EVENT_FINALIZED:-0}" != "1" ]; then
+		emit_terminal_upgrade_event "update_failed" "${CURRENT_VERSION:-}" "${TARGET_VERSION:-}" "${UPGRADE_STEP:-updater failed} (exit $code)"
+	fi
+	exit "$code"
 }
 
 verify_signature() {
@@ -138,17 +175,19 @@ restart_with_rollback() {
 		return 0
 	fi
 	say_err "$SERVICE_NAME 升级后未变为 active，正在回滚" "$SERVICE_NAME did not become active after update; rolling back"
-	emit_upgrade_event "update_failed" "$CURRENT_VERSION" "$TARGET_VERSION" "service did not become active after update"
+	emit_terminal_upgrade_event "update_failed" "$CURRENT_VERSION" "$TARGET_VERSION" "service did not become active after update"
 	emit_upgrade_event "rollback_started" "$CURRENT_VERSION" "$TARGET_VERSION" "service did not become active"
 	if [ -x "$BACKUP_PATH" ]; then
 		install -m 0755 "$BACKUP_PATH" "$INSTALL_PATH.rollback"
 		mv -f "$INSTALL_PATH.rollback" "$INSTALL_PATH"
 		systemctl restart "$SERVICE_NAME" || true
 		if wait_service_active "$SERVICE_NAME" "$START_TIMEOUT_SECONDS"; then
-			emit_upgrade_event "rollback_succeeded" "$TARGET_VERSION" "$CURRENT_VERSION" "service restored previous binary"
+			emit_terminal_upgrade_event "rollback_succeeded" "$TARGET_VERSION" "$CURRENT_VERSION" "service restored previous binary"
 		else
-			emit_upgrade_event "rollback_failed" "$TARGET_VERSION" "$CURRENT_VERSION" "rollback restart failed"
+			emit_terminal_upgrade_event "rollback_failed" "$TARGET_VERSION" "$CURRENT_VERSION" "rollback restart failed"
 		fi
+	else
+		emit_terminal_upgrade_event "rollback_failed" "$TARGET_VERSION" "$CURRENT_VERSION" "previous binary backup missing"
 	fi
 	return 1
 }
@@ -257,39 +296,55 @@ consume_update_request() {
 consume_update_request
 
 REQUESTED_VERSION="$(normalize_version "$REQUESTED_VERSION")"
+CURRENT_VERSION="$(current_agent_version || true)"
+TARGET_VERSION="nodeping-agent/$REQUESTED_VERSION"
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+trap cleanup_and_report_failure EXIT
 
 version="$REQUESTED_VERSION"
 if [ "$version" = "latest" ]; then
+	UPGRADE_STEP="resolving latest release for $GITHUB_REPOSITORY"
+	emit_upgrade_progress 25 "$UPGRADE_STEP"
 	version="$(latest_release_version "$tmp_dir")"
 fi
 
 if [ -z "$version" ]; then
+	UPGRADE_STEP="checking requested release version"
 	say_err "发布版本为空" "empty release version"
 	exit 2
 fi
+
+TARGET_VERSION="nodeping-agent/$version"
 
 if [ -z "$BASE_URL" ]; then
 	BASE_URL="$(default_release_base_url "$version")"
 fi
 BASE_URL="${BASE_URL%/}"
 
-TARGET_VERSION="nodeping-agent/$version"
-CURRENT_VERSION="$(current_agent_version || true)"
-
+UPGRADE_STEP="detecting system platform"
+emit_upgrade_progress 30 "$UPGRADE_STEP"
 os="$(detect_os)"
 arch="$(detect_arch)"
 artifact="nodeping-agent_${version}_${os}_${arch}.tar.gz"
 checksums="nodeping-agent_${version}_checksums.txt"
 
+UPGRADE_STEP="downloading $artifact"
+emit_upgrade_progress 40 "$UPGRADE_STEP"
 download "$BASE_URL/$artifact" "$tmp_dir/$artifact"
+UPGRADE_STEP="downloading $checksums"
+emit_upgrade_progress 45 "$UPGRADE_STEP"
 download "$BASE_URL/$checksums" "$tmp_dir/$checksums"
 if [ -n "$SIGNING_PUBLIC_KEY" ] || signature_required; then
+	UPGRADE_STEP="downloading signature for $artifact"
+	emit_upgrade_progress 50 "$UPGRADE_STEP"
 	download "$BASE_URL/$artifact.minisig" "$tmp_dir/$artifact.minisig"
+	UPGRADE_STEP="verifying signature for $artifact"
+	emit_upgrade_progress 55 "$UPGRADE_STEP"
 	verify_signature "$tmp_dir/$artifact" "$tmp_dir/$artifact.minisig"
 fi
 
+UPGRADE_STEP="checking checksum for $artifact"
+emit_upgrade_progress 60 "$UPGRADE_STEP"
 expected="$(awk -v file="$artifact" '$2 == file { print $1 }' "$tmp_dir/$checksums")"
 if [ -z "$expected" ]; then
 	say_err "校验和文件 $checksums 中找不到 $artifact" "checksum for $artifact not found in $checksums"
@@ -302,6 +357,8 @@ if [ "$actual" != "$expected" ]; then
 	exit 1
 fi
 
+UPGRADE_STEP="extracting $artifact"
+emit_upgrade_progress 70 "$UPGRADE_STEP"
 mkdir -p "$tmp_dir/extract"
 tar -xzf "$tmp_dir/$artifact" -C "$tmp_dir/extract"
 new_bin="$(find "$tmp_dir/extract" -type f -name nodeping-agent -perm -111 | head -n 1)"
@@ -312,11 +369,12 @@ fi
 
 if [ -x "$INSTALL_PATH" ] && cmp -s "$new_bin" "$INSTALL_PATH"; then
 	say "nodeping-agent 已是最新版本：$version" "nodeping-agent is already up to date: $version"
-	emit_upgrade_event "up_to_date" "$CURRENT_VERSION" "$TARGET_VERSION" "binary already matches requested version"
+	emit_terminal_upgrade_event "up_to_date" "$CURRENT_VERSION" "$TARGET_VERSION" "binary already matches requested version"
 	exit 0
 fi
 
-emit_upgrade_event "update_started" "$CURRENT_VERSION" "$TARGET_VERSION" "installing release $version"
+UPGRADE_STEP="installing release $version"
+emit_upgrade_progress 80 "$UPGRADE_STEP"
 
 if [ -x "$INSTALL_PATH" ]; then
 	install -m 0755 "$INSTALL_PATH" "$BACKUP_PATH"
@@ -330,8 +388,10 @@ if command -v setcap >/dev/null 2>&1; then
 fi
 say "已安装 nodeping-agent $version 到 $INSTALL_PATH" "installed nodeping-agent $version to $INSTALL_PATH"
 
+UPGRADE_STEP="restarting $SERVICE_NAME"
+emit_upgrade_progress 90 "$UPGRADE_STEP"
 if restart_with_rollback; then
-	emit_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$TARGET_VERSION" "update completed"
+	emit_terminal_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$TARGET_VERSION" "update completed"
 else
 	exit 1
 fi

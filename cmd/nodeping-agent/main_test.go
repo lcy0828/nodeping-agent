@@ -54,6 +54,20 @@ func TestReadSSETasksAllowsLargePayload(t *testing.T) {
 	}
 }
 
+func TestTaskStreamHTTPClientKeepsLongLivedConnection(t *testing.T) {
+	base := &http.Client{Timeout: 30 * time.Second}
+	streamClient := taskStreamHTTPClient(config{HTTPClient: base})
+	if streamClient == base {
+		t.Fatal("taskStreamHTTPClient should not mutate the shared client")
+	}
+	if streamClient.Timeout != 0 {
+		t.Fatalf("stream client timeout = %s, want no timeout", streamClient.Timeout)
+	}
+	if base.Timeout != 30*time.Second {
+		t.Fatalf("base client timeout mutated to %s", base.Timeout)
+	}
+}
+
 func TestDoctorConfigReportsMissingRequiredValues(t *testing.T) {
 	check := checkConfig(config{})
 	if check.Status != "fail" || !strings.Contains(check.Message, "NODEPING_SERVER_URL") || !strings.Contains(check.Message, "NODEPING_TOKEN") {

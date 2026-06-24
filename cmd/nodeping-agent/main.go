@@ -725,7 +725,7 @@ func consumeTaskStream(ctx context.Context, cfg config, sem chan struct{}) error
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.AgentToken)
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := cfg.HTTPClient.Do(req)
+	resp, err := taskStreamHTTPClient(cfg).Do(req)
 	if err != nil {
 		return err
 	}
@@ -741,6 +741,15 @@ func consumeTaskStream(ctx context.Context, cfg config, sem chan struct{}) error
 			executeAndReport(ctx, cfg, task)
 		}()
 	})
+}
+
+func taskStreamHTTPClient(cfg config) *http.Client {
+	if cfg.HTTPClient == nil {
+		return &http.Client{}
+	}
+	client := *cfg.HTTPClient
+	client.Timeout = 0
+	return &client
 }
 
 func readSSETasks(ctx context.Context, body io.Reader, handle func(taskRequest)) error {
