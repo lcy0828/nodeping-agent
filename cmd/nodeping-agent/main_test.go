@@ -313,6 +313,44 @@ func TestRunLongProbeAllowsSustainedSampleCount(t *testing.T) {
 	}
 }
 
+func TestLongProbeProgressReporterPostsEachSample(t *testing.T) {
+	var events []taskEvent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/v1/tasks/task-1/events" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer agent-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		var event taskEvent
+		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+			t.Fatalf("decode event: %v", err)
+		}
+		events = append(events, event)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	report := longProbeProgressReporter(context.Background(), config{
+		ServerURL:  server.URL,
+		AgentToken: "agent-token",
+		HTTPClient: server.Client(),
+	}, taskRequest{ID: "task-1"}, "long_ping")
+	report(map[string]any{"sample_count": 100, "completed_count": 1, "success_count": 1, "samples": []map[string]any{{"seq": 1, "success": true, "latency_ms": 8.0}}})
+	report(map[string]any{"sample_count": 100, "completed_count": 2, "success_count": 2, "samples": []map[string]any{{"seq": 1, "success": true, "latency_ms": 8.0}, {"seq": 2, "success": true, "latency_ms": 9.0}}})
+
+	if len(events) != 2 {
+		t.Fatalf("posted events = %d, want 2", len(events))
+	}
+	if events[0].Progress != 1 || events[1].Progress != 2 {
+		t.Fatalf("unexpected progress values: %+v", events)
+	}
+	if events[1].Extra["event_kind"] != "long_probe_sample" || events[1].Extra["task_type"] != "long_ping" {
+		t.Fatalf("unexpected event extra: %+v", events[1].Extra)
+	}
+}
+
 func TestRunUDPProbe(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

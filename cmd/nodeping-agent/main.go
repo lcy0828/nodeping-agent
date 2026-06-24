@@ -1129,13 +1129,11 @@ func longProbeProgressReporter(ctx context.Context, cfg config, task taskRequest
 			Extra:     extra,
 			CreatedAt: time.Now().UTC(),
 		}
-		go func() {
-			reportCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			if err := postAgentJSON(reportCtx, cfg, "/api/agent/v1/tasks/"+url.PathEscape(task.ID)+"/events", event, nil); err != nil {
-				log.Printf("report task event failed task_id=%s: %v", task.ID, err)
-			}
-		}()
+		reportCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if err := postAgentJSON(reportCtx, cfg, "/api/agent/v1/tasks/"+url.PathEscape(task.ID)+"/events", event, nil); err != nil {
+			log.Printf("report task event failed task_id=%s: %v", task.ID, err)
+		}
 	}
 }
 
