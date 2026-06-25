@@ -1092,13 +1092,16 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		target, _ := payloadString(payload, "udp_probe")
 		targetSummary = target
 		response, err = runUDPProbe(ctx, target, task.Options)
-		latency = floatFromMap(response, "udp_probe")
+		latency = udpProbeTaskLatency(response)
 		responseIP = hostLiteralIP(target)
 	case "http_ping":
 		target, _ := payloadString(payload, "http_ping")
 		targetSummary = target
 		latency, responseIP, err = runHTTPPing(ctx, target)
 		response = map[string]any{"http_ping": latency}
+		if responseIP != "" {
+			response["response_ip"] = responseIP
+		}
 	case "http_request":
 		target, method, headers, body := httpRequestPayload(payload)
 		targetSummary = target
@@ -1169,10 +1172,15 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		result.ErrorCode = "TASK_FAILED"
 		result.ErrorMessage = err.Error()
 		result.LatencyMS = elapsedMS(started)
+		if latency > 0 {
+			result.LatencyMS = latency
+		}
+		result.ResponseIP = responseIP
+		result.Result = response
 		result.Extra = taskResultExtra(task, targetSummary)
 		return result
 	}
-	if latency <= 0 {
+	if latency <= 0 && task.TaskType != "udp_probe" {
 		latency = elapsedMS(started)
 	}
 	result.Status = "completed"
@@ -1193,6 +1201,24 @@ func taskResultExtra(task taskRequest, target string) map[string]any {
 		extra["target"] = target
 	}
 	return extra
+}
+
+func udpProbeTaskLatency(response map[string]any) float64 {
+	if response == nil {
+		return 0
+	}
+	if boolFromMap(response, "response_received") {
+		if latency := floatFromMap(response, "response_latency_ms"); latency > 0 {
+			return latency
+		}
+	}
+	if latency := floatFromMap(response, "udp_probe"); latency > 0 {
+		return latency
+	}
+	if latency := floatFromMap(response, "send_latency_ms"); latency > 0 {
+		return latency
+	}
+	return 0
 }
 
 func dnsTargetSummary(payload map[string]any) string {
@@ -1426,12 +1452,33 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 	if target == "" {
 		return nil, errors.New("udp_probe target is required")
 	}
-	payload := stringOptionAny(options, "payload")
-	if payload == "" {
-		payload = "nodeping"
+	payloadMode := strings.ToLower(strings.TrimSpace(stringOptionAny(options, "payload_mode")))
+	payloadText := stringOptionAny(options, "payload")
+	payloadBytes := []byte(payloadText)
+	dnsQueryDomain := strings.TrimSpace(stringOptionAny(options, "dns_query_domain"))
+	if dnsQueryDomain == "" {
+		dnsQueryDomain = "example.com"
 	}
-	if len(payload) > 1024 {
-		payload = payload[:1024]
+	if payloadMode == "" || payloadMode == "auto" {
+		if payloadText == "" && udpTargetPort(target) == "53" {
+			payloadMode = "dns_query"
+		} else {
+			payloadMode = "text"
+		}
+	}
+	switch payloadMode {
+	case "dns_query":
+		payloadBytes = buildDNSQueryPayload(dnsQueryDomain, "A")
+	case "text":
+		if payloadText == "" {
+			payloadText = "nodeping"
+			payloadBytes = []byte(payloadText)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported udp payload_mode: %s", payloadMode)
+	}
+	if len(payloadBytes) > 1024 {
+		payloadBytes = payloadBytes[:1024]
 	}
 	waitResponse := boolOptionDefault(options, "wait_response", true)
 	readTimeoutMS := intOption(options, "read_timeout_ms", 1000)
@@ -1448,21 +1495,30 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 		return nil, err
 	}
 	defer conn.Close()
+	connectLatencyMS := elapsedMS(started)
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	} else {
 		_ = conn.SetDeadline(time.Now().Add(time.Duration(readTimeoutMS) * time.Millisecond))
 	}
-	sent, err := conn.Write([]byte(payload))
+	writeStarted := time.Now()
+	sent, err := conn.Write(payloadBytes)
 	if err != nil {
 		return nil, err
 	}
+	sendLatencyMS := elapsedMS(writeStarted)
 	result := map[string]any{
-		"udp_probe":       elapsedMS(started),
-		"target":          target,
-		"sent_bytes":      sent,
-		"wait_response":   waitResponse,
-		"read_timeout_ms": readTimeoutMS,
+		"udp_probe":          sendLatencyMS,
+		"target":             target,
+		"sent_bytes":         sent,
+		"payload_mode":       payloadMode,
+		"wait_response":      waitResponse,
+		"read_timeout_ms":    readTimeoutMS,
+		"connect_latency_ms": connectLatencyMS,
+		"send_latency_ms":    sendLatencyMS,
+	}
+	if payloadMode == "dns_query" {
+		result["dns_query_domain"] = dnsQueryDomain
 	}
 	if remote := conn.RemoteAddr(); remote != nil {
 		result["remote_addr"] = remote.String()
@@ -1480,7 +1536,7 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 			result["reachable"] = true
 			result["response_received"] = false
 			result["response_timeout"] = true
-			result["udp_probe"] = elapsedMS(started)
+			result["elapsed_ms"] = elapsedMS(started)
 			return result, nil
 		}
 		return nil, err
@@ -1488,8 +1544,56 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 	result["reachable"] = true
 	result["response_received"] = true
 	result["received_bytes"] = received
-	result["udp_probe"] = elapsedMS(started)
+	responseLatencyMS := elapsedMS(started)
+	result["udp_probe"] = responseLatencyMS
+	result["response_latency_ms"] = responseLatencyMS
 	return result, nil
+}
+
+func udpTargetPort(target string) string {
+	_, port, err := net.SplitHostPort(strings.TrimSpace(target))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(port)
+}
+
+func buildDNSQueryPayload(domain string, recordType string) []byte {
+	domain = strings.Trim(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		domain = "example.com"
+	}
+	recordType = strings.ToUpper(strings.TrimSpace(recordType))
+	qtype := uint16(1)
+	if recordType == "AAAA" {
+		qtype = 28
+	}
+	id := make([]byte, 2)
+	if _, err := rand.Read(id); err != nil {
+		now := time.Now().UnixNano()
+		id[0] = byte(now >> 8)
+		id[1] = byte(now)
+	}
+	payload := []byte{
+		id[0], id[1],
+		0x01, 0x00,
+		0x00, 0x01,
+		0x00, 0x00,
+		0x00, 0x00,
+		0x00, 0x00,
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" {
+			continue
+		}
+		if len(label) > 63 {
+			label = label[:63]
+		}
+		payload = append(payload, byte(len(label)))
+		payload = append(payload, []byte(label)...)
+	}
+	payload = append(payload, 0x00, byte(qtype>>8), byte(qtype), 0x00, 0x01)
+	return payload
 }
 
 func runHTTPRequest(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any) (float64, string, map[string]any, error) {
@@ -1525,14 +1629,23 @@ func runHTTPRequest(ctx context.Context, method string, target string, headers m
 	bodyLimit := int64(maxBodyBytes)
 	readBody, _ := io.ReadAll(io.LimitReader(resp.Body, bodyLimit+1))
 	latency := elapsedMS(started)
-	responseIP := ""
-	if parsed, err := url.Parse(target); err == nil {
-		responseIP = literalIP(parsed.Hostname())
+	responseIP := trace.responseIP
+	if responseIP == "" {
+		responseIP = literalIP(resp.Request.URL.Hostname())
+	}
+	if responseIP == "" {
+		parsed, err := url.Parse(target)
+		if err == nil {
+			responseIP = literalIP(parsed.Hostname())
+		}
 	}
 	result := map[string]any{
 		"status_code":  resp.StatusCode,
 		"http_request": latency,
 		"body_bytes":   len(readBody),
+	}
+	if responseIP != "" {
+		result["response_ip"] = responseIP
 	}
 	bodyForResult := readBody
 	if len(readBody) > maxBodyBytes {
@@ -1590,6 +1703,7 @@ type httpTimingTrace struct {
 	tlsDone      time.Time
 	gotConn      time.Time
 	firstByte    time.Time
+	responseIP   string
 }
 
 func (t *httpTimingTrace) clientTrace() *httptrace.ClientTrace {
@@ -1612,8 +1726,11 @@ func (t *httpTimingTrace) clientTrace() *httptrace.ClientTrace {
 		TLSHandshakeDone: func(tls.ConnectionState, error) {
 			t.tlsDone = time.Now()
 		},
-		GotConn: func(httptrace.GotConnInfo) {
+		GotConn: func(info httptrace.GotConnInfo) {
 			t.gotConn = time.Now()
+			if ip := remoteAddrIP(info.Conn.RemoteAddr()); ip != "" {
+				t.responseIP = ip
+			}
 		},
 		GotFirstResponseByte: func() {
 			t.firstByte = time.Now()
@@ -2960,6 +3077,29 @@ func floatFromMap(values map[string]any, key string) float64 {
 		parsed, _ := strconv.ParseFloat(strings.TrimSpace(fmt.Sprint(value)), 64)
 		return parsed
 	}
+}
+
+func boolFromMap(values map[string]any, key string) bool {
+	if values == nil {
+		return false
+	}
+	switch value := values[key].(type) {
+	case bool:
+		return value
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "y", "on":
+			return true
+		}
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case json.Number:
+		parsed, _ := value.Float64()
+		return parsed != 0
+	}
+	return false
 }
 
 func minFloat(values []float64) float64 {

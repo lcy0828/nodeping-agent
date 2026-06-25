@@ -456,6 +456,64 @@ func TestRunUDPProbe(t *testing.T) {
 	<-done
 }
 
+func TestRunUDPProbeTimeoutKeepsSendLatencySeparate(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer conn.Close()
+
+	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), map[string]any{"payload": "hello", "wait_response": true, "read_timeout_ms": 200})
+	if err != nil {
+		t.Fatalf("runUDPProbe: %v", err)
+	}
+	if result["response_timeout"] != true || result["response_received"] != false {
+		t.Fatalf("unexpected timeout result: %+v", result)
+	}
+	if _, ok := result["elapsed_ms"]; !ok {
+		t.Fatalf("elapsed_ms missing from timeout result: %+v", result)
+	}
+	udpLatency, _ := result["udp_probe"].(float64)
+	if udpLatency >= 200 {
+		t.Fatalf("udp_probe = %v, want send latency rather than read timeout", udpLatency)
+	}
+	if _, ok := result["send_latency_ms"]; !ok {
+		t.Fatalf("send_latency_ms missing from timeout result: %+v", result)
+	}
+}
+
+func TestRunUDPProbeSendsDNSQueryPayload(t *testing.T) {
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer conn.Close()
+	received := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 512)
+		n, _, err := conn.ReadFrom(buf)
+		if err == nil {
+			received <- append([]byte(nil), buf[:n]...)
+		}
+	}()
+
+	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), map[string]any{"payload_mode": "dns_query", "dns_query_domain": "example.com", "wait_response": false})
+	if err != nil {
+		t.Fatalf("runUDPProbe: %v", err)
+	}
+	if result["payload_mode"] != "dns_query" {
+		t.Fatalf("payload_mode = %v, want dns_query", result["payload_mode"])
+	}
+	select {
+	case payload := <-received:
+		if len(payload) < 12 || payload[2] != 0x01 || payload[5] != 0x01 {
+			t.Fatalf("payload does not look like DNS query: %v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for udp payload")
+	}
+}
+
 func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Alt-Svc", `h3=":443"; ma=86400`)
@@ -463,7 +521,7 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	}))
 	defer server.Close()
 
-	latency, _, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
+	latency, responseIP, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
 		"expected_status":      200,
 		"expect_body_contains": "nodeping",
 	})
@@ -472,6 +530,10 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	}
 	if latency <= 0 || result["status_code"] != 200 || result["http3_advertised"] != true || result["body"] != "nodeping-ok" {
 		t.Fatalf("unexpected http result latency=%v result=%+v", latency, result)
+	}
+	serverIP := hostLiteralIP(server.Listener.Addr().String())
+	if responseIP != serverIP || result["response_ip"] != serverIP {
+		t.Fatalf("response IP = %q result=%+v, want %q", responseIP, result, serverIP)
 	}
 }
 
@@ -489,6 +551,55 @@ func TestRunHTTPRequestReturnsTruncatedBody(t *testing.T) {
 	}
 	if result["body"] != "node" || result["body_truncated"] != true || result["body_bytes"] != 4 {
 		t.Fatalf("unexpected truncated body result: %+v", result)
+	}
+}
+
+func TestExecuteTaskHTTPPingIncludesResponseIP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	payload, _ := json.Marshal(map[string]any{"http_ping": server.URL})
+	result := executeTask(context.Background(), config{}, taskRequest{
+		ID:       "http-ping-response-ip",
+		TaskType: "http_ping",
+		Payload:  payload,
+	})
+	serverIP := hostLiteralIP(server.Listener.Addr().String())
+	if !result.Success {
+		t.Fatalf("executeTask failed: %+v", result)
+	}
+	if result.ResponseIP != serverIP || result.Result["response_ip"] != serverIP {
+		t.Fatalf("response IP = %q result=%+v, want %q", result.ResponseIP, result.Result, serverIP)
+	}
+}
+
+func TestExecuteTaskHTTPRequestFailureKeepsResponseIP(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("failed"))
+	}))
+	defer server.Close()
+
+	payload, _ := json.Marshal(map[string]any{
+		"http_request": map[string]any{
+			"url":    server.URL,
+			"method": http.MethodGet,
+		},
+	})
+	result := executeTask(context.Background(), config{}, taskRequest{
+		ID:       "http-request-failed-response-ip",
+		TaskType: "http_request",
+		Payload:  payload,
+		Options:  map[string]any{"expected_status": 200},
+	})
+	serverIP := hostLiteralIP(server.Listener.Addr().String())
+	if result.Success {
+		t.Fatalf("executeTask success = true, want failed status assertion")
+	}
+	if result.ResponseIP != serverIP || result.Result["response_ip"] != serverIP {
+		t.Fatalf("response IP = %q result=%+v, want %q", result.ResponseIP, result.Result, serverIP)
 	}
 }
 
