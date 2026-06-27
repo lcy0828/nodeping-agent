@@ -40,9 +40,7 @@ NODEPING_TOKEN='np_xxx' \
 nodeping-agent doctor
 ```
 
-`doctor` 会检查配置、token 文件读写、系统 `ping`、`traceroute`、`mtr`、DNS、公网 IP、远程升级配置和后端 `/healthz` 可达性。使用 `nodeping-agent doctor --json` 可以输出结构化结果，便于安装脚本、Docker healthcheck 或运维系统读取。
-
-Agent 心跳会同步上报 `dependency_status`。后端和页面部署到配套版本后，可以直接看到缺少的依赖、依赖版本提示、受影响能力和安装/升级建议。旧版 `mtr` 不支持 `-j`/JSON 输出时，Agent 会保留 MTR 能力并使用文本报告降级解析，同时在依赖状态里提示升级版本。
+`doctor` 会检查配置、token 文件读写、系统 `ping`、DNS、公网 IP 和后端 `/healthz` 可达性。
 
 ## 构建独立安装包
 
@@ -97,7 +95,7 @@ cd nodeping-agent
 sudo ./install-systemd.sh
 ```
 
-安装脚本会预检 `systemctl`、`ping`、`curl/wget`、`tar` 等基础依赖；重复安装会打印当前版本和将要安装的版本。配置完整时，启动服务后会自动执行一次 `nodeping-agent doctor --json` 和可读自检，缺少 `traceroute`、`mtr` 等诊断依赖时会给出明确提示。
+安装脚本会预检 `systemctl`、`ping`、`curl/wget`、`tar` 等依赖；重复安装会打印当前版本和将要安装的版本。配置完整时，启动服务后会自动执行一次 `nodeping-agent doctor`。
 
 编辑配置：
 
@@ -167,7 +165,7 @@ cp docker.env.example .env
 docker compose --env-file .env up -d
 ```
 
-Docker 镜像已预置 `ping`、`traceroute` 和 `mtr`。容器需要 `NET_RAW` 能力来执行 ICMP ping；Compose 文件已包含 `cap_add: NET_RAW`。
+容器需要 `NET_RAW` 能力来执行 ICMP ping；Compose 文件已包含 `cap_add: NET_RAW`。
 
 发布镜像：
 

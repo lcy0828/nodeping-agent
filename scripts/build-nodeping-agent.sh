@@ -143,6 +143,7 @@ EOF
 done
 
 printf '%s\n' "$VERSION" > "$DIST_DIR/VERSION"
+printf '%s\n' "$VERSION" > "$DIST_DIR/latest.txt"
 write_platforms_file "$DIST_DIR/PLATFORMS.md"
 write_release_notes_file "$DIST_DIR/RELEASE_NOTES.md"
 {

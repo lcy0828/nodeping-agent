@@ -1095,9 +1095,9 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		latency = udpProbeTaskLatency(response)
 		responseIP = hostLiteralIP(target)
 	case "http_ping":
-		target, _ := payloadString(payload, "http_ping")
+		target, httpPingOptions := httpPingPayload(payload)
 		targetSummary = target
-		latency, responseIP, err = runHTTPPing(ctx, target)
+		latency, responseIP, err = runHTTPPing(ctx, target, mergeAgentOptions(task.Options, httpPingOptions))
 		response = map[string]any{"http_ping": latency}
 		if responseIP != "" {
 			response["response_ip"] = responseIP
@@ -1107,9 +1107,9 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		targetSummary = target
 		latency, responseIP, response, err = runHTTPRequest(ctx, method, target, headers, body, task.Options)
 	case "http3_check":
-		target, _ := payloadString(payload, "http3_check")
+		target, http3Options := http3CheckPayload(payload)
 		targetSummary = target
-		response, err = runHTTP3Check(ctx, target, task.Options)
+		response, err = runHTTP3Check(ctx, target, mergeAgentOptions(task.Options, http3Options))
 		latency = floatFromMap(response, "http3_check")
 		responseIP = stringFromMap(response, "response_ip")
 	case "dns_lookup":
@@ -1442,8 +1442,8 @@ func longProbeSummary(taskKey string, started time.Time, requestedCount int, int
 	return result
 }
 
-func runHTTPPing(ctx context.Context, target string) (float64, string, error) {
-	latency, responseIP, _, err := runHTTPRequest(ctx, http.MethodGet, target, nil, "", nil)
+func runHTTPPing(ctx context.Context, target string, options map[string]any) (float64, string, error) {
+	latency, responseIP, _, err := runHTTPRequest(ctx, http.MethodGet, target, nil, "", options)
 	return latency, responseIP, err
 }
 
@@ -1609,10 +1609,21 @@ func runHTTPRequest(ctx context.Context, method string, target string, headers m
 	if err != nil {
 		return 0, "", nil, err
 	}
+	originalHost := originalHostOption(options)
+	if originalHost != "" {
+		req.Host = originalHost
+	}
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	client := &http.Client{Timeout: deadlineTimeout(ctx, 10*time.Second)}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if originalHost != "" && req.URL.Scheme == "https" {
+		transport.TLSClientConfig = &tls.Config{
+			ServerName: strings.Trim(originalHost, "[]"),
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+	client := &http.Client{Timeout: deadlineTimeout(ctx, 10*time.Second), Transport: transport}
 	started := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1692,6 +1703,70 @@ func httpRequestPayload(payload map[string]any) (string, string, map[string]stri
 		body = fmt.Sprint(raw["body"])
 	}
 	return target, method, headers, body
+}
+
+func httpPingPayload(payload map[string]any) (string, map[string]any) {
+	raw, ok := payload["http_ping"].(map[string]any)
+	if !ok || raw == nil {
+		target, _ := payloadString(payload, "http_ping")
+		return target, nil
+	}
+	target := strings.TrimSpace(firstNonEmptyStringAgent(
+		fmt.Sprint(raw["url"]),
+		fmt.Sprint(raw["target"]),
+	))
+	options := map[string]any{}
+	if originalHost := strings.TrimSpace(fmt.Sprint(raw["original_host"])); originalHost != "" && originalHost != "<nil>" {
+		options["original_host"] = originalHost
+	}
+	return target, options
+}
+
+func http3CheckPayload(payload map[string]any) (string, map[string]any) {
+	raw, ok := payload["http3_check"].(map[string]any)
+	if !ok || raw == nil {
+		target, _ := payloadString(payload, "http3_check")
+		return target, nil
+	}
+	target := strings.TrimSpace(firstNonEmptyStringAgent(
+		fmt.Sprint(raw["url"]),
+		fmt.Sprint(raw["target"]),
+	))
+	options := map[string]any{}
+	if originalHost := strings.TrimSpace(fmt.Sprint(raw["original_host"])); originalHost != "" && originalHost != "<nil>" {
+		options["original_host"] = originalHost
+	}
+	return target, options
+}
+
+func mergeAgentOptions(base map[string]any, overlays ...map[string]any) map[string]any {
+	if len(base) == 0 && len(overlays) == 0 {
+		return nil
+	}
+	merged := map[string]any{}
+	for key, value := range base {
+		merged[key] = value
+	}
+	for _, overlay := range overlays {
+		for key, value := range overlay {
+			merged[key] = value
+		}
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+func originalHostOption(options map[string]any) string {
+	host := strings.Trim(strings.TrimSpace(firstNonEmptyStringAgent(
+		stringOptionAny(options, "original_host"),
+		stringOptionAny(options, "server_name"),
+	)), "[]")
+	if host == "" || strings.ContainsAny(host, " \t\r\n") {
+		return ""
+	}
+	return host
 }
 
 type httpTimingTrace struct {
@@ -1915,8 +1990,13 @@ func runHTTP3CheckWithTLSConfig(ctx context.Context, target string, options map[
 	if parsed.Scheme != "https" {
 		return nil, errors.New("http3_check requires https URL")
 	}
+	originalHost := originalHostOption(options)
 	started := time.Now()
-	_, _, httpsResponse, _ := runHTTPRequest(ctx, http.MethodGet, target, nil, "", map[string]any{"max_body_bytes": 0})
+	httpsOptions := map[string]any{"max_body_bytes": 0}
+	if originalHost != "" {
+		httpsOptions["original_host"] = originalHost
+	}
+	_, _, httpsResponse, _ := runHTTPRequest(ctx, http.MethodGet, target, nil, "", httpsOptions)
 	result := map[string]any{
 		"http3_check": elapsedMS(started),
 	}
@@ -1963,6 +2043,9 @@ func runHTTP3CheckWithTLSConfig(ctx context.Context, target string, options map[
 			headers[item.header] = value
 		}
 	}
+	if originalHost != "" {
+		headers["host"] = originalHost
+	}
 	latency, responseIP, http3Response, err := runHTTP3RequestWithTLSConfig(ctx, method, target, headers, body, options, tlsConfig)
 	for key, value := range http3Response {
 		result[key] = value
@@ -1993,6 +2076,10 @@ func runHTTP3RequestWithTLSConfig(ctx context.Context, method string, target str
 	if err != nil {
 		return 0, "", nil, err
 	}
+	originalHost := originalHostOption(options)
+	if originalHost != "" {
+		req.Host = originalHost
+	}
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
@@ -2004,6 +2091,9 @@ func runHTTP3RequestWithTLSConfig(ctx context.Context, method string, target str
 		if tlsConfig.MinVersion == 0 {
 			tlsConfig.MinVersion = tls.VersionTLS12
 		}
+	}
+	if originalHost != "" {
+		tlsConfig.ServerName = originalHost
 	}
 	transport := &http3.Transport{
 		TLSClientConfig: tlsConfig,

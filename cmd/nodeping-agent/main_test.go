@@ -554,6 +554,50 @@ func TestRunHTTPRequestReturnsTruncatedBody(t *testing.T) {
 	}
 }
 
+func TestRunHTTPRequestUsesOriginalHostHeader(t *testing.T) {
+	seenHost := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHost = r.Host
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	_, _, _, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
+		"original_host": "origin.example.com",
+	})
+	if err != nil {
+		t.Fatalf("runHTTPRequest: %v", err)
+	}
+	if seenHost != "origin.example.com" {
+		t.Fatalf("Host = %q, want original host", seenHost)
+	}
+}
+
+func TestExecuteTaskHTTPPingAcceptsObjectPayloadWithOriginalHost(t *testing.T) {
+	seenHost := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHost = r.Host
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	payload, _ := json.Marshal(map[string]any{"http_ping": map[string]any{
+		"url":           server.URL,
+		"original_host": "meeting.tencent.com",
+	}})
+	result := executeTask(context.Background(), config{}, taskRequest{
+		ID:       "http-ping-object-payload",
+		TaskType: "http_ping",
+		Payload:  payload,
+	})
+	if !result.Success {
+		t.Fatalf("executeTask failed: %+v", result)
+	}
+	if seenHost != "meeting.tencent.com" {
+		t.Fatalf("Host = %q, want original host", seenHost)
+	}
+}
+
 func TestExecuteTaskHTTPPingIncludesResponseIP(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok"))
