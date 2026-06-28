@@ -1127,16 +1127,8 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 		targetSummary = dnsTargetSummary(dnsPayload)
 		response, err = runDNSCompare(ctx, dnsPayload, task.Options)
 	case "tls_check":
-		tlsPayload := map[string]any{}
-		switch value := payload["tls_check"].(type) {
-		case map[string]any:
-			tlsPayload = value
-		case string:
-			tlsPayload["target"] = value
-		default:
-			tlsPayload = payload
-		}
-		targetSummary = strings.TrimSpace(fmt.Sprint(tlsPayload["target"]))
+		tlsPayload := tlsCheckPayload(payload)
+		targetSummary = tlsTargetSummary(tlsPayload)
 		response, err = runTLSCheck(ctx, tlsPayload)
 		responseIP = stringFromMap(response, "response_ip")
 	case "traceroute":
@@ -1253,6 +1245,48 @@ func payloadString(payload map[string]any, key string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSpace(fmt.Sprint(value)), true
+}
+
+func tlsCheckPayload(payload map[string]any) map[string]any {
+	out := map[string]any{}
+	switch value := payload["tls_check"].(type) {
+	case map[string]any:
+		for key, item := range value {
+			out[key] = item
+		}
+	case string:
+		out["target"] = value
+	default:
+		for key, item := range payload {
+			out[key] = item
+		}
+	}
+	for _, key := range []string{"host", "target", "server_name", "port"} {
+		if isBlankAny(out[key]) && !isBlankAny(payload[key]) {
+			out[key] = payload[key]
+		}
+	}
+	if isBlankAny(out["target"]) && !isBlankAny(out["host"]) {
+		out["target"] = out["host"]
+	}
+	if isBlankAny(out["host"]) && !isBlankAny(out["target"]) {
+		out["host"] = out["target"]
+	}
+	return out
+}
+
+func tlsTargetSummary(payload map[string]any) string {
+	for _, key := range []string{"target", "host"} {
+		if value := strings.TrimSpace(fmt.Sprint(payload[key])); value != "" && value != "<nil>" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isBlankAny(value any) bool {
+	text := strings.TrimSpace(fmt.Sprint(value))
+	return value == nil || text == "" || text == "<nil>"
 }
 
 func runPing(ctx context.Context, target string) (float64, error) {

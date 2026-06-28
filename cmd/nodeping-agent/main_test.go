@@ -344,6 +344,35 @@ func TestRunTLSCheck(t *testing.T) {
 	}
 }
 
+func TestTLSCheckPayloadInheritsTopLevelFallbacks(t *testing.T) {
+	payload := tlsCheckPayload(map[string]any{
+		"tls_check": map[string]any{
+			"server_name": "origin.example.com",
+		},
+		"host":   "203.0.113.10:443",
+		"target": "203.0.113.10:443",
+	})
+
+	if payload["host"] != "203.0.113.10:443" || payload["target"] != "203.0.113.10:443" || payload["server_name"] != "origin.example.com" {
+		t.Fatalf("tls payload = %+v", payload)
+	}
+	if got := tlsTargetSummary(payload); got != "203.0.113.10:443" {
+		t.Fatalf("tls target summary = %q", got)
+	}
+}
+
+func TestTLSCheckPayloadUsesHostAsTarget(t *testing.T) {
+	payload := tlsCheckPayload(map[string]any{
+		"tls_check": map[string]any{
+			"host": "example.com:443",
+		},
+	})
+
+	if payload["host"] != "example.com:443" || payload["target"] != "example.com:443" {
+		t.Fatalf("tls payload = %+v", payload)
+	}
+}
+
 func TestRunLongProbeSummarizesSamples(t *testing.T) {
 	calls := 0
 	result, err := runLongProbe(context.Background(), "long_ping", "example.com", map[string]any{"sample_count": 3, "interval_ms": 200}, func(context.Context, string) (float64, error) {
