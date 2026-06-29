@@ -271,6 +271,21 @@ func TestDoctorSnapshotSkipsMissingOptionalCommandCapabilities(t *testing.T) {
 	}
 }
 
+func TestExecuteTaskAgentDependencyFixRejectsUnknownDependency(t *testing.T) {
+	payload, _ := json.Marshal(map[string]any{"dependency": "curl"})
+	result := executeTask(context.Background(), config{}, taskRequest{
+		ID:       "dependency-fix-unknown",
+		TaskType: "agent_dependency_fix",
+		Payload:  payload,
+	})
+	if result.Success || result.ErrorCode != "TASK_FAILED" {
+		t.Fatalf("dependency fix should fail for unknown dependency: %+v", result)
+	}
+	if !strings.Contains(result.ErrorMessage, "unsupported dependency") {
+		t.Fatalf("unexpected error message: %+v", result)
+	}
+}
+
 func stringSliceContains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
