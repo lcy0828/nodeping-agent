@@ -22,28 +22,32 @@ REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
 GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
 GITHUB_API_BASE_URL="${NODEPING_AGENT_GITHUB_API_BASE_URL:-https://api.github.com}"
 default_agent_id() {
-	host="$(hostname | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._-' '-' | sed 's/^-*//; s/-*$//')"
-	if [ -z "$host" ]; then
-		host="nodeping-agent"
+	if [ -r "$STATE_DIR/agent-id" ]; then
+		existing="$(tr -d '[:space:]' < "$STATE_DIR/agent-id")"
+		case "$existing" in
+			agent-*) printf '%s\n' "$existing"; return 0 ;;
+		esac
 	fi
-	seed=""
-	for path in /etc/machine-id /var/lib/dbus/machine-id /sys/class/dmi/id/product_uuid; do
-		if [ -r "$path" ]; then
-			seed="$(tr -d '[:space:]' < "$path")"
-			if [ -n "$seed" ]; then
-				break
-			fi
-		fi
-	done
-	if [ -z "$seed" ]; then
-		seed="$(date +%s%N)-$$"
+	if command -v uuidgen >/dev/null 2>&1; then
+		printf 'agent-%s\n' "$(uuidgen | tr '[:upper:]' '[:lower:]')"
+		return 0
 	fi
-	if command -v sha256sum >/dev/null 2>&1; then
-		suffix="$(printf '%s:%s' "$host" "$seed" | sha256sum | awk '{print substr($1,1,12)}')"
+	if [ -r /proc/sys/kernel/random/uuid ]; then
+		printf 'agent-%s\n' "$(tr -d '[:space:]' < /proc/sys/kernel/random/uuid)"
+		return 0
+	fi
+	if command -v openssl >/dev/null 2>&1; then
+		hex="$(openssl rand -hex 16)"
+		printf 'agent-%s-%s-4%s-%s%s-%s\n' \
+			"$(printf '%s' "$hex" | cut -c1-8)" \
+			"$(printf '%s' "$hex" | cut -c9-12)" \
+			"$(printf '%s' "$hex" | cut -c14-16)" \
+			"$(printf '%x' $(( (0x$(printf '%s' "$hex" | cut -c17-17) & 3) | 8 )))" \
+			"$(printf '%s' "$hex" | cut -c18-20)" \
+			"$(printf '%s' "$hex" | cut -c21-32)"
 	else
-		suffix="$(printf '%s:%s' "$host" "$seed" | shasum -a 256 | awk '{print substr($1,1,12)}')"
+		printf 'agent-%s\n' "$(date +%s%N)-$$"
 	fi
-	printf 'agent-%s-%s\n' "$host" "$suffix"
 }
 
 ETC_DIR="${ETC_DIR:-/etc/nodeping-agent}"
@@ -275,6 +279,9 @@ fi
 
 tar -xzf "$tmp_dir/$artifact" -C "$tmp_dir"
 install -d -m 0755 "$ETC_DIR"
+install -d -m 0750 "$STATE_DIR"
+printf '%s\n' "$AGENT_ID" > "$STATE_DIR/agent-id"
+chmod 0600 "$STATE_DIR/agent-id"
 install -m 0600 /dev/null "$ETC_DIR/nodeping-agent.env"
 {
 	printf 'NODEPING_SERVER_URL="%s"\n' "$(env_quote "$SERVER_URL")"

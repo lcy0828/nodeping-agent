@@ -5,9 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -93,6 +91,7 @@ type taskEvent struct {
 }
 
 type registerResponse struct {
+	AgentID    string `json:"agent_id"`
 	AgentToken string `json:"agent_token"`
 }
 
@@ -210,9 +209,6 @@ func loadConfig() config {
 	if cfg.PrintVersion {
 		return cfg
 	}
-	if cfg.AgentID == "" {
-		cfg.AgentID = defaultAgentID()
-	}
 	if cfg.ServerURL == "" || cfg.Token == "" {
 		if cfg.Doctor {
 			cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
@@ -220,11 +216,12 @@ func loadConfig() config {
 		}
 		log.Fatal("NODEPING_SERVER_URL and NODEPING_TOKEN are required")
 	}
-	if cfg.Name == "" {
-		cfg.Name = cfg.AgentID
-	}
 	if cfg.AgentToken == "" {
 		cfg.AgentToken = readAgentTokenFile(cfg.AgentTokenFile)
+	}
+	cfg.AgentID = resolveAgentIDForConfig(cfg.AgentID, cfg.AgentToken, defaultAgentIDFile())
+	if cfg.Name == "" {
+		cfg.Name = cfg.AgentID
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 3
@@ -250,6 +247,12 @@ func run(ctx context.Context, cfg config) error {
 		}
 		log.Printf("binding token register failed, continuing with stored agent token: %v", err)
 	} else {
+		if agentID := strings.TrimSpace(registerResp.AgentID); agentID != "" {
+			cfg.AgentID = agentID
+			if err := writeAgentIDFile(defaultAgentIDFile(), cfg.AgentID); err != nil {
+				log.Printf("store agent id failed: %v", err)
+			}
+		}
 		cfg.AgentToken = strings.TrimSpace(registerResp.AgentToken)
 	}
 	if cfg.AgentToken == "" {
@@ -805,11 +808,11 @@ func mtrSupportsJSON(path string) bool {
 func installHint(binary string) string {
 	switch binary {
 	case "ping":
-		return "Debian/Ubuntu: sudo apt install iputils-ping; Alpine: apk add iputils; RHEL/Rocky: sudo dnf install iputils"
+		return "Debian/Ubuntu: sudo apt install iputils-ping; Alpine: apk add iputils; RHEL 8+/Rocky/Alma: sudo dnf install iputils; CentOS/RHEL 7: sudo yum install iputils"
 	case "traceroute":
-		return "Debian/Ubuntu: sudo apt install traceroute; Alpine: apk add traceroute; RHEL/Rocky: sudo dnf install traceroute"
+		return "Debian/Ubuntu: sudo apt install traceroute; Alpine: apk add traceroute; RHEL 8+/Rocky/Alma: sudo dnf install traceroute; CentOS/RHEL 7: sudo yum install traceroute"
 	case "mtr":
-		return "Debian/Ubuntu: sudo apt install mtr-tiny; Alpine: apk add mtr; RHEL/Rocky: sudo dnf install mtr"
+		return "Debian/Ubuntu: sudo apt install mtr-tiny; Alpine: apk add mtr; RHEL 8+/Rocky/Alma: sudo dnf install mtr; CentOS/RHEL 7: sudo yum install mtr"
 	default:
 		return "install " + binary + " with your system package manager"
 	}
@@ -818,7 +821,7 @@ func installHint(binary string) string {
 func upgradeHint(binary string) string {
 	switch binary {
 	case "mtr":
-		return "upgrade mtr to enable JSON output; current Agent will use text fallback when -j is unavailable"
+		return "mtr does not support JSON output; the Agent will use text fallback. CentOS/RHEL 7 repositories commonly ship mtr 0.85, so yum update may not help; use Docker Agent, upgrade to a newer RHEL-compatible OS, or manually install a newer mtr if JSON output is required"
 	default:
 		return "upgrade " + binary
 	}
@@ -3667,30 +3670,95 @@ func defaultAgentIDFile() string {
 }
 
 func defaultAgentID() string {
-	if value := readAgentIDFile(defaultAgentIDFile()); value != "" {
+	return defaultAgentIDFromFile(defaultAgentIDFile())
+}
+
+func defaultAgentIDFromFile(path string) string {
+	if value := readAgentIDFile(path); value != "" {
 		return value
 	}
-	host := sanitizeAgentIDPart(hostname())
-	seed := strings.Join([]string{
-		host,
-		readFirstExistingFile("/etc/machine-id", "/var/lib/dbus/machine-id", "/sys/class/dmi/id/product_uuid"),
-	}, ":")
-	if strings.Trim(seed, ":") == "" {
-		raw := make([]byte, 16)
-		if _, err := rand.Read(raw); err == nil {
-			seed = hex.EncodeToString(raw)
-		} else {
-			seed = strconv.FormatInt(time.Now().UnixNano(), 36)
+	value := randomLocalAgentID()
+	_ = writeAgentIDFile(path, value)
+	return value
+}
+
+func resolveAgentIDForConfig(configured string, agentToken string, path string) string {
+	configured = strings.TrimSpace(configured)
+	agentToken = strings.TrimSpace(agentToken)
+	if configured == "" {
+		if stored := readAgentIDFile(path); stored != "" {
+			if agentIDIsUUIDV4(stored) || agentToken == "" {
+				return stored
+			}
+		}
+		if agentToken != "" {
+			return randomLocalAgentID()
+		}
+		return defaultAgentIDFromFile(path)
+	}
+	if agentIDIsUUIDV4(configured) {
+		return configured
+	}
+	if stored := readAgentIDFile(path); agentIDIsUUIDV4(stored) {
+		return stored
+	}
+	if agentToken != "" {
+		return randomLocalAgentID()
+	}
+	return configured
+}
+
+func randomLocalAgentID() string {
+	if id, err := randomAgentUUID(); err == nil {
+		return id
+	}
+	return "agent-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+}
+
+func randomAgentUUID() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return fmt.Sprintf("agent-%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
+}
+
+func agentIDIsUUIDV4(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != len("agent-00000000-0000-4000-8000-000000000000") {
+		return false
+	}
+	if !strings.HasPrefix(value, "agent-") {
+		return false
+	}
+	for _, index := range []int{14, 19, 24, 29} {
+		if value[index] != '-' {
+			return false
 		}
 	}
-	sum := sha256.Sum256([]byte(seed))
-	suffix := hex.EncodeToString(sum[:])[:12]
-	if host == "" {
-		host = "nodeping-agent"
+	if value[20] != '4' {
+		return false
 	}
-	value := "agent-" + host + "-" + suffix
-	_ = writeAgentIDFile(defaultAgentIDFile(), value)
-	return value
+	switch value[25] {
+	case '8', '9', 'a', 'b', 'A', 'B':
+	default:
+		return false
+	}
+	for i := 6; i < len(value); i++ {
+		if value[i] == '-' {
+			continue
+		}
+		if !isHexDigit(value[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 func defaultUpgradeRequestFile() string {

@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +140,59 @@ func TestAgentIDFilePersistsStableValue(t *testing.T) {
 	}
 }
 
+func TestDefaultAgentIDGeneratesOpaqueStableValue(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-id")
+	if got := readAgentIDFile(path); got != "" {
+		t.Fatalf("empty agent id file read = %q", got)
+	}
+	id := randomLocalAgentID()
+	uuidAgentIDPattern := regexp.MustCompile(`^agent-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	if !uuidAgentIDPattern.MatchString(id) {
+		t.Fatalf("randomLocalAgentID()=%q, want agent UUID v4 format", id)
+	}
+	if strings.Contains(strings.ToLower(id), strings.ToLower(hostname())) {
+		t.Fatalf("randomLocalAgentID() should not include hostname: %q", id)
+	}
+	if err := writeAgentIDFile(path, id); err != nil {
+		t.Fatalf("writeAgentIDFile: %v", err)
+	}
+	if got := readAgentIDFile(path); got != id {
+		t.Fatalf("readAgentIDFile()=%q, want %q", got, id)
+	}
+}
+
+func TestResolveAgentIDMigratesLegacyConfiguredIDWhenAgentTokenExists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-id")
+	got := resolveAgentIDForConfig("ops", "npa_existing", path)
+	if !agentIDIsUUIDV4(got) {
+		t.Fatalf("resolveAgentIDForConfig()=%q, want agent UUID v4 format", got)
+	}
+	if got == "ops" {
+		t.Fatalf("legacy configured id should not be reused when agent token exists")
+	}
+	if stored := readAgentIDFile(path); stored != "" {
+		t.Fatalf("migration candidate should not be persisted before register succeeds, stored=%q", stored)
+	}
+}
+
+func TestResolveAgentIDPrefersStoredUUIDOverLegacyConfiguredID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-id")
+	stored := "agent-12345678-1234-4123-9123-123456789abc"
+	if err := writeAgentIDFile(path, stored); err != nil {
+		t.Fatalf("writeAgentIDFile: %v", err)
+	}
+	if got := resolveAgentIDForConfig("ops", "npa_existing", path); got != stored {
+		t.Fatalf("resolveAgentIDForConfig()=%q, want stored uuid %q", got, stored)
+	}
+}
+
+func TestResolveAgentIDKeepsLegacyConfiguredIDWithoutAgentToken(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-id")
+	if got := resolveAgentIDForConfig("ops", "", path); got != "ops" {
+		t.Fatalf("resolveAgentIDForConfig()=%q, want legacy configured id before first token", got)
+	}
+}
+
 func TestAgentTokenCanContinueWhenBindingTokenInvalid(t *testing.T) {
 	var statusAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +242,7 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := registerAgent(context.Background(), config{
+	resp, err := registerAgent(context.Background(), config{
 		ServerURL:  server.URL,
 		Token:      "binding-token",
 		AgentID:    "agent-test",
@@ -198,6 +252,9 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("registerAgent: %v", err)
+	}
+	if resp.AgentID != "agent-test" || resp.AgentToken != "agent-token" {
+		t.Fatalf("register response = %+v", resp)
 	}
 	if payload["server_url"] != server.URL {
 		t.Fatalf("server_url = %#v, want %q; payload=%+v", payload["server_url"], server.URL, payload)
@@ -830,6 +887,15 @@ OUT
 	}
 	if result["hop_count"] != 3 || result["protocol"] != "icmp" || result["report_cycles"] != 5 {
 		t.Fatalf("unexpected mtr metadata: %+v", result)
+	}
+}
+
+func TestInstallHintsIncludeYumFallback(t *testing.T) {
+	for _, binary := range []string{"ping", "traceroute", "mtr"} {
+		hint := installHint(binary)
+		if !strings.Contains(hint, "dnf install") || !strings.Contains(hint, "yum install") {
+			t.Fatalf("install hint for %s should include dnf and yum commands: %q", binary, hint)
+		}
 	}
 }
 
