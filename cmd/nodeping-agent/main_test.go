@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -43,7 +44,7 @@ func TestReadSSETasksAllowsLargePayload(t *testing.T) {
 	large := strings.Repeat("x", 128*1024)
 	stream := fmt.Sprintf("event: task\ndata: {\"task_id\":\"task-large\",\"agent_id\":\"agent-a\",\"task_type\":\"http_request\",\"payload\":{\"http_request\":{\"url\":\"https://example.com/\",\"body\":\"%s\"}}}\n\n", large)
 	var got taskRequest
-	err := readSSETasks(context.Background(), strings.NewReader(stream), func(task taskRequest) {
+	err := readSSETasks(context.Background(), strings.NewReader(stream), time.Second, func(task taskRequest) {
 		got = task
 	})
 	if err != nil {
@@ -51,6 +52,32 @@ func TestReadSSETasksAllowsLargePayload(t *testing.T) {
 	}
 	if got.ID != "task-large" {
 		t.Fatalf("task id = %q", got.ID)
+	}
+}
+
+func TestReadSSETasksIgnoresKeepaliveComments(t *testing.T) {
+	stream := ": connected\n\n: keepalive\n\nevent: task\ndata: {\"task_id\":\"task-1\",\"agent_id\":\"agent-a\",\"task_type\":\"ping\",\"payload\":{\"ping\":\"1.1.1.1\"}}\n\n"
+	var got taskRequest
+	err := readSSETasks(context.Background(), strings.NewReader(stream), time.Second, func(task taskRequest) {
+		got = task
+	})
+	if err != nil {
+		t.Fatalf("readSSETasks returned error: %v", err)
+	}
+	if got.ID != "task-1" {
+		t.Fatalf("task id = %q", got.ID)
+	}
+}
+
+func TestReadSSETasksReturnsIdleTimeout(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+	err := readSSETasks(context.Background(), pr, 20*time.Millisecond, func(task taskRequest) {
+		t.Fatalf("unexpected task: %+v", task)
+	})
+	if err == nil || !strings.Contains(err.Error(), "task stream idle") {
+		t.Fatalf("readSSETasks error = %v, want idle timeout", err)
 	}
 }
 

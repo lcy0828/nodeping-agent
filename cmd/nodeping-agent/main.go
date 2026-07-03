@@ -49,6 +49,9 @@ type config struct {
 	UpgradeRequestFile string
 	HeartbeatInterval  time.Duration
 	PublicIPInterval   time.Duration
+	StreamIdleTimeout  time.Duration
+	StreamRetryMin     time.Duration
+	StreamRetryMax     time.Duration
 	Concurrency        int
 	HTTPClient         *http.Client
 	PrintVersion       bool
@@ -177,6 +180,9 @@ func loadConfig() config {
 	flag.StringVar(&cfg.UpgradeRequestFile, "upgrade-request-file", env("NODEPING_AGENT_UPGRADE_REQUEST_FILE", defaultUpgradeRequestFile()), "fixed request file watched by the systemd upgrade path")
 	flag.DurationVar(&cfg.HeartbeatInterval, "heartbeat", envDuration("NODEPING_HEARTBEAT_INTERVAL", 20*time.Second), "heartbeat interval")
 	flag.DurationVar(&cfg.PublicIPInterval, "public-ip-interval", envDuration("NODEPING_PUBLIC_IP_INTERVAL", 10*time.Minute), "public IP report interval")
+	flag.DurationVar(&cfg.StreamIdleTimeout, "stream-idle-timeout", envDuration("NODEPING_STREAM_IDLE_TIMEOUT", 90*time.Second), "task stream idle timeout before reconnect")
+	flag.DurationVar(&cfg.StreamRetryMin, "stream-retry-min", envDuration("NODEPING_STREAM_RETRY_MIN", 2*time.Second), "minimum task stream reconnect delay")
+	flag.DurationVar(&cfg.StreamRetryMax, "stream-retry-max", envDuration("NODEPING_STREAM_RETRY_MAX", 30*time.Second), "maximum task stream reconnect delay")
 	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("NODEPING_CONCURRENCY", 3), "max concurrent tasks")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.Doctor, "doctor", false, "run diagnostics and exit")
@@ -222,6 +228,15 @@ func loadConfig() config {
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 3
+	}
+	if cfg.StreamIdleTimeout <= 0 {
+		cfg.StreamIdleTimeout = 90 * time.Second
+	}
+	if cfg.StreamRetryMin <= 0 {
+		cfg.StreamRetryMin = 2 * time.Second
+	}
+	if cfg.StreamRetryMax < cfg.StreamRetryMin {
+		cfg.StreamRetryMax = cfg.StreamRetryMin
 	}
 	cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	return cfg
@@ -1085,10 +1100,23 @@ func reportPublicIP(ctx context.Context, cfg config) {
 
 func taskStreamLoop(ctx context.Context, cfg config) {
 	sem := make(chan struct{}, cfg.Concurrency)
+	retryDelay := cfg.StreamRetryMin
 	for {
 		if err := consumeTaskStream(ctx, cfg, sem); err != nil && ctx.Err() == nil {
-			log.Printf("task stream stopped: %v", err)
-			time.Sleep(3 * time.Second)
+			log.Printf("task stream stopped: %v; reconnecting in %s", err, retryDelay)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryDelay):
+			}
+			retryDelay *= 2
+			if retryDelay > cfg.StreamRetryMax {
+				retryDelay = cfg.StreamRetryMax
+			}
+			continue
+		}
+		if ctx.Err() == nil {
+			retryDelay = cfg.StreamRetryMin
 		}
 		if ctx.Err() != nil {
 			return
@@ -1113,13 +1141,18 @@ func consumeTaskStream(ctx context.Context, cfg config, sem chan struct{}) error
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("stream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return readSSETasks(ctx, resp.Body, func(task taskRequest) {
+	log.Printf("task stream connected")
+	err = readSSETasks(ctx, resp.Body, cfg.StreamIdleTimeout, func(task taskRequest) {
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem }()
 			executeAndReport(ctx, cfg, task)
 		}()
 	})
+	if err == nil {
+		return errors.New("task stream closed")
+	}
+	return err
 }
 
 func taskStreamHTTPClient(cfg config) *http.Client {
@@ -1131,11 +1164,33 @@ func taskStreamHTTPClient(cfg config) *http.Client {
 	return &client
 }
 
-func readSSETasks(ctx context.Context, body io.Reader, handle func(taskRequest)) error {
+func readSSETasks(ctx context.Context, body io.Reader, idleTimeout time.Duration, handle func(taskRequest)) error {
+	if idleTimeout <= 0 {
+		idleTimeout = 90 * time.Second
+	}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	var event string
 	var data bytes.Buffer
+	lines := make(chan string)
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		defer close(lines)
+		for scanner.Scan() {
+			select {
+			case lines <- scanner.Text():
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case <-done:
+				errCh <- nil
+				return
+			}
+		}
+		errCh <- scanner.Err()
+	}()
 	flush := func() {
 		if event != "task" || data.Len() == 0 {
 			event = ""
@@ -1151,30 +1206,51 @@ func readSSETasks(ctx context.Context, body io.Reader, handle func(taskRequest))
 		event = ""
 		data.Reset()
 	}
-	for scanner.Scan() {
+	timer := time.NewTimer(idleTimeout)
+	defer timer.Stop()
+	resetIdleTimer := func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(idleTimeout)
+	}
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
-		}
-		line := scanner.Text()
-		if line == "" {
-			flush()
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			if data.Len() > 0 {
-				data.WriteByte('\n')
+		case <-timer.C:
+			return fmt.Errorf("task stream idle for %s", idleTimeout)
+		case line, ok := <-lines:
+			if !ok {
+				flush()
+				if err := <-errCh; err != nil {
+					return err
+				}
+				return nil
 			}
-			data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			resetIdleTimer()
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+			if line == "" {
+				flush()
+				continue
+			}
+			if strings.HasPrefix(line, "event:") {
+				event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				if data.Len() > 0 {
+					data.WriteByte('\n')
+				}
+				data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			}
 		}
 	}
-	flush()
-	return scanner.Err()
 }
 
 func executeAndReport(ctx context.Context, cfg config, task taskRequest) {
