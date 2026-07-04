@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -2096,17 +2097,20 @@ func runDNSLookup(ctx context.Context, payload map[string]any) (map[string]any, 
 	recordType := "A"
 	if records, ok := payload["record_types"].([]any); ok && len(records) > 0 {
 		recordType = strings.ToUpper(strings.TrimSpace(fmt.Sprint(records[0])))
+	} else if records, ok := payload["record_types"].([]string); ok && len(records) > 0 {
+		recordType = strings.ToUpper(strings.TrimSpace(records[0]))
+	}
+	server := strings.TrimSpace(fmt.Sprint(payload["dns_server"]))
+	protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(payload["dns_protocol"])))
+	if server != "" && server != "<nil>" {
+		started := time.Now()
+		answers, err := lookupDNSViaProtocol(ctx, domain, recordType, server, protocol)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"answers": answers, "dns_lookup": elapsedMS(started)}, nil
 	}
 	resolver := net.DefaultResolver
-	if server := strings.TrimSpace(fmt.Sprint(payload["dns_server"])); server != "" && server != "<nil>" {
-		resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 3*time.Second)}
-				return dialer.DialContext(ctx, "udp", dnsServerAddress(server))
-			},
-		}
-	}
 	started := time.Now()
 	var answers []map[string]any
 	switch recordType {
@@ -2160,6 +2164,515 @@ func runDNSLookup(ctx context.Context, payload map[string]any) (map[string]any, 
 	return map[string]any{"answers": answers, "dns_lookup": elapsedMS(started)}, nil
 }
 
+func lookupDNSViaProtocol(ctx context.Context, domain string, recordType string, server string, protocol string) ([]map[string]any, error) {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if protocol == "" {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(server)), "https://") {
+			protocol = "doh"
+		} else {
+			protocol = "udp"
+		}
+	}
+	query, id, err := buildDNSQuery(domain, recordType)
+	if err != nil {
+		return nil, err
+	}
+	var response []byte
+	switch protocol {
+	case "udp":
+		response, err = exchangeDNSUDP(ctx, server, query)
+	case "tcp":
+		response, err = exchangeDNSTCP(ctx, server, query, false)
+	case "dot":
+		response, err = exchangeDNSTCP(ctx, server, query, true)
+	case "doh":
+		response, err = exchangeDNSDoH(ctx, server, query)
+	case "doq":
+		response, err = exchangeDNSDoQ(ctx, server, query)
+	default:
+		return nil, fmt.Errorf("unsupported dns protocol: %s", protocol)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return parseDNSAnswers(response, id, recordType)
+}
+
+func buildDNSQuery(domain string, recordType string) ([]byte, uint16, error) {
+	qtype, ok := dnsRecordTypeCode(recordType)
+	if !ok {
+		return nil, 0, fmt.Errorf("unsupported dns record type: %s", recordType)
+	}
+	name, err := encodeDNSName(domain)
+	if err != nil {
+		return nil, 0, err
+	}
+	var idBytes [2]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
+		return nil, 0, err
+	}
+	id := binary.BigEndian.Uint16(idBytes[:])
+	query := make([]byte, 0, 12+len(name)+4)
+	query = binary.BigEndian.AppendUint16(query, id)
+	query = binary.BigEndian.AppendUint16(query, 0x0100)
+	query = binary.BigEndian.AppendUint16(query, 1)
+	query = binary.BigEndian.AppendUint16(query, 0)
+	query = binary.BigEndian.AppendUint16(query, 0)
+	query = binary.BigEndian.AppendUint16(query, 0)
+	query = append(query, name...)
+	query = binary.BigEndian.AppendUint16(query, qtype)
+	query = binary.BigEndian.AppendUint16(query, 1)
+	return query, id, nil
+}
+
+func dnsRecordTypeCode(recordType string) (uint16, bool) {
+	switch strings.ToUpper(strings.TrimSpace(recordType)) {
+	case "", "A":
+		return 1, true
+	case "NS":
+		return 2, true
+	case "CNAME":
+		return 5, true
+	case "MX":
+		return 15, true
+	case "TXT":
+		return 16, true
+	case "AAAA":
+		return 28, true
+	default:
+		return 0, false
+	}
+}
+
+func dnsRecordTypeName(qtype uint16) string {
+	switch qtype {
+	case 1:
+		return "A"
+	case 2:
+		return "NS"
+	case 5:
+		return "CNAME"
+	case 15:
+		return "MX"
+	case 16:
+		return "TXT"
+	case 28:
+		return "AAAA"
+	default:
+		return strconv.Itoa(int(qtype))
+	}
+}
+
+func encodeDNSName(domain string) ([]byte, error) {
+	domain = strings.Trim(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return nil, fmt.Errorf("dns domain is required")
+	}
+	if len(domain) > 253 {
+		return nil, fmt.Errorf("dns domain is too long")
+	}
+	labels := strings.Split(domain, ".")
+	name := make([]byte, 0, len(domain)+2)
+	for _, label := range labels {
+		if label == "" || len(label) > 63 {
+			return nil, fmt.Errorf("dns domain label is invalid")
+		}
+		name = append(name, byte(len(label)))
+		name = append(name, label...)
+	}
+	name = append(name, 0)
+	return name, nil
+}
+
+func exchangeDNSUDP(ctx context.Context, server string, query []byte) ([]byte, error) {
+	addr := dnsServerAddressForProtocol(server, "udp")
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	timeout := deadlineTimeout(ctx, 5*time.Second)
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(query); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 65535)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte(nil), buf[:n]...), nil
+}
+
+func exchangeDNSTCP(ctx context.Context, server string, query []byte, useTLS bool) ([]byte, error) {
+	protocol := "tcp"
+	if useTLS {
+		protocol = "dot"
+	}
+	addr := dnsServerAddressForProtocol(server, protocol)
+	dialer := &net.Dialer{Timeout: deadlineTimeout(ctx, 5*time.Second)}
+	var conn net.Conn
+	var err error
+	if useTLS {
+		serverName := dnsServerNameForTLS(server)
+		tlsDialer := &tls.Dialer{
+			NetDialer: dialer,
+			Config:    &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12},
+		}
+		conn, err = tlsDialer.DialContext(ctx, "tcp", addr)
+	} else {
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	timeout := deadlineTimeout(ctx, 5*time.Second)
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	return exchangeDNSLengthPrefixed(conn, query)
+}
+
+func exchangeDNSDoH(ctx context.Context, server string, query []byte) ([]byte, error) {
+	endpoint, err := dnsDoHEndpoint(server)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(query))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-message")
+	req.Header.Set("Content-Type", "application/dns-message")
+	client := &http.Client{Timeout: deadlineTimeout(ctx, 10*time.Second)}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("DoH resolver returned status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("empty DoH response")
+	}
+	return body, nil
+}
+
+func exchangeDNSDoQ(ctx context.Context, server string, query []byte) ([]byte, error) {
+	addr := dnsServerAddressForProtocol(server, "doq")
+	serverName := dnsServerNameForTLS(server)
+	conn, err := quic.DialAddr(ctx, addr, &tls.Config{
+		ServerName: serverName,
+		NextProtos: []string{
+			"doq",
+			"doq-i11",
+			"doq-i10",
+		},
+		MinVersion: tls.VersionTLS13,
+	}, &quic.Config{HandshakeIdleTimeout: deadlineTimeout(ctx, 5*time.Second)})
+	if err != nil {
+		return nil, err
+	}
+	defer conn.CloseWithError(0, "")
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	timeout := deadlineTimeout(ctx, 5*time.Second)
+	_ = stream.SetDeadline(time.Now().Add(timeout))
+	response, err := exchangeDNSLengthPrefixed(stream, query)
+	_ = stream.Close()
+	return response, err
+}
+
+func exchangeDNSLengthPrefixed(conn io.ReadWriter, query []byte) ([]byte, error) {
+	if len(query) > 65535 {
+		return nil, fmt.Errorf("dns query is too large")
+	}
+	prefixed := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(prefixed[:2], uint16(len(query)))
+	copy(prefixed[2:], query)
+	if _, err := conn.Write(prefixed); err != nil {
+		return nil, err
+	}
+	var lengthBuf [2]byte
+	if _, err := io.ReadFull(conn, lengthBuf[:]); err != nil {
+		return nil, err
+	}
+	length := int(binary.BigEndian.Uint16(lengthBuf[:]))
+	if length == 0 {
+		return nil, fmt.Errorf("empty dns response")
+	}
+	response := make([]byte, length)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func parseDNSAnswers(message []byte, expectedID uint16, recordType string) ([]map[string]any, error) {
+	if len(message) < 12 {
+		return nil, fmt.Errorf("dns response is too short")
+	}
+	id := binary.BigEndian.Uint16(message[0:2])
+	if expectedID != 0 && id != expectedID {
+		return nil, fmt.Errorf("dns response id mismatch")
+	}
+	flags := binary.BigEndian.Uint16(message[2:4])
+	rcode := int(flags & 0x000f)
+	if rcode != 0 {
+		return nil, fmt.Errorf("dns response error: %s", dnsRCodeName(rcode))
+	}
+	qdCount := int(binary.BigEndian.Uint16(message[4:6]))
+	anCount := int(binary.BigEndian.Uint16(message[6:8]))
+	offset := 12
+	var err error
+	for i := 0; i < qdCount; i++ {
+		_, offset, err = readDNSName(message, offset, 0)
+		if err != nil {
+			return nil, err
+		}
+		if offset+4 > len(message) {
+			return nil, fmt.Errorf("dns question is truncated")
+		}
+		offset += 4
+	}
+	wantType, _ := dnsRecordTypeCode(recordType)
+	answers := make([]map[string]any, 0, anCount)
+	for i := 0; i < anCount; i++ {
+		_, offset, err = readDNSName(message, offset, 0)
+		if err != nil {
+			return nil, err
+		}
+		if offset+10 > len(message) {
+			return nil, fmt.Errorf("dns answer is truncated")
+		}
+		qtype := binary.BigEndian.Uint16(message[offset : offset+2])
+		offset += 2
+		class := binary.BigEndian.Uint16(message[offset : offset+2])
+		offset += 2
+		ttl := binary.BigEndian.Uint32(message[offset : offset+4])
+		offset += 4
+		rdLength := int(binary.BigEndian.Uint16(message[offset : offset+2]))
+		offset += 2
+		if offset+rdLength > len(message) {
+			return nil, fmt.Errorf("dns answer data is truncated")
+		}
+		dataOffset := offset
+		offset += rdLength
+		if class != 1 || (wantType != 0 && qtype != wantType) {
+			continue
+		}
+		answer, err := parseDNSAnswerData(message, dataOffset, rdLength, qtype)
+		if err != nil {
+			continue
+		}
+		answer["type"] = dnsRecordTypeName(qtype)
+		answer["ttl"] = ttl
+		answers = append(answers, answer)
+	}
+	return answers, nil
+}
+
+func parseDNSAnswerData(message []byte, offset int, length int, qtype uint16) (map[string]any, error) {
+	if offset < 0 || length < 0 || offset+length > len(message) {
+		return nil, fmt.Errorf("dns answer data is invalid")
+	}
+	data := message[offset : offset+length]
+	switch qtype {
+	case 1:
+		if len(data) != net.IPv4len {
+			return nil, fmt.Errorf("invalid A record length")
+		}
+		return map[string]any{"data": net.IP(data).String()}, nil
+	case 28:
+		if len(data) != net.IPv6len {
+			return nil, fmt.Errorf("invalid AAAA record length")
+		}
+		return map[string]any{"data": net.IP(data).String()}, nil
+	case 2, 5:
+		name, _, err := readDNSName(message, offset, 0)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"data": name}, nil
+	case 15:
+		if length < 3 {
+			return nil, fmt.Errorf("invalid MX record length")
+		}
+		preference := binary.BigEndian.Uint16(message[offset : offset+2])
+		name, _, err := readDNSName(message, offset+2, 0)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"data": name, "preference": preference}, nil
+	case 16:
+		parts := make([]string, 0)
+		for index := 0; index < len(data); {
+			partLen := int(data[index])
+			index++
+			if index+partLen > len(data) {
+				return nil, fmt.Errorf("invalid TXT record length")
+			}
+			parts = append(parts, string(data[index:index+partLen]))
+			index += partLen
+		}
+		return map[string]any{"data": strings.Join(parts, "")}, nil
+	default:
+		return nil, fmt.Errorf("unsupported dns answer type: %d", qtype)
+	}
+}
+
+func readDNSName(message []byte, offset int, depth int) (string, int, error) {
+	if depth > 16 {
+		return "", offset, fmt.Errorf("dns name compression loop")
+	}
+	if offset < 0 || offset >= len(message) {
+		return "", offset, fmt.Errorf("dns name is truncated")
+	}
+	labels := make([]string, 0)
+	nextOffset := offset
+	for {
+		if offset >= len(message) {
+			return "", nextOffset, fmt.Errorf("dns name is truncated")
+		}
+		length := int(message[offset])
+		offset++
+		if length == 0 {
+			nextOffset = offset
+			break
+		}
+		if length&0xc0 == 0xc0 {
+			if offset >= len(message) {
+				return "", nextOffset, fmt.Errorf("dns compression pointer is truncated")
+			}
+			pointer := ((length & 0x3f) << 8) | int(message[offset])
+			offset++
+			if pointer >= len(message) {
+				return "", nextOffset, fmt.Errorf("dns compression pointer is invalid")
+			}
+			nextOffset = offset
+			name, _, err := readDNSName(message, pointer, depth+1)
+			if err != nil {
+				return "", nextOffset, err
+			}
+			if name != "" {
+				labels = append(labels, strings.Split(name, ".")...)
+			}
+			break
+		}
+		if length&0xc0 != 0 {
+			return "", nextOffset, fmt.Errorf("dns label is invalid")
+		}
+		if offset+length > len(message) {
+			return "", nextOffset, fmt.Errorf("dns label is truncated")
+		}
+		labels = append(labels, string(message[offset:offset+length]))
+		offset += length
+		nextOffset = offset
+	}
+	return strings.Join(labels, "."), nextOffset, nil
+}
+
+func dnsRCodeName(rcode int) string {
+	switch rcode {
+	case 1:
+		return "FORMERR"
+	case 2:
+		return "SERVFAIL"
+	case 3:
+		return "NXDOMAIN"
+	case 4:
+		return "NOTIMP"
+	case 5:
+		return "REFUSED"
+	default:
+		return fmt.Sprintf("RCODE_%d", rcode)
+	}
+}
+
+func dnsServerAddressForProtocol(server string, protocol string) string {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(server), "https://") {
+		if parsed, err := url.Parse(server); err == nil {
+			server = parsed.Host
+		}
+	}
+	port := "53"
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "dot", "doq":
+		port = "853"
+	case "doh":
+		port = "443"
+	}
+	if host, rawPort, err := net.SplitHostPort(server); err == nil {
+		if rawPort != "" {
+			return net.JoinHostPort(strings.Trim(host, "[]"), rawPort)
+		}
+	}
+	if strings.Count(server, ":") > 1 {
+		return net.JoinHostPort(strings.Trim(server, "[]"), port)
+	}
+	return net.JoinHostPort(server, port)
+}
+
+func dnsServerNameForTLS(server string) string {
+	server = strings.TrimSpace(server)
+	if strings.HasPrefix(strings.ToLower(server), "https://") {
+		if parsed, err := url.Parse(server); err == nil {
+			server = parsed.Host
+		}
+	}
+	host := server
+	if splitHost, _, err := net.SplitHostPort(server); err == nil {
+		host = splitHost
+	}
+	host = strings.Trim(host, "[]")
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+	return host
+}
+
+func dnsDoHEndpoint(server string) (string, error) {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return "", fmt.Errorf("DoH resolver is required")
+	}
+	if strings.Contains(server, "://") {
+		parsed, err := url.Parse(server)
+		if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
+			return "", fmt.Errorf("DoH resolver must be an https URL")
+		}
+		if parsed.Path == "" {
+			parsed.Path = "/dns-query"
+		}
+		parsed.RawQuery = ""
+		parsed.Fragment = ""
+		return parsed.String(), nil
+	}
+	hostPort := dnsServerAddressForProtocol(server, "doh")
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return "", err
+	}
+	normalizedHost := host
+	if net.ParseIP(host) != nil && strings.Contains(host, ":") {
+		normalizedHost = "[" + host + "]"
+	}
+	if port != "443" {
+		normalizedHost = net.JoinHostPort(host, port)
+	}
+	return (&url.URL{Scheme: "https", Host: normalizedHost, Path: "/dns-query"}).String(), nil
+}
+
 func runDNSCompare(ctx context.Context, payload map[string]any, options map[string]any) (map[string]any, error) {
 	domain := strings.TrimSpace(fmt.Sprint(payload["domain"]))
 	if domain == "" || domain == "<nil>" {
@@ -2180,53 +2693,83 @@ func runDNSCompare(ctx context.Context, payload map[string]any, options map[stri
 		resolvers = compareResolvers(options["compare_resolvers"])
 	}
 	if len(resolvers) == 0 {
-		resolvers = []string{"system", "223.5.5.5", "119.29.29.29", "8.8.8.8", "1.1.1.1"}
+		resolvers = []string{"system", "1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}
 	}
 	if len(resolvers) > 6 {
 		resolvers = resolvers[:6]
 	}
 	started := time.Now()
-	rows := make([]map[string]any, 0, len(resolvers))
+	rows := make([]map[string]any, len(resolvers))
+	var wg sync.WaitGroup
+	for index, resolver := range resolvers {
+		wg.Add(1)
+		go func(index int, resolver string) {
+			defer wg.Done()
+			rows[index] = runDNSCompareResolver(ctx, domain, recordType, resolver)
+		}(index, resolver)
+	}
+	wg.Wait()
+
 	sets := map[string]int{}
 	successes := 0
-	for _, resolver := range resolvers {
-		rowPayload := map[string]any{
-			"domain":       domain,
-			"record_types": []any{recordType},
-		}
-		if !strings.EqualFold(resolver, "system") {
-			rowPayload["dns_server"] = resolver
-		}
-		rowStarted := time.Now()
-		result, err := runDNSLookup(ctx, rowPayload)
-		row := map[string]any{
-			"resolver":   resolver,
-			"latency_ms": elapsedMS(rowStarted),
-			"success":    err == nil,
-		}
-		if err != nil {
-			row["error"] = err.Error()
-		} else {
+	for _, row := range rows {
+		if boolFromMap(row, "success") {
 			successes++
-			answers, _ := result["answers"].([]map[string]any)
-			row["answers"] = answers
+			answers, _ := row["answers"].([]map[string]any)
 			key := answerSetKey(answers)
 			row["answer_set_key"] = key
 			sets[key]++
 		}
-		rows = append(rows, row)
 	}
 	consistent := len(sets) <= 1 && successes == len(resolvers)
 	return map[string]any{
-		"dns_compare":    elapsedMS(started),
-		"domain":         domain,
-		"record_type":    recordType,
-		"resolvers":      rows,
-		"resolver_count": len(resolvers),
-		"success_count":  successes,
-		"mismatch_count": maxInt(0, len(sets)-1),
-		"consistent":     consistent,
+		"dns_compare":     elapsedMS(started),
+		"resolve_time_ms": maxDNSCompareResolverLatency(rows),
+		"domain":          domain,
+		"record_type":     recordType,
+		"resolvers":       rows,
+		"resolver_count":  len(resolvers),
+		"success_count":   successes,
+		"mismatch_count":  maxInt(0, len(sets)-1),
+		"consistent":      consistent,
 	}, nil
+}
+
+func runDNSCompareResolver(ctx context.Context, domain string, recordType string, resolver string) map[string]any {
+	rowPayload := map[string]any{
+		"domain":       domain,
+		"record_types": []any{recordType},
+	}
+	if !strings.EqualFold(resolver, "system") {
+		rowPayload["dns_server"] = resolver
+	}
+	rowStarted := time.Now()
+	result, err := runDNSLookup(ctx, rowPayload)
+	row := map[string]any{
+		"resolver":   resolver,
+		"latency_ms": elapsedMS(rowStarted),
+		"success":    err == nil,
+	}
+	if err != nil {
+		row["error"] = err.Error()
+		return row
+	}
+	answers, _ := result["answers"].([]map[string]any)
+	row["answers"] = answers
+	return row
+}
+
+func maxDNSCompareResolverLatency(rows []map[string]any) float64 {
+	latency := 0.0
+	for _, row := range rows {
+		if !boolFromMap(row, "success") {
+			continue
+		}
+		if value := floatFromMap(row, "latency_ms"); value > latency {
+			latency = value
+		}
+	}
+	return latency
 }
 
 func runHTTP3Check(ctx context.Context, target string, options map[string]any) (map[string]any, error) {

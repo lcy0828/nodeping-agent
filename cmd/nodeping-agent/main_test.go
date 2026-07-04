@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -39,6 +40,118 @@ func TestDNSServerAddressDefaultsPort(t *testing.T) {
 			t.Fatalf("dnsServerAddress(%q)=%q want %q", input, got, want)
 		}
 	}
+}
+
+func TestDNSServerAddressForProtocolDefaultsPorts(t *testing.T) {
+	tests := map[string]string{
+		"udp:8.8.8.8":                             "8.8.8.8:53",
+		"tcp:8.8.8.8":                             "8.8.8.8:53",
+		"dot:dns.example.com":                     "dns.example.com:853",
+		"doh:1.1.1.1":                             "1.1.1.1:443",
+		"doh:https://dns.example.com/custom":      "dns.example.com:443",
+		"doh:https://dns.example.com:8443/custom": "dns.example.com:8443",
+		"dot:2001:4860:4860::8888":                "[2001:4860:4860::8888]:853",
+		"doq:dns.example.com":                     "dns.example.com:853",
+		"doq:2001:4860:4860::8888":                "[2001:4860:4860::8888]:853",
+	}
+	for key, want := range tests {
+		parts := strings.SplitN(key, ":", 2)
+		if got := dnsServerAddressForProtocol(parts[1], parts[0]); got != want {
+			t.Fatalf("dnsServerAddressForProtocol(%q,%q)=%q want %q", parts[1], parts[0], got, want)
+		}
+	}
+}
+
+func TestDNSDoHEndpointNormalizesHostAndURL(t *testing.T) {
+	tests := map[string]string{
+		"1.1.1.1":                              "https://1.1.1.1/dns-query",
+		"dns.example.com":                      "https://dns.example.com/dns-query",
+		"dns.example.com:8443":                 "https://dns.example.com:8443/dns-query",
+		"https://dns.example.com/custom?q=bad": "https://dns.example.com/custom",
+	}
+	for input, want := range tests {
+		got, err := dnsDoHEndpoint(input)
+		if err != nil {
+			t.Fatalf("dnsDoHEndpoint(%q): %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("dnsDoHEndpoint(%q)=%q want %q", input, got, want)
+		}
+	}
+}
+
+func TestParseDNSAnswersSupportsCommonRecords(t *testing.T) {
+	query, id, err := buildDNSQuery("example.com", "A")
+	if err != nil {
+		t.Fatalf("build query: %v", err)
+	}
+	response := makeDNSResponse(t, query, id, []dnsTestAnswer{
+		{qtype: 1, data: []byte{93, 184, 216, 34}},
+	})
+	answers, err := parseDNSAnswers(response, id, "A")
+	if err != nil {
+		t.Fatalf("parse A response: %v", err)
+	}
+	if len(answers) != 1 || answers[0]["type"] != "A" || answers[0]["data"] != "93.184.216.34" {
+		t.Fatalf("A answers = %#v", answers)
+	}
+
+	txtResponse := makeDNSResponse(t, query, id, []dnsTestAnswer{
+		{qtype: 16, data: append([]byte{5}, []byte("hello")...)},
+	})
+	txtAnswers, err := parseDNSAnswers(txtResponse, id, "TXT")
+	if err != nil {
+		t.Fatalf("parse TXT response: %v", err)
+	}
+	if len(txtAnswers) != 1 || txtAnswers[0]["type"] != "TXT" || txtAnswers[0]["data"] != "hello" {
+		t.Fatalf("TXT answers = %#v", txtAnswers)
+	}
+
+	mxName, err := encodeDNSName("mail.example.com")
+	if err != nil {
+		t.Fatalf("encode mx name: %v", err)
+	}
+	mxData := binary.BigEndian.AppendUint16(nil, 10)
+	mxData = append(mxData, mxName...)
+	mxResponse := makeDNSResponse(t, query, id, []dnsTestAnswer{
+		{qtype: 15, data: mxData},
+	})
+	mxAnswers, err := parseDNSAnswers(mxResponse, id, "MX")
+	if err != nil {
+		t.Fatalf("parse MX response: %v", err)
+	}
+	if len(mxAnswers) != 1 || mxAnswers[0]["type"] != "MX" || mxAnswers[0]["data"] != "mail.example.com" || mxAnswers[0]["preference"] != uint16(10) {
+		t.Fatalf("MX answers = %#v", mxAnswers)
+	}
+}
+
+type dnsTestAnswer struct {
+	qtype uint16
+	data  []byte
+}
+
+func makeDNSResponse(t *testing.T, query []byte, id uint16, answers []dnsTestAnswer) []byte {
+	t.Helper()
+	if len(query) < 12 {
+		t.Fatalf("query too short")
+	}
+	response := make([]byte, 0, 512)
+	response = binary.BigEndian.AppendUint16(response, id)
+	response = binary.BigEndian.AppendUint16(response, 0x8180)
+	response = binary.BigEndian.AppendUint16(response, 1)
+	response = binary.BigEndian.AppendUint16(response, uint16(len(answers)))
+	response = binary.BigEndian.AppendUint16(response, 0)
+	response = binary.BigEndian.AppendUint16(response, 0)
+	response = append(response, query[12:]...)
+	for _, answer := range answers {
+		response = append(response, 0xc0, 0x0c)
+		response = binary.BigEndian.AppendUint16(response, answer.qtype)
+		response = binary.BigEndian.AppendUint16(response, 1)
+		response = binary.BigEndian.AppendUint32(response, 60)
+		response = binary.BigEndian.AppendUint16(response, uint16(len(answer.data)))
+		response = append(response, answer.data...)
+	}
+	return response
 }
 
 func TestReadSSETasksAllowsLargePayload(t *testing.T) {
