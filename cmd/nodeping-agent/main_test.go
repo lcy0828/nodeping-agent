@@ -1003,6 +1003,70 @@ OUT
 	}
 }
 
+func TestRunMTRFallsBackWhenJSONOptionPrintsWithZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+for arg in "$@"; do
+  if [ "$arg" = "-j" ]; then
+    echo "/usr/sbin/mtr: invalid option -- 'j'"
+    exit 0
+  fi
+done
+cat <<'OUT'
+Start: 2026-06-24T12:00:00+0800
+HOST: test-node                 Loss%   Snt   Last   Avg  Best  Wrst StDev
+  1.|-- 192.0.2.1                0.0%     5    1.2   1.5   1.1   2.0   0.3
+OUT
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	result, err := runMTR(context.Background(), "example.com", map[string]any{"report_cycles": 5, "max_hops": 8})
+	if err != nil {
+		t.Fatalf("runMTR: %v result=%+v", err, result)
+	}
+	hops, ok := result["hops"].([]map[string]any)
+	if !ok || len(hops) != 1 {
+		t.Fatalf("hops = %#v", result["hops"])
+	}
+	if hops[0]["ip"] != "192.0.2.1" || hops[0]["avg_ms"] != 1.5 {
+		t.Fatalf("first hop not parsed: %+v", hops[0])
+	}
+}
+
+func TestMTRSupportsJSONRejectsTextOutputWithZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+if [ "$1" = "--version" ]; then
+  echo "mtr 0.85"
+  exit 0
+fi
+for arg in "$@"; do
+  if [ "$arg" = "-j" ]; then
+    echo "/usr/sbin/mtr: invalid option -- 'j'"
+    exit 0
+  fi
+done
+echo "unexpected"
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if mtrSupportsJSON(mtrPath) {
+		t.Fatalf("mtrSupportsJSON should reject non-JSON output from %s", mtrPath)
+	}
+	check := checkMTRCommand()
+	if check.Status != "warn" || !strings.Contains(check.Message, "text fallback") {
+		t.Fatalf("checkMTRCommand status = %+v, want text fallback warning", check)
+	}
+}
+
 func TestInstallHintsIncludeYumFallback(t *testing.T) {
 	for _, binary := range []string{"ping", "traceroute", "mtr"} {
 		hint := installHint(binary)

@@ -800,10 +800,14 @@ func mtrSupportsJSON(path string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, path, "-r", "-c", "1", "-n", "-j", "127.0.0.1").CombinedOutput()
-	if err != nil && mtrJSONUnsupported(out) {
+	if err != nil && mtrShouldFallbackToText(out, err) {
 		return false
 	}
-	return !mtrJSONUnsupported(out)
+	if mtrShouldFallbackToText(out, err) {
+		return false
+	}
+	text := strings.TrimLeft(string(out), " \t\r\n")
+	return strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[")
 }
 
 func installHint(binary string) string {
@@ -3434,7 +3438,7 @@ func runMTR(ctx context.Context, target string, options map[string]any) (map[str
 	out, cmdErr := exec.CommandContext(ctx, path, args...).CombinedOutput()
 	result, parseErr := parseMTRJSON(out)
 	if parseErr != nil {
-		if cmdErr != nil && mtrJSONUnsupported(out) {
+		if mtrShouldFallbackToText(out, cmdErr) {
 			textArgs := append(append([]string{}, baseArgs...), target)
 			out, cmdErr = exec.CommandContext(ctx, path, textArgs...).CombinedOutput()
 			result = parseMTRText(out)
@@ -3563,6 +3567,27 @@ func mtrJSONUnsupported(raw []byte) bool {
 	text := strings.ToLower(strings.TrimSpace(string(raw)))
 	return strings.Contains(text, "invalid option") &&
 		(strings.Contains(text, "-j") || strings.Contains(text, "'j'") || strings.Contains(text, " j") || strings.Contains(text, "--json") || strings.Contains(text, "json"))
+}
+
+func mtrShouldFallbackToText(raw []byte, cmdErr error) bool {
+	if mtrJSONUnsupported(raw) {
+		return true
+	}
+	text := strings.TrimLeft(string(raw), " \t\r\n")
+	if text == "" || strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[") {
+		return false
+	}
+	lower := strings.ToLower(text)
+	if cmdErr == nil && mtrLooksLikeTextReport(lower) {
+		return true
+	}
+	return cmdErr == nil &&
+		(strings.Contains(lower, "mtr") || strings.Contains(lower, "usage") || strings.Contains(lower, "invalid option") || strings.Contains(lower, "unknown option"))
+}
+
+func mtrLooksLikeTextReport(lower string) bool {
+	return strings.Contains(lower, "loss%") &&
+		(strings.Contains(lower, "snt") || strings.Contains(lower, "|--"))
 }
 
 func parseMTRText(raw []byte) map[string]any {
