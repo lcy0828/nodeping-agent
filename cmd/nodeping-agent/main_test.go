@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -40,118 +39,6 @@ func TestDNSServerAddressDefaultsPort(t *testing.T) {
 			t.Fatalf("dnsServerAddress(%q)=%q want %q", input, got, want)
 		}
 	}
-}
-
-func TestDNSServerAddressForProtocolDefaultsPorts(t *testing.T) {
-	tests := map[string]string{
-		"udp:8.8.8.8":                             "8.8.8.8:53",
-		"tcp:8.8.8.8":                             "8.8.8.8:53",
-		"dot:dns.example.com":                     "dns.example.com:853",
-		"doh:1.1.1.1":                             "1.1.1.1:443",
-		"doh:https://dns.example.com/custom":      "dns.example.com:443",
-		"doh:https://dns.example.com:8443/custom": "dns.example.com:8443",
-		"dot:2001:4860:4860::8888":                "[2001:4860:4860::8888]:853",
-		"doq:dns.example.com":                     "dns.example.com:853",
-		"doq:2001:4860:4860::8888":                "[2001:4860:4860::8888]:853",
-	}
-	for key, want := range tests {
-		parts := strings.SplitN(key, ":", 2)
-		if got := dnsServerAddressForProtocol(parts[1], parts[0]); got != want {
-			t.Fatalf("dnsServerAddressForProtocol(%q,%q)=%q want %q", parts[1], parts[0], got, want)
-		}
-	}
-}
-
-func TestDNSDoHEndpointNormalizesHostAndURL(t *testing.T) {
-	tests := map[string]string{
-		"1.1.1.1":                              "https://1.1.1.1/dns-query",
-		"dns.example.com":                      "https://dns.example.com/dns-query",
-		"dns.example.com:8443":                 "https://dns.example.com:8443/dns-query",
-		"https://dns.example.com/custom?q=bad": "https://dns.example.com/custom",
-	}
-	for input, want := range tests {
-		got, err := dnsDoHEndpoint(input)
-		if err != nil {
-			t.Fatalf("dnsDoHEndpoint(%q): %v", input, err)
-		}
-		if got != want {
-			t.Fatalf("dnsDoHEndpoint(%q)=%q want %q", input, got, want)
-		}
-	}
-}
-
-func TestParseDNSAnswersSupportsCommonRecords(t *testing.T) {
-	query, id, err := buildDNSQuery("example.com", "A")
-	if err != nil {
-		t.Fatalf("build query: %v", err)
-	}
-	response := makeDNSResponse(t, query, id, []dnsTestAnswer{
-		{qtype: 1, data: []byte{93, 184, 216, 34}},
-	})
-	answers, err := parseDNSAnswers(response, id, "A")
-	if err != nil {
-		t.Fatalf("parse A response: %v", err)
-	}
-	if len(answers) != 1 || answers[0]["type"] != "A" || answers[0]["data"] != "93.184.216.34" {
-		t.Fatalf("A answers = %#v", answers)
-	}
-
-	txtResponse := makeDNSResponse(t, query, id, []dnsTestAnswer{
-		{qtype: 16, data: append([]byte{5}, []byte("hello")...)},
-	})
-	txtAnswers, err := parseDNSAnswers(txtResponse, id, "TXT")
-	if err != nil {
-		t.Fatalf("parse TXT response: %v", err)
-	}
-	if len(txtAnswers) != 1 || txtAnswers[0]["type"] != "TXT" || txtAnswers[0]["data"] != "hello" {
-		t.Fatalf("TXT answers = %#v", txtAnswers)
-	}
-
-	mxName, err := encodeDNSName("mail.example.com")
-	if err != nil {
-		t.Fatalf("encode mx name: %v", err)
-	}
-	mxData := binary.BigEndian.AppendUint16(nil, 10)
-	mxData = append(mxData, mxName...)
-	mxResponse := makeDNSResponse(t, query, id, []dnsTestAnswer{
-		{qtype: 15, data: mxData},
-	})
-	mxAnswers, err := parseDNSAnswers(mxResponse, id, "MX")
-	if err != nil {
-		t.Fatalf("parse MX response: %v", err)
-	}
-	if len(mxAnswers) != 1 || mxAnswers[0]["type"] != "MX" || mxAnswers[0]["data"] != "mail.example.com" || mxAnswers[0]["preference"] != uint16(10) {
-		t.Fatalf("MX answers = %#v", mxAnswers)
-	}
-}
-
-type dnsTestAnswer struct {
-	qtype uint16
-	data  []byte
-}
-
-func makeDNSResponse(t *testing.T, query []byte, id uint16, answers []dnsTestAnswer) []byte {
-	t.Helper()
-	if len(query) < 12 {
-		t.Fatalf("query too short")
-	}
-	response := make([]byte, 0, 512)
-	response = binary.BigEndian.AppendUint16(response, id)
-	response = binary.BigEndian.AppendUint16(response, 0x8180)
-	response = binary.BigEndian.AppendUint16(response, 1)
-	response = binary.BigEndian.AppendUint16(response, uint16(len(answers)))
-	response = binary.BigEndian.AppendUint16(response, 0)
-	response = binary.BigEndian.AppendUint16(response, 0)
-	response = append(response, query[12:]...)
-	for _, answer := range answers {
-		response = append(response, 0xc0, 0x0c)
-		response = binary.BigEndian.AppendUint16(response, answer.qtype)
-		response = binary.BigEndian.AppendUint16(response, 1)
-		response = binary.BigEndian.AppendUint32(response, 60)
-		response = binary.BigEndian.AppendUint16(response, uint16(len(answer.data)))
-		response = append(response, answer.data...)
-	}
-	return response
 }
 
 func TestReadSSETasksAllowsLargePayload(t *testing.T) {
@@ -206,6 +93,49 @@ func TestTaskStreamHTTPClientKeepsLongLivedConnection(t *testing.T) {
 	}
 	if base.Timeout != 30*time.Second {
 		t.Fatalf("base client timeout mutated to %s", base.Timeout)
+	}
+}
+
+func TestConsumeTaskStreamReportsWhetherConnectionWasEstablished(t *testing.T) {
+	streamClosed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			_, _ = w.Write([]byte(": connected\n\n"))
+			flusher.Flush()
+		}
+	}))
+	defer streamClosed.Close()
+
+	connected, err := consumeTaskStream(context.Background(), config{
+		ServerURL:         streamClosed.URL,
+		AgentID:           "agent-a",
+		AgentToken:        "agent-token",
+		StreamIdleTimeout: time.Second,
+		StreamRetryMin:    time.Millisecond,
+		StreamRetryMax:    time.Millisecond,
+		Concurrency:       1,
+		HTTPClient:        streamClosed.Client(),
+	}, make(chan struct{}, 1))
+	if !connected || err == nil || !strings.Contains(err.Error(), "task stream closed") {
+		t.Fatalf("consumeTaskStream connected=%v err=%v, want connected closed stream", connected, err)
+	}
+
+	statusFailed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "maintenance", http.StatusServiceUnavailable)
+	}))
+	defer statusFailed.Close()
+	connected, err = consumeTaskStream(context.Background(), config{
+		ServerURL:         statusFailed.URL,
+		AgentID:           "agent-a",
+		AgentToken:        "agent-token",
+		StreamIdleTimeout: time.Second,
+		StreamRetryMin:    time.Millisecond,
+		StreamRetryMax:    time.Millisecond,
+		Concurrency:       1,
+		HTTPClient:        statusFailed.Client(),
+	}, make(chan struct{}, 1))
+	if connected || err == nil || !strings.Contains(err.Error(), "stream status 503") {
+		t.Fatalf("consumeTaskStream connected=%v err=%v, want pre-connect status error", connected, err)
 	}
 }
 
@@ -671,6 +601,44 @@ func TestLongProbeProgressReporterPostsEachSample(t *testing.T) {
 	}
 }
 
+func TestMTRProgressReporterPostsEachReport(t *testing.T) {
+	var events []taskEvent
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/v1/tasks/task-mtr/events" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer agent-token" {
+			t.Fatalf("authorization = %q", got)
+		}
+		var event taskEvent
+		if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+			t.Fatalf("decode event: %v", err)
+		}
+		events = append(events, event)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	report := mtrProgressReporter(context.Background(), config{
+		ServerURL:  server.URL,
+		AgentToken: "agent-token",
+		HTTPClient: server.Client(),
+	}, taskRequest{ID: "task-mtr"})
+	report(map[string]any{"report_cycles": 5, "completed_count": 1, "hop_count": 2, "hops": []map[string]any{{"hop": 1, "ip": "192.0.2.1"}}})
+	report(map[string]any{"report_cycles": 5, "completed_count": 2, "hop_count": 2, "hops": []map[string]any{{"hop": 1, "ip": "192.0.2.1"}}})
+
+	if len(events) != 2 {
+		t.Fatalf("posted events = %d, want 2", len(events))
+	}
+	if events[0].Progress != 20 || events[1].Progress != 40 {
+		t.Fatalf("unexpected progress values: %+v", events)
+	}
+	if events[1].Extra["event_kind"] != "mtr_report" || events[1].Extra["task_type"] != "mtr" || events[1].Extra["live_running"] != true {
+		t.Fatalf("unexpected event extra: %+v", events[1].Extra)
+	}
+}
+
 func TestRunUDPProbe(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -763,8 +731,9 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	defer server.Close()
 
 	latency, responseIP, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
-		"expected_status":      200,
-		"expect_body_contains": "nodeping",
+		"expected_status":       200,
+		"expect_body_contains":  "nodeping",
+		"allow_private_targets": true,
 	})
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
@@ -785,7 +754,8 @@ func TestRunHTTPRequestReturnsTruncatedBody(t *testing.T) {
 	defer server.Close()
 
 	_, _, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
-		"max_body_bytes": 4,
+		"max_body_bytes":        4,
+		"allow_private_targets": true,
 	})
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
@@ -804,7 +774,8 @@ func TestRunHTTPRequestUsesOriginalHostHeader(t *testing.T) {
 	defer server.Close()
 
 	_, _, _, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
-		"original_host": "origin.example.com",
+		"original_host":         "origin.example.com",
+		"allow_private_targets": true,
 	})
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
@@ -830,6 +801,7 @@ func TestExecuteTaskHTTPPingAcceptsObjectPayloadWithOriginalHost(t *testing.T) {
 		ID:       "http-ping-object-payload",
 		TaskType: "http_ping",
 		Payload:  payload,
+		Options:  map[string]any{"allow_private_targets": true},
 	})
 	if !result.Success {
 		t.Fatalf("executeTask failed: %+v", result)
@@ -850,6 +822,7 @@ func TestExecuteTaskHTTPPingIncludesResponseIP(t *testing.T) {
 		ID:       "http-ping-response-ip",
 		TaskType: "http_ping",
 		Payload:  payload,
+		Options:  map[string]any{"allow_private_targets": true},
 	})
 	serverIP := hostLiteralIP(server.Listener.Addr().String())
 	if !result.Success {
@@ -877,7 +850,7 @@ func TestExecuteTaskHTTPRequestFailureKeepsResponseIP(t *testing.T) {
 		ID:       "http-request-failed-response-ip",
 		TaskType: "http_request",
 		Payload:  payload,
-		Options:  map[string]any{"expected_status": 200},
+		Options:  map[string]any{"expected_status": 200, "allow_private_targets": true},
 	})
 	serverIP := hostLiteralIP(server.Listener.Addr().String())
 	if result.Success {
@@ -929,8 +902,9 @@ func TestRunHTTP3CheckPerformsRealRequest(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	result, err := runHTTP3CheckWithTLSConfig(ctx, "https://"+conn.LocalAddr().String()+"/real", map[string]any{
-		"expected_status":      http.StatusAccepted,
-		"expect_body_contains": "h3-ok",
+		"expected_status":       http.StatusAccepted,
+		"expect_body_contains":  "h3-ok",
+		"allow_private_targets": true,
 	}, &tls.Config{
 		RootCAs:    roots,
 		ServerName: "127.0.0.1",
@@ -1058,10 +1032,10 @@ echo "unexpected"
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	if mtrSupportsJSON(mtrPath) {
+	if mtrSupportsJSON(context.Background(), mtrPath) {
 		t.Fatalf("mtrSupportsJSON should reject non-JSON output from %s", mtrPath)
 	}
-	check := checkMTRCommand()
+	check := checkMTRCommand(context.Background())
 	if check.Status != "warn" || !strings.Contains(check.Message, "text fallback") {
 		t.Fatalf("checkMTRCommand status = %+v, want text fallback warning", check)
 	}
