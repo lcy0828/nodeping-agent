@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -974,6 +975,241 @@ OUT
 	}
 	if result["hop_count"] != 3 || result["protocol"] != "icmp" || result["report_cycles"] != 5 {
 		t.Fatalf("unexpected mtr metadata: %+v", result)
+	}
+}
+
+func TestRunMTRRawStreamsCyclesAndPreservesMultipath(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+cat <<'OUT'
+x 0 1
+h 0 192.0.2.1
+p 0 1000 1
+x 1 2
+h 1 203.0.113.9
+p 1 10000 2
+x 0 3
+h 0 192.0.2.2
+p 0 3000 3
+x 1 4
+h 1 203.0.113.9
+p 1 12000 4
+OUT
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	var reports []map[string]any
+	result, _, err := runMTRRaw(context.Background(), &mtrRunConfig{
+		Target:       "203.0.113.9",
+		Path:         mtrPath,
+		ReportCycles: 2,
+		MaxHops:      8,
+		Protocol:     "icmp",
+	}, func(summary map[string]any) {
+		reports = append(reports, summary)
+	})
+	if err != nil {
+		t.Fatalf("runMTRRaw: %v", err)
+	}
+	if result["stream_mode"] != "raw" || result["completed_count"] != 2 || result["reached"] != true {
+		t.Fatalf("unexpected raw result: %+v", result)
+	}
+	hops := mtrHops(result)
+	if len(hops) != 2 {
+		t.Fatalf("hops = %+v", hops)
+	}
+	first := hops[0]
+	if first["multipath"] != true || first["path_count"] != 2 || first["sent"] != 2 || first["avg_ms"] != 2.0 {
+		t.Fatalf("multipath hop = %+v", first)
+	}
+	paths, ok := first["paths"].([]map[string]any)
+	if !ok || len(paths) != 2 || paths[0]["ip"] == paths[1]["ip"] {
+		t.Fatalf("paths = %#v", first["paths"])
+	}
+	if len(reports) != 2 || reports[0]["completed_count"] != 1 || reports[1]["completed_count"] != 2 {
+		t.Fatalf("reports = %+v", reports)
+	}
+}
+
+func TestNewMTRRunConfigDefaultsAndClampsToOneHundredSamples(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	if err := os.WriteFile(mtrPath, []byte("#!/usr/bin/env sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cfg, err := newMTRRunConfig("192.0.2.1", nil)
+	if err != nil {
+		t.Fatalf("newMTRRunConfig default: %v", err)
+	}
+	if cfg.ReportCycles != 100 {
+		t.Fatalf("default report cycles = %d, want 100", cfg.ReportCycles)
+	}
+	cfg, err = newMTRRunConfig("192.0.2.1", map[string]any{"report_cycles": 1000})
+	if err != nil {
+		t.Fatalf("newMTRRunConfig clamp: %v", err)
+	}
+	if cfg.ReportCycles != 100 {
+		t.Fatalf("clamped report cycles = %d, want 100", cfg.ReportCycles)
+	}
+}
+
+func TestMTRDiagnosticOutputIsBounded(t *testing.T) {
+	var output bytes.Buffer
+	appendMTRDiagnosticString(&output, strings.Repeat("x", maxMTRRawDiagnosticBytes+1024))
+	appendMTRDiagnosticBytes(&output, []byte("more"))
+	if output.Len() != maxMTRRawDiagnosticBytes {
+		t.Fatalf("diagnostic output length = %d, want %d", output.Len(), maxMTRRawDiagnosticBytes)
+	}
+}
+
+func TestRunMTRRawKeepsLostFirstHopAsCompletedSamples(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+cat <<'OUT'
+x 0 1
+x 1 2
+h 1 203.0.113.9
+p 1 10000 2
+x 0 3
+x 1 4
+p 1 12000 4
+OUT
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	result, _, err := runMTRRaw(context.Background(), &mtrRunConfig{
+		Target:       "203.0.113.9",
+		Path:         mtrPath,
+		ReportCycles: 2,
+		MaxHops:      8,
+		Protocol:     "icmp",
+	}, nil)
+	if err != nil {
+		t.Fatalf("runMTRRaw: %v", err)
+	}
+	hops := mtrHops(result)
+	if len(hops) != 2 || result["completed_count"] != 2 || result["reached"] != true {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if hops[0]["sent"] != 2 || hops[0]["loss_percent"] != 100.0 || hops[0]["timeout"] != true {
+		t.Fatalf("lost first hop = %+v", hops[0])
+	}
+}
+
+func TestRunMTRRawDeduplicatesSequenceEvents(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+cat <<'OUT'
+x 0 1
+x 0 1
+h 0 192.0.2.1
+p 0 1000 1
+p 0 9000 1
+x 0 2
+p 0 2000 2
+OUT
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	var reports []map[string]any
+	result, _, err := runMTRRaw(context.Background(), &mtrRunConfig{
+		Target:       "192.0.2.1",
+		Path:         mtrPath,
+		ReportCycles: 2,
+		MaxHops:      8,
+		Protocol:     "icmp",
+	}, func(summary map[string]any) {
+		reports = append(reports, summary)
+	})
+	if err != nil {
+		t.Fatalf("runMTRRaw: %v", err)
+	}
+	hops := mtrHops(result)
+	if len(hops) != 1 || hops[0]["sent"] != 2 || hops[0]["avg_ms"] != 1.5 || hops[0]["loss_percent"] != 0.0 {
+		t.Fatalf("deduplicated hop = %+v", hops)
+	}
+	if len(reports) != 2 || mtrHops(reports[0])[0]["loss_percent"] != 0.0 {
+		t.Fatalf("duplicate transmit emitted an incomplete report: %+v", reports)
+	}
+}
+
+func TestRunMTRRawReturnsPartialResultOnTimeout(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+cat <<'OUT'
+x 0 1
+h 0 192.0.2.1
+p 0 1000 1
+OUT
+exec sleep 5
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result, _, err := runMTRRaw(ctx, &mtrRunConfig{
+		Target:       "192.0.2.1",
+		Path:         mtrPath,
+		ReportCycles: 5,
+		MaxHops:      8,
+		Protocol:     "icmp",
+	}, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context deadline", err)
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("timeout took too long: %s", time.Since(started))
+	}
+	if result == nil || result["completed_count"] != 1 || result["stopped_early"] != true {
+		t.Fatalf("partial result = %+v", result)
+	}
+}
+
+func TestParseMTRRawEventSupportsReplySequenceSuffix(t *testing.T) {
+	event, ok := parseMTRRawEvent("p 4 12500 77")
+	if !ok || event.kind != 'p' || event.hop != 5 || event.latencyMS != 12.5 || !event.hasSequence || event.sequence != 77 {
+		t.Fatalf("event = %+v ok=%v", event, ok)
+	}
+}
+
+func TestRunMTRWithProgressFallsBackWhenRawModeIsUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+for arg in "$@"; do
+  if [ "$arg" = "-l" ]; then
+    echo "mtr: invalid option -- l" >&2
+    exit 1
+  fi
+done
+cat <<'OUT'
+{"report":{"hubs":[{"count":1,"host":"192.0.2.1","Loss%":0,"Snt":2,"Last":1,"Avg":1.5,"Best":1,"Wrst":2,"StDev":0.5}]}}
+OUT
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	result, err := runMTRWithProgress(context.Background(), config{}, taskRequest{
+		ID:      "mtr-fallback",
+		Options: map[string]any{"report_cycles": 2, "max_hops": 8},
+	}, "192.0.2.1")
+	if err != nil {
+		t.Fatalf("runMTRWithProgress: %v", err)
+	}
+	if result["stream_mode"] != "report_fallback" || result["completed_count"] != 2 {
+		t.Fatalf("fallback result = %+v", result)
 	}
 }
 

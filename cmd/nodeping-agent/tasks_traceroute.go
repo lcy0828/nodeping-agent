@@ -123,7 +123,32 @@ func traceReachedTarget(hops []map[string]any, targetIP string) bool {
 		return false
 	}
 	last := hops[len(hops)-1]
-	return strings.TrimSpace(fmt.Sprint(last["ip"])) == targetIP || strings.TrimSpace(fmt.Sprint(last["host"])) == targetIP
+	if strings.TrimSpace(fmt.Sprint(last["ip"])) == targetIP || strings.TrimSpace(fmt.Sprint(last["host"])) == targetIP {
+		return true
+	}
+	for _, path := range tracePathMaps(last["paths"]) {
+		if strings.TrimSpace(fmt.Sprint(path["ip"])) == targetIP || strings.TrimSpace(fmt.Sprint(path["host"])) == targetIP {
+			return true
+		}
+	}
+	return false
+}
+
+func tracePathMaps(raw any) []map[string]any {
+	switch paths := raw.(type) {
+	case []map[string]any:
+		return paths
+	case []any:
+		out := make([]map[string]any, 0, len(paths))
+		for _, item := range paths {
+			if path, ok := item.(map[string]any); ok {
+				out = append(out, path)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func firstResolvedIP(ctx context.Context, target string) string {

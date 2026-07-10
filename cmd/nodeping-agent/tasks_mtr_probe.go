@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,8 +12,10 @@ import (
 	"net"
 	"net/url"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +26,13 @@ type mtrRunConfig struct {
 	MaxHops      int
 	Protocol     string
 }
+
+const (
+	defaultMTRReportCycles   = 100
+	maxMTRReportCycles       = 100
+	mtrSampleIntervalSeconds = 1
+	maxMTRRawDiagnosticBytes = 64 * 1024
+)
 
 func runMTR(ctx context.Context, target string, options map[string]any) (map[string]any, error) {
 	cfg, err := newMTRRunConfig(target, options)
@@ -42,37 +52,29 @@ func runMTRWithProgress(ctx context.Context, cfg config, task taskRequest, targe
 	if err != nil {
 		return nil, err
 	}
+	emitter := newMTRProgressEmitter(ctx, cfg, task)
+	defer emitter.Close()
+
+	result, raw, rawErr := runMTRRaw(ctx, mtrCfg, emitter.Emit)
+	if rawErr == nil {
+		result["raw_output"] = strings.TrimSpace(string(raw))
+		return result, nil
+	}
+	if result != nil {
+		result["raw_output"] = strings.TrimSpace(string(raw))
+		return result, rawErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
 	started := time.Now()
-	targetIP := firstResolvedIP(ctx, mtrCfg.Target)
-	aggregate := newMTRAggregate(mtrCfg, started, targetIP)
-	reportProgress := mtrProgressReporter(ctx, cfg, task)
-	var lastRaw []byte
-	var lastCmdErr error
-	for cycle := 1; cycle <= mtrCfg.ReportCycles; cycle++ {
-		report, raw, cmdErr, err := runMTRReport(ctx, mtrCfg, 1)
-		if err != nil {
-			if aggregate.completedCount > 0 {
-				result := aggregate.summary()
-				result["stopped_early"] = true
-				result["stop_reason"] = err.Error()
-				result["raw_output"] = strings.TrimSpace(string(lastRaw))
-				if lastCmdErr != nil {
-					result["command_error"] = lastCmdErr.Error()
-				}
-				return result, nil
-			}
-			return nil, err
-		}
-		lastRaw = raw
-		lastCmdErr = cmdErr
-		aggregate.addReport(report)
-		reportProgress(aggregate.summary())
+	report, reportRaw, cmdErr, reportErr := runMTRReport(ctx, mtrCfg, mtrCfg.ReportCycles)
+	if reportErr != nil {
+		return nil, fmt.Errorf("mtr raw mode failed: %v; report fallback failed: %w", rawErr, reportErr)
 	}
-	result := aggregate.summary()
-	result["raw_output"] = strings.TrimSpace(string(lastRaw))
-	if lastCmdErr != nil {
-		result["command_error"] = lastCmdErr.Error()
-	}
+	result = finalizeMTRResult(ctx, mtrCfg, started, report, reportRaw, cmdErr)
+	result["stream_mode"] = "report_fallback"
 	return result, nil
 }
 
@@ -85,12 +87,12 @@ func newMTRRunConfig(target string, options map[string]any) (*mtrRunConfig, erro
 	if err != nil {
 		return nil, errors.New("mtr command not found")
 	}
-	reportCycles := intOption(options, "report_cycles", 5)
+	reportCycles := intOption(options, "report_cycles", defaultMTRReportCycles)
 	if reportCycles < 1 {
 		reportCycles = 1
 	}
-	if reportCycles > 20 {
-		reportCycles = 20
+	if reportCycles > maxMTRReportCycles {
+		reportCycles = maxMTRReportCycles
 	}
 	maxHops := intOption(options, "max_hops", 30)
 	if maxHops < 1 {
@@ -117,6 +119,208 @@ func newMTRRunConfig(target string, options map[string]any) (*mtrRunConfig, erro
 	}, nil
 }
 
+func runMTRRaw(ctx context.Context, cfg *mtrRunConfig, emit func(map[string]any)) (map[string]any, []byte, error) {
+	if cfg == nil {
+		return nil, nil, errors.New("mtr config is required")
+	}
+	args := []string{"-l", "-c", strconv.Itoa(cfg.ReportCycles), "-i", strconv.Itoa(mtrSampleIntervalSeconds), "-m", strconv.Itoa(cfg.MaxHops), "-n"}
+	switch cfg.Protocol {
+	case "udp":
+		args = append(args, "-u")
+	case "tcp":
+		args = append(args, "-T")
+	}
+	args = append(args, cfg.Target)
+
+	cmd := exec.CommandContext(ctx, cfg.Path, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("open mtr raw output: %w", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("start mtr raw mode: %w", err)
+	}
+
+	started := time.Now()
+	aggregate := newMTRAggregate(cfg, started, firstResolvedIP(ctx, cfg.Target))
+	var raw bytes.Buffer
+	lastEmitted := 0
+	rawTransmits := 0
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		appendMTRDiagnosticString(&raw, line)
+		appendMTRDiagnosticString(&raw, "\n")
+		event, ok := parseMTRRawEvent(line)
+		if !ok {
+			continue
+		}
+		switch event.kind {
+		case 'x':
+			if aggregate.hasTransmit(event.hop, event.sequence, event.hasSequence) {
+				continue
+			}
+			if event.hop == 1 {
+				completed := aggregate.sentCount(1)
+				if completed > lastEmitted {
+					aggregate.completedCount = min(completed, cfg.ReportCycles)
+					if emit != nil {
+						emit(aggregate.summary())
+					}
+					lastEmitted = aggregate.completedCount
+				}
+			}
+			if aggregate.addTransmit(event.hop, event.sequence, event.hasSequence) {
+				rawTransmits++
+			}
+		case 'h':
+			aggregate.setPath(event.hop, event.value)
+		case 'p':
+			aggregate.addReply(event.hop, event.latencyMS, event.sequence, event.hasSequence)
+		}
+	}
+	scanErr := scanner.Err()
+	cmdErr := cmd.Wait()
+	if stderr.Len() > 0 {
+		if raw.Len() > 0 && raw.Bytes()[raw.Len()-1] != '\n' {
+			raw.WriteByte('\n')
+		}
+		appendMTRDiagnosticBytes(&raw, stderr.Bytes())
+	}
+	if scanErr != nil {
+		return nil, raw.Bytes(), fmt.Errorf("read mtr raw output: %w", scanErr)
+	}
+	if rawTransmits == 0 || aggregate.sentCount(1) == 0 || len(aggregate.hops) == 0 {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, raw.Bytes(), ctxErr
+		}
+		message := strings.TrimSpace(stderr.String())
+		if message == "" && cmdErr != nil {
+			message = cmdErr.Error()
+		}
+		if message == "" {
+			message = "no raw events returned"
+		}
+		return nil, raw.Bytes(), fmt.Errorf("mtr raw mode unavailable: %s", message)
+	}
+
+	completed := aggregate.sentCount(1)
+	aggregate.completedCount = min(completed, cfg.ReportCycles)
+	result := aggregate.summary()
+	result["stream_mode"] = "raw"
+	result["raw_output"] = strings.TrimSpace(raw.String())
+	if emit != nil && aggregate.completedCount > lastEmitted {
+		emit(result)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		result["stopped_early"] = true
+		result["stop_reason"] = ctxErr.Error()
+		if cmdErr != nil {
+			result["command_error"] = cmdErr.Error()
+		}
+		return result, raw.Bytes(), ctxErr
+	}
+	if cmdErr != nil {
+		diagnostic := cmdErr.Error()
+		if message := strings.TrimSpace(stderr.String()); message != "" {
+			diagnostic += ": " + message
+		}
+		publicMessage := "mtr process stopped before sampling completed"
+		result["stopped_early"] = true
+		result["stop_reason"] = publicMessage
+		result["command_error"] = diagnostic
+		return result, raw.Bytes(), errors.New(publicMessage)
+	}
+	if completed < cfg.ReportCycles {
+		message := fmt.Sprintf("mtr raw mode stopped after %d/%d samples", completed, cfg.ReportCycles)
+		result["stopped_early"] = true
+		result["stop_reason"] = message
+		return result, raw.Bytes(), errors.New(message)
+	}
+	return result, raw.Bytes(), nil
+}
+
+func appendMTRDiagnosticString(target *bytes.Buffer, value string) {
+	if target == nil || value == "" {
+		return
+	}
+	remaining := maxMTRRawDiagnosticBytes - target.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(value) > remaining {
+		value = value[:remaining]
+	}
+	target.WriteString(value)
+}
+
+func appendMTRDiagnosticBytes(target *bytes.Buffer, value []byte) {
+	if target == nil || len(value) == 0 {
+		return
+	}
+	remaining := maxMTRRawDiagnosticBytes - target.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(value) > remaining {
+		value = value[:remaining]
+	}
+	target.Write(value)
+}
+
+type mtrRawEvent struct {
+	kind        byte
+	hop         int
+	value       string
+	latencyMS   float64
+	sequence    int
+	hasSequence bool
+}
+
+func parseMTRRawEvent(line string) (mtrRawEvent, bool) {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) < 3 || len(fields[0]) != 1 {
+		return mtrRawEvent{}, false
+	}
+	position, err := strconv.Atoi(fields[1])
+	if err != nil || position < 0 {
+		return mtrRawEvent{}, false
+	}
+	event := mtrRawEvent{kind: fields[0][0], hop: position + 1}
+	switch event.kind {
+	case 'x':
+		if sequence, err := strconv.Atoi(fields[2]); err == nil {
+			event.sequence = sequence
+			event.hasSequence = true
+		}
+		return event, true
+	case 'h':
+		event.value = strings.TrimSpace(fields[2])
+		return event, event.value != ""
+	case 'p':
+		latencyUS, err := strconv.ParseFloat(fields[2], 64)
+		if err != nil || latencyUS < 0 {
+			return mtrRawEvent{}, false
+		}
+		event.latencyMS = latencyUS / 1000
+		if len(fields) > 3 {
+			if sequence, err := strconv.Atoi(fields[3]); err == nil {
+				event.sequence = sequence
+				event.hasSequence = true
+			}
+		}
+		return event, true
+	default:
+		return mtrRawEvent{}, false
+	}
+}
+
 func runMTRReport(ctx context.Context, cfg *mtrRunConfig, cycles int) (map[string]any, []byte, error, error) {
 	if cfg == nil {
 		return nil, nil, nil, errors.New("mtr config is required")
@@ -124,7 +328,7 @@ func runMTRReport(ctx context.Context, cfg *mtrRunConfig, cycles int) (map[strin
 	if cycles < 1 {
 		cycles = 1
 	}
-	baseArgs := []string{"-r", "-c", strconv.Itoa(cycles), "-m", strconv.Itoa(cfg.MaxHops), "-n"}
+	baseArgs := []string{"-r", "-c", strconv.Itoa(cycles), "-i", strconv.Itoa(mtrSampleIntervalSeconds), "-m", strconv.Itoa(cfg.MaxHops), "-n"}
 	switch cfg.Protocol {
 	case "udp":
 		baseArgs = append(baseArgs, "-u")
@@ -192,19 +396,30 @@ type mtrAggregate struct {
 }
 
 type mtrHopStats struct {
-	hop          int
-	host         string
-	ip           string
-	sent         float64
-	lost         float64
-	latencyCount int
-	latencySum   float64
-	latencySumSq float64
-	bestMS       float64
-	worstMS      float64
-	lastMS       float64
-	timeout      bool
-	lastSample   map[string]any
+	hop            int
+	sent           int
+	received       int
+	latency        mtrLatencyStats
+	currentPath    string
+	paths          map[string]*mtrPathStats
+	sentSequences  map[int]struct{}
+	replySequences map[int]struct{}
+}
+
+type mtrPathStats struct {
+	host     string
+	ip       string
+	received int
+	latency  mtrLatencyStats
+}
+
+type mtrLatencyStats struct {
+	count int
+	sum   float64
+	sumSq float64
+	best  float64
+	worst float64
+	last  float64
 }
 
 func newMTRAggregate(cfg *mtrRunConfig, started time.Time, targetIP string) *mtrAggregate {
@@ -216,64 +431,112 @@ func newMTRAggregate(cfg *mtrRunConfig, started time.Time, targetIP string) *mtr
 	}
 }
 
-func (a *mtrAggregate) addReport(report map[string]any) {
-	if a == nil {
-		return
+func (a *mtrAggregate) hopStats(hop int) *mtrHopStats {
+	if a == nil || hop <= 0 || a.cfg == nil || hop > a.cfg.MaxHops {
+		return nil
 	}
-	a.completedCount++
-	for index, hop := range mtrHops(report) {
-		hopNumber := intFromAnyDefault(hop["hop"], index+1)
-		if hopNumber <= 0 {
-			hopNumber = index + 1
+	stats := a.hops[hop]
+	if stats == nil {
+		stats = &mtrHopStats{
+			hop:            hop,
+			paths:          map[string]*mtrPathStats{},
+			sentSequences:  map[int]struct{}{},
+			replySequences: map[int]struct{}{},
 		}
-		stats := a.hops[hopNumber]
-		if stats == nil {
-			stats = &mtrHopStats{hop: hopNumber}
-			a.hops[hopNumber] = stats
-		}
-		stats.addHop(hop)
+		a.hops[hop] = stats
 	}
+	return stats
 }
 
-func (s *mtrHopStats) addHop(hop map[string]any) {
-	if s == nil || hop == nil {
+func (a *mtrAggregate) addTransmit(hop int, sequence int, hasSequence bool) bool {
+	stats := a.hopStats(hop)
+	if stats == nil {
+		return false
+	}
+	if hasSequence {
+		if _, exists := stats.sentSequences[sequence]; exists {
+			return false
+		}
+		stats.sentSequences[sequence] = struct{}{}
+	}
+	stats.sent++
+	return true
+}
+
+func (a *mtrAggregate) hasTransmit(hop int, sequence int, hasSequence bool) bool {
+	if a == nil || !hasSequence {
+		return false
+	}
+	stats := a.hops[hop]
+	if stats == nil {
+		return false
+	}
+	_, exists := stats.sentSequences[sequence]
+	return exists
+}
+
+func (a *mtrAggregate) setPath(hop int, value string) {
+	stats := a.hopStats(hop)
+	value = strings.TrimSpace(value)
+	if stats == nil || value == "" {
 		return
 	}
-	s.lastSample = cloneAnyMap(hop)
-	if host := strings.TrimSpace(stringFromMap(hop, "host")); host != "" {
-		s.host = host
+	key := value
+	path := stats.paths[key]
+	if path == nil {
+		path = &mtrPathStats{}
+		stats.paths[key] = path
 	}
-	if ip := strings.TrimSpace(stringFromMap(hop, "ip")); ip != "" {
-		s.ip = ip
-	}
-	sent := mtrPositiveFloat(hop["sent"])
-	if sent <= 0 {
-		sent = 1
-	}
-	lossPercent := mtrClampedLossPercent(hop["loss_percent"])
-	lost := sent * lossPercent / 100
-	if boolFromMap(hop, "timeout") && lossPercent == 0 {
-		lost = sent
-		lossPercent = 100
-	}
-	s.sent += sent
-	s.lost += lost
-	latency := firstPositiveMTRFloat(hop["last_ms"], hop["avg_ms"], hop["rtt_ms"])
-	if latency > 0 && lossPercent < 100 {
-		s.latencyCount++
-		s.latencySum += latency
-		s.latencySumSq += latency * latency
-		s.lastMS = latency
-		best := firstPositiveMTRFloat(hop["best_ms"], latency)
-		worst := firstPositiveMTRFloat(hop["worst_ms"], latency)
-		if s.bestMS <= 0 || best < s.bestMS {
-			s.bestMS = best
+	if ip := net.ParseIP(value); ip != nil {
+		path.ip = ip.String()
+		key = path.ip
+		if key != value {
+			delete(stats.paths, value)
+			stats.paths[key] = path
 		}
-		if worst > s.worstMS {
-			s.worstMS = worst
-		}
+	} else {
+		path.host = value
 	}
-	s.timeout = s.latencyCount == 0 && s.lost >= s.sent
+	stats.currentPath = key
+}
+
+func (a *mtrAggregate) addReply(hop int, latencyMS float64, sequence int, hasSequence bool) {
+	stats := a.hopStats(hop)
+	if stats == nil {
+		return
+	}
+	if hasSequence {
+		if _, exists := stats.replySequences[sequence]; exists {
+			return
+		}
+		stats.replySequences[sequence] = struct{}{}
+		if _, exists := stats.sentSequences[sequence]; !exists {
+			stats.sentSequences[sequence] = struct{}{}
+			stats.sent++
+		}
+	} else if stats.sent <= stats.received {
+		stats.sent++
+	}
+	stats.received++
+	stats.latency.add(latencyMS)
+	key := stats.currentPath
+	if key == "" {
+		key = "unknown"
+	}
+	path := stats.paths[key]
+	if path == nil {
+		path = &mtrPathStats{host: key}
+		stats.paths[key] = path
+	}
+	path.received++
+	path.latency.add(latencyMS)
+}
+
+func (a *mtrAggregate) sentCount(hop int) int {
+	if a == nil || a.hops[hop] == nil {
+		return 0
+	}
+	return a.hops[hop].sent
 }
 
 func (a *mtrAggregate) summary() map[string]any {
@@ -306,38 +569,168 @@ func (a *mtrAggregate) summary() map[string]any {
 }
 
 func (s *mtrHopStats) summary() map[string]any {
-	hop := map[string]any{"hop": s.hop}
-	for key, value := range s.lastSample {
-		hop[key] = value
-	}
-	hop["hop"] = s.hop
-	if s.host != "" {
-		hop["host"] = s.host
-	}
-	if s.ip != "" {
-		hop["ip"] = s.ip
-	}
+	hop := map[string]any{"hop": s.hop, "sent": s.sent}
 	if s.sent > 0 {
-		hop["sent"] = s.sent
-		hop["loss_percent"] = math.Round((s.lost*100/s.sent)*10) / 10
+		lost := max(0, s.sent-s.received)
+		hop["loss_percent"] = math.Round((float64(lost)*100/float64(s.sent))*10) / 10
 	}
-	if s.latencyCount > 0 {
-		hop["last_ms"] = s.lastMS
-		hop["avg_ms"] = math.Round((s.latencySum/float64(s.latencyCount))*1000) / 1000
-		hop["best_ms"] = s.bestMS
-		hop["worst_ms"] = s.worstMS
-		if s.latencyCount > 1 {
-			mean := s.latencySum / float64(s.latencyCount)
-			variance := (s.latencySumSq / float64(s.latencyCount)) - (mean * mean)
-			if variance < 0 {
-				variance = 0
-			}
-			hop["stdev_ms"] = math.Round(math.Sqrt(variance)*1000) / 1000
-		}
-	} else if s.timeout {
+	s.latency.apply(hop)
+	paths := s.pathSummaries()
+	if len(paths) == 1 {
+		copyMTRPathIdentity(hop, paths[0])
+	} else if len(paths) > 1 {
+		hop["multipath"] = true
+		hop["path_count"] = len(paths)
+		hop["paths"] = paths
+	}
+	if s.received == 0 && s.sent > 0 {
 		hop["timeout"] = true
 	}
 	return hop
+}
+
+func (s *mtrHopStats) pathSummaries() []map[string]any {
+	if s == nil || len(s.paths) == 0 {
+		return nil
+	}
+	paths := make([]map[string]any, 0, len(s.paths))
+	for _, stats := range s.paths {
+		if stats == nil || (stats.ip == "" && stats.host == "") {
+			continue
+		}
+		path := map[string]any{"received": stats.received}
+		if stats.ip != "" {
+			path["ip"] = stats.ip
+		}
+		if stats.host != "" && stats.host != "unknown" {
+			path["host"] = stats.host
+		}
+		stats.latency.apply(path)
+		paths = append(paths, path)
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		left := intFromAnyDefault(paths[i]["received"], 0)
+		right := intFromAnyDefault(paths[j]["received"], 0)
+		if left != right {
+			return left > right
+		}
+		return firstNonEmptyMTRPathValue(paths[i]) < firstNonEmptyMTRPathValue(paths[j])
+	})
+	return paths
+}
+
+func (s *mtrLatencyStats) add(latencyMS float64) {
+	if s == nil || latencyMS < 0 {
+		return
+	}
+	s.count++
+	s.sum += latencyMS
+	s.sumSq += latencyMS * latencyMS
+	s.last = latencyMS
+	if s.count == 1 || latencyMS < s.best {
+		s.best = latencyMS
+	}
+	if s.count == 1 || latencyMS > s.worst {
+		s.worst = latencyMS
+	}
+}
+
+func (s *mtrLatencyStats) apply(target map[string]any) {
+	if s == nil || target == nil || s.count == 0 {
+		return
+	}
+	target["last_ms"] = roundMTRMillis(s.last)
+	target["avg_ms"] = roundMTRMillis(s.sum / float64(s.count))
+	target["best_ms"] = roundMTRMillis(s.best)
+	target["worst_ms"] = roundMTRMillis(s.worst)
+	if s.count > 1 {
+		mean := s.sum / float64(s.count)
+		variance := (s.sumSq / float64(s.count)) - (mean * mean)
+		if variance < 0 {
+			variance = 0
+		}
+		target["stdev_ms"] = roundMTRMillis(math.Sqrt(variance))
+	}
+}
+
+func roundMTRMillis(value float64) float64 {
+	return math.Round(value*1000) / 1000
+}
+
+func copyMTRPathIdentity(target map[string]any, path map[string]any) {
+	if target == nil || path == nil {
+		return
+	}
+	for _, key := range []string{"ip", "host"} {
+		if value := strings.TrimSpace(fmt.Sprint(path[key])); value != "" && value != "<nil>" {
+			target[key] = value
+		}
+	}
+}
+
+func firstNonEmptyMTRPathValue(path map[string]any) string {
+	return firstNonEmptyStringAgent(stringFromMap(path, "ip"), stringFromMap(path, "host"))
+}
+
+type mtrProgressEmitter struct {
+	updates   chan map[string]any
+	done      chan struct{}
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+}
+
+func newMTRProgressEmitter(parent context.Context, cfg config, task taskRequest) *mtrProgressEmitter {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	emitter := &mtrProgressEmitter{
+		updates: make(chan map[string]any, 1),
+		done:    make(chan struct{}),
+		cancel:  cancel,
+	}
+	report := mtrProgressReporter(ctx, cfg, task)
+	go func() {
+		defer close(emitter.done)
+		for summary := range emitter.updates {
+			report(summary)
+		}
+	}()
+	return emitter
+}
+
+func (e *mtrProgressEmitter) Emit(summary map[string]any) {
+	if e == nil || summary == nil {
+		return
+	}
+	snapshot := cloneAnyMap(summary)
+	select {
+	case e.updates <- snapshot:
+		return
+	default:
+	}
+	select {
+	case <-e.updates:
+	default:
+	}
+	select {
+	case e.updates <- snapshot:
+	default:
+	}
+}
+
+func (e *mtrProgressEmitter) Close() {
+	if e == nil {
+		return
+	}
+	e.closeOnce.Do(func() {
+		e.cancel()
+		close(e.updates)
+		select {
+		case <-e.done:
+		case <-time.After(time.Second):
+		}
+	})
 }
 
 func mtrProgressReporter(ctx context.Context, cfg config, task taskRequest) func(map[string]any) {
