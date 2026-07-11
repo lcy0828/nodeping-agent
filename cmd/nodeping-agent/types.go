@@ -31,14 +31,15 @@ type config struct {
 }
 
 type taskRequest struct {
-	ID        string          `json:"task_id"`
-	NodeID    int64           `json:"node_id"`
-	AgentID   string          `json:"agent_id"`
-	TaskType  string          `json:"task_type"`
-	Payload   json.RawMessage `json:"payload"`
-	Options   map[string]any  `json:"options,omitempty"`
-	TimeoutMS int             `json:"timeout_ms,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
+	ID             string          `json:"task_id"`
+	NodeID         int64           `json:"node_id"`
+	AgentID        string          `json:"agent_id"`
+	TaskType       string          `json:"task_type"`
+	Payload        json.RawMessage `json:"payload"`
+	Options        map[string]any  `json:"options,omitempty"`
+	TimeoutMS      int             `json:"timeout_ms,omitempty"`
+	MaxConcurrency int             `json:"max_concurrency,omitempty"`
+	CreatedAt      time.Time       `json:"created_at"`
 }
 
 type taskResult struct {

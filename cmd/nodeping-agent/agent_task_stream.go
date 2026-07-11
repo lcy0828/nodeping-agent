@@ -16,10 +16,10 @@ import (
 )
 
 func taskStreamLoop(ctx context.Context, cfg config) {
-	sem := make(chan struct{}, cfg.Concurrency)
+	limiter := newTaskConcurrencyLimiter(cfg.Concurrency)
 	retryDelay := cfg.StreamRetryMin
 	for {
-		connected, err := consumeTaskStream(ctx, cfg, sem)
+		connected, err := consumeTaskStream(ctx, cfg, limiter)
 		if err != nil && ctx.Err() == nil {
 			if connected {
 				retryDelay = cfg.StreamRetryMin
@@ -45,7 +45,7 @@ func taskStreamLoop(ctx context.Context, cfg config) {
 	}
 }
 
-func consumeTaskStream(ctx context.Context, cfg config, sem chan struct{}) (bool, error) {
+func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrencyLimiter) (bool, error) {
 	endpoint := cfg.ServerURL + "/api/agent/v1/tasks/stream?agent_id=" + url.QueryEscape(cfg.AgentID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -64,9 +64,14 @@ func consumeTaskStream(ctx context.Context, cfg config, sem chan struct{}) (bool
 	}
 	log.Printf("task stream connected")
 	err = readSSETasks(ctx, resp.Body, cfg.StreamIdleTimeout, func(task taskRequest) {
-		sem <- struct{}{}
+		if task.MaxConcurrency > 0 {
+			limiter.SetLimit(task.MaxConcurrency)
+		}
+		if !limiter.Acquire(ctx) {
+			return
+		}
 		go func() {
-			defer func() { <-sem }()
+			defer limiter.Release()
 			executeAndReport(ctx, cfg, task)
 		}()
 	})

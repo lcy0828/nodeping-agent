@@ -116,7 +116,7 @@ func TestConsumeTaskStreamReportsWhetherConnectionWasEstablished(t *testing.T) {
 		StreamRetryMax:    time.Millisecond,
 		Concurrency:       1,
 		HTTPClient:        streamClosed.Client(),
-	}, make(chan struct{}, 1))
+	}, newTaskConcurrencyLimiter(1))
 	if !connected || err == nil || !strings.Contains(err.Error(), "task stream closed") {
 		t.Fatalf("consumeTaskStream connected=%v err=%v, want connected closed stream", connected, err)
 	}
@@ -134,7 +134,7 @@ func TestConsumeTaskStreamReportsWhetherConnectionWasEstablished(t *testing.T) {
 		StreamRetryMax:    time.Millisecond,
 		Concurrency:       1,
 		HTTPClient:        statusFailed.Client(),
-	}, make(chan struct{}, 1))
+	}, newTaskConcurrencyLimiter(1))
 	if connected || err == nil || !strings.Contains(err.Error(), "stream status 503") {
 		t.Fatalf("consumeTaskStream connected=%v err=%v, want pre-connect status error", connected, err)
 	}
@@ -287,12 +287,13 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	defer server.Close()
 
 	resp, err := registerAgent(context.Background(), config{
-		ServerURL:  server.URL,
-		Token:      "binding-token",
-		AgentID:    "agent-test",
-		Name:       "agent-test",
-		Version:    "nodeping-agent/test",
-		HTTPClient: server.Client(),
+		ServerURL:   server.URL,
+		Token:       "binding-token",
+		AgentID:     "agent-test",
+		Name:        "agent-test",
+		Version:     "nodeping-agent/test",
+		Concurrency: 7,
+		HTTPClient:  server.Client(),
 	})
 	if err != nil {
 		t.Fatalf("registerAgent: %v", err)
@@ -305,6 +306,9 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	}
 	if caps, ok := payload["capabilities"].([]any); !ok || len(caps) == 0 {
 		t.Fatalf("capabilities missing from register payload: %+v", payload)
+	}
+	if payload["concurrency"] != float64(7) {
+		t.Fatalf("concurrency = %#v, want 7; payload=%+v", payload["concurrency"], payload)
 	}
 	dependencies, ok := payload["dependency_status"].(map[string]any)
 	if !ok {
@@ -319,6 +323,61 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	if checks, ok := dependencies["checks"].([]any); !ok || len(checks) == 0 {
 		t.Fatalf("dependency status checks missing: %+v", dependencies)
 	}
+}
+
+func TestNormalizeAgentTaskConcurrency(t *testing.T) {
+	tests := []struct {
+		name  string
+		value int
+		want  int
+	}{
+		{name: "legacy default", value: 3, want: 10},
+		{name: "backend execution pool default", value: 10, want: 10},
+		{name: "larger local ceiling", value: 20, want: 20},
+		{name: "invalid high value", value: 1001, want: 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := normalizeAgentTaskConcurrency(tt.value); got != tt.want {
+				t.Fatalf("normalizeAgentTaskConcurrency(%d) = %d, want %d", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTaskConcurrencyLimiterFollowsServerLimit(t *testing.T) {
+	limiter := newTaskConcurrencyLimiter(10)
+	limiter.SetLimit(1)
+	if got := limiter.Limit(); got != 1 {
+		t.Fatalf("limit = %d, want 1", got)
+	}
+	if !limiter.Acquire(context.Background()) {
+		t.Fatal("first acquire failed")
+	}
+
+	acquired := make(chan bool, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		acquired <- limiter.Acquire(ctx)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second acquire should wait at limit 1")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	limiter.SetLimit(2)
+	select {
+	case ok := <-acquired:
+		if !ok {
+			t.Fatal("second acquire failed after increasing limit")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second acquire did not resume after increasing limit")
+	}
+	limiter.Release()
+	limiter.Release()
 }
 
 func TestRunAgentDoctorReturnsStructuredChecks(t *testing.T) {

@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+const (
+	defaultAgentTaskConcurrency = 10
+	maxAgentTaskConcurrency     = 1000
+)
+
 func loadConfig() config {
 	var cfg config
 	flag.StringVar(&cfg.ServerURL, "server", env("NODEPING_SERVER_URL", ""), "NodePing backend base URL")
@@ -31,7 +36,7 @@ func loadConfig() config {
 	flag.DurationVar(&cfg.StreamIdleTimeout, "stream-idle-timeout", envDuration("NODEPING_STREAM_IDLE_TIMEOUT", 90*time.Second), "task stream idle timeout before reconnect")
 	flag.DurationVar(&cfg.StreamRetryMin, "stream-retry-min", envDuration("NODEPING_STREAM_RETRY_MIN", 2*time.Second), "minimum task stream reconnect delay")
 	flag.DurationVar(&cfg.StreamRetryMax, "stream-retry-max", envDuration("NODEPING_STREAM_RETRY_MAX", 30*time.Second), "maximum task stream reconnect delay")
-	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("NODEPING_CONCURRENCY", 3), "max concurrent tasks")
+	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("NODEPING_CONCURRENCY", defaultAgentTaskConcurrency), "fallback concurrency for older backends; current backends control concurrency per task")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.Doctor, "doctor", false, "run diagnostics and exit")
 	flag.BoolVar(&cfg.DoctorJSON, "json", false, "print doctor result as JSON")
@@ -72,9 +77,7 @@ func loadConfig() config {
 	if cfg.Name == "" {
 		cfg.Name = cfg.AgentID
 	}
-	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 3
-	}
+	cfg.Concurrency = normalizeAgentTaskConcurrency(cfg.Concurrency)
 	if cfg.StreamIdleTimeout <= 0 {
 		cfg.StreamIdleTimeout = 90 * time.Second
 	}
@@ -86,6 +89,18 @@ func loadConfig() config {
 	}
 	cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
 	return cfg
+}
+
+func normalizeAgentTaskConcurrency(value int) int {
+	// Older installers persisted 3 in the environment. Current backends send
+	// the authoritative limit with every task, so keep the fallback consistent.
+	if value < defaultAgentTaskConcurrency {
+		return defaultAgentTaskConcurrency
+	}
+	if value > maxAgentTaskConcurrency {
+		return maxAgentTaskConcurrency
+	}
+	return value
 }
 
 func env(key string, fallback string) string {

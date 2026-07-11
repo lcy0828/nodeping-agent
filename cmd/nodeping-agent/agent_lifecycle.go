@@ -22,6 +22,7 @@ func registerAgent(ctx context.Context, cfg config) (registerResponse, error) {
 		"os":                runtime.GOOS,
 		"arch":              runtime.GOARCH,
 		"capabilities":      dependencies.Capabilities,
+		"concurrency":       cfg.Concurrency,
 		"dependency_status": dependencies,
 	}, &out); err != nil {
 		return registerResponse{}, fmt.Errorf("register: %w", err)
@@ -55,6 +56,7 @@ func heartbeatLoop(ctx context.Context, cfg config) {
 			"name":              cfg.Name,
 			"version":           cfg.Version,
 			"capabilities":      dependencies.Capabilities,
+			"concurrency":       cfg.Concurrency,
 			"dependency_status": dependencies,
 		}, nil); err != nil {
 			log.Printf("heartbeat failed: %v", err)

@@ -292,7 +292,7 @@ install -m 0600 /dev/null "$ETC_DIR/nodeping-agent.env"
 	printf 'NODEPING_AGENT_TOKEN_FILE="%s/agent-token"\n' "$(env_quote "$STATE_DIR")"
 	printf 'NODEPING_HEARTBEAT_INTERVAL="%s"\n' "$(env_quote "${NODEPING_HEARTBEAT_INTERVAL:-20s}")"
 	printf 'NODEPING_PUBLIC_IP_INTERVAL="%s"\n' "$(env_quote "${NODEPING_PUBLIC_IP_INTERVAL:-10m}")"
-	printf 'NODEPING_CONCURRENCY="%s"\n' "$(env_quote "${NODEPING_CONCURRENCY:-3}")"
+	printf 'NODEPING_CONCURRENCY="%s"\n' "$(env_quote "${NODEPING_CONCURRENCY:-10}")"
 	printf 'NODEPING_AGENT_UPGRADE_MODE="request_file"\n'
 	printf 'NODEPING_AGENT_UPGRADE_REQUEST_FILE="%s/update-request.json"\n' "$(env_quote "$STATE_DIR")"
 } > "$ETC_DIR/nodeping-agent.env"
