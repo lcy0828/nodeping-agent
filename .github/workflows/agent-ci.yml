@@ -23,7 +23,7 @@ jobs:
           cache: true
 
       - name: Test
-        run: go test ./...
+        run: go test -count=1 ./...
 
       - name: Build default release artifacts
         run: |
