@@ -27,12 +27,36 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: ./scripts/build-nodeping-agent.sh
 
+      - name: Sign release artifacts
+        env:
+          VERSION: ${{ github.ref_name }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY"
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          key_file="$(mktemp)"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
+          for artifact in \
+            dist/nodeping-agent/${VERSION}/nodeping-agent_${VERSION}_*.tar.gz \
+            dist/nodeping-agent/${VERSION}/nodeping-agent_${VERSION}_checksums.txt \
+            dist/nodeping-agent/${VERSION}/nodeping-agent_${VERSION}_manifest.json; do
+            minisign -Sm "$artifact" -s "$key_file" -t "nodeping-agent ${VERSION}"
+          done
+          test -s "dist/nodeping-agent/${VERSION}/nodeping-agent_${VERSION}_checksums.txt.minisig"
+          test -s "dist/nodeping-agent/${VERSION}/nodeping-agent_${VERSION}_manifest.json.minisig"
+
       - name: Upload GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_*.tar.gz
+            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_*.tar.gz.minisig
             dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_checksums.txt
+            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_checksums.txt.minisig
+            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_manifest.json
+            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_manifest.json.minisig
           generate_release_notes: true
 
       - name: Prune non-release assets
@@ -43,7 +67,7 @@ jobs:
             const repo = context.repo.repo;
             const tag = context.ref.replace('refs/tags/', '');
             const release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-            const keep = new RegExp(`^nodeping-agent_${tag}_(?:.+\\.tar\\.gz|checksums\\.txt)$`);
+            const keep = new RegExp(`^nodeping-agent_${tag}_(?:.+\\.tar\\.gz|checksums\\.txt|manifest\\.json)(?:\\.minisig)?$`);
             for (const asset of release.data.assets) {
               if (!keep.test(asset.name)) {
                 core.info(`Deleting release asset ${asset.name}`);
@@ -71,7 +95,7 @@ jobs:
       - name: Build and push Docker image
         env:
           VERSION: ${{ github.ref_name }}
-          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE: ghcr.io/lcy0828/nodeping-agent
           PUSH: "1"
           PLATFORMS: linux/amd64,linux/arm64
         run: ./scripts/build-nodeping-agent-image.sh

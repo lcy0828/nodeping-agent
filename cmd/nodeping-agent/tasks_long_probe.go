@@ -5,25 +5,58 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 func runLongPing(ctx context.Context, target string, options map[string]any) (map[string]any, error) {
-	return runLongProbe(ctx, "long_ping", target, options, runPing)
+	return runPinnedLongPing(ctx, "long_ping", target, options)
 }
 
 func runLongTCPPing(ctx context.Context, target string, options map[string]any) (map[string]any, error) {
-	return runLongProbe(ctx, "long_tcp_ping", target, options, runTCPPing)
+	return runPinnedLongTCPPing(ctx, "long_tcp_ping", target, options)
 }
 
 func runLongPingWithProgress(ctx context.Context, cfg config, task taskRequest, target string) (map[string]any, error) {
-	return runLongProbe(ctx, "long_ping", target, task.Options, runPing, longProbeProgressReporter(ctx, cfg, task, "long_ping"))
+	emitter := newLongProbeProgressEmitter(ctx, cfg, task, "long_ping")
+	defer emitter.Close()
+	return runPinnedLongPing(ctx, "long_ping", target, task.Options, emitter.Emit)
 }
 
 func runLongTCPPingWithProgress(ctx context.Context, cfg config, task taskRequest, target string) (map[string]any, error) {
-	return runLongProbe(ctx, "long_tcp_ping", target, task.Options, runTCPPing, longProbeProgressReporter(ctx, cfg, task, "long_tcp_ping"))
+	emitter := newLongProbeProgressEmitter(ctx, cfg, task, "long_tcp_ping")
+	defer emitter.Close()
+	return runPinnedLongTCPPing(ctx, "long_tcp_ping", target, task.Options, emitter.Emit)
+}
+
+func runPinnedLongPing(ctx context.Context, taskKey string, target string, options map[string]any, onProgress ...func(map[string]any)) (map[string]any, error) {
+	resolver := newProbeTargetResolver(options)
+	addr, err := resolver.resolveHost(ctx, strings.TrimSpace(target))
+	if err != nil {
+		return nil, err
+	}
+	result, err := runLongProbe(ctx, taskKey, addr.String(), options, runPing, onProgress...)
+	if result != nil {
+		result["response_ip"] = addr.String()
+	}
+	return result, err
+}
+
+func runPinnedLongTCPPing(ctx context.Context, taskKey string, target string, options map[string]any, onProgress ...func(map[string]any)) (map[string]any, error) {
+	resolver := newProbeTargetResolver(options)
+	resolved, err := resolver.resolveHostPort(ctx, strings.TrimSpace(target))
+	if err != nil {
+		return nil, err
+	}
+	pinned := net.JoinHostPort(resolved.IP.String(), resolved.Port)
+	result, err := runLongProbe(ctx, taskKey, pinned, options, runTCPPing, onProgress...)
+	if result != nil {
+		result["response_ip"] = resolved.IP.String()
+	}
+	return result, err
 }
 
 var waitLongProbeInterval = func(ctx context.Context, interval time.Duration) error {
@@ -104,6 +137,10 @@ func longProbeProgressReporter(ctx context.Context, cfg config, task taskRequest
 			progress = 100
 		}
 		extra := cloneAnyMap(summary)
+		if sample := latestLongProbeSample(summary["samples"]); sample != nil {
+			extra["latest_sample"] = sample
+		}
+		delete(extra, "samples")
 		extra["event_kind"] = "long_probe_sample"
 		extra["task_type"] = taskKey
 		event := taskEvent{
@@ -120,6 +157,93 @@ func longProbeProgressReporter(ctx context.Context, cfg config, task taskRequest
 			log.Printf("report task event failed task_id=%s: %v", task.ID, err)
 		}
 	}
+}
+
+type longProbeProgressEmitter struct {
+	updates   chan map[string]any
+	done      chan struct{}
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	closed    bool
+	closeOnce sync.Once
+}
+
+func newLongProbeProgressEmitter(parent context.Context, cfg config, task taskRequest, taskKey string) *longProbeProgressEmitter {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	emitter := &longProbeProgressEmitter{
+		updates: make(chan map[string]any, 1),
+		done:    make(chan struct{}),
+		cancel:  cancel,
+	}
+	report := longProbeProgressReporter(ctx, cfg, task, taskKey)
+	go func() {
+		defer close(emitter.done)
+		for summary := range emitter.updates {
+			report(summary)
+		}
+	}()
+	return emitter
+}
+
+func (e *longProbeProgressEmitter) Emit(summary map[string]any) {
+	if e == nil || summary == nil {
+		return
+	}
+	snapshot := cloneAnyMap(summary)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	select {
+	case e.updates <- snapshot:
+		return
+	default:
+	}
+	select {
+	case <-e.updates:
+	default:
+	}
+	select {
+	case e.updates <- snapshot:
+	default:
+	}
+}
+
+func (e *longProbeProgressEmitter) Close() {
+	if e == nil {
+		return
+	}
+	e.closeOnce.Do(func() {
+		e.mu.Lock()
+		e.closed = true
+		close(e.updates)
+		e.mu.Unlock()
+		e.cancel()
+		select {
+		case <-e.done:
+		case <-time.After(time.Second):
+		}
+	})
+}
+
+func latestLongProbeSample(raw any) map[string]any {
+	switch samples := raw.(type) {
+	case []map[string]any:
+		if len(samples) > 0 {
+			return cloneAnyMap(samples[len(samples)-1])
+		}
+	case []any:
+		if len(samples) > 0 {
+			if sample, ok := samples[len(samples)-1].(map[string]any); ok {
+				return cloneAnyMap(sample)
+			}
+		}
+	}
+	return nil
 }
 
 func cloneAnyMap(in map[string]any) map[string]any {

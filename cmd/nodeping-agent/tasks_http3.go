@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -24,20 +23,22 @@ func runHTTP3CheckWithTLSConfig(ctx context.Context, target string, options map[
 	if target == "" {
 		return nil, errors.New("http3_check target is required")
 	}
-	parsed, err := url.Parse(target)
+	parsed, err := validateHTTPProbeURL(target, true)
 	if err != nil {
 		return nil, err
 	}
-	if parsed.Scheme != "https" {
-		return nil, errors.New("http3_check requires https URL")
+	resolver := newProbeTargetResolver(options)
+	pinnedIP, err := resolver.resolveHost(ctx, parsed.Hostname())
+	if err != nil {
+		return nil, err
 	}
 	originalHost := originalHostOption(options)
 	started := time.Now()
-	httpsOptions := map[string]any{"max_body_bytes": 0}
+	httpsOptions := mergeAgentOptions(options, map[string]any{"max_body_bytes": 0})
 	if originalHost != "" {
 		httpsOptions["original_host"] = originalHost
 	}
-	_, _, httpsResponse, _ := runHTTPRequest(ctx, http.MethodGet, target, nil, "", httpsOptions)
+	_, _, httpsResponse, _ := runHTTPRequestWithResolver(ctx, http.MethodGet, target, nil, "", httpsOptions, resolver)
 	result := map[string]any{
 		"http3_check": elapsedMS(started),
 	}
@@ -50,8 +51,9 @@ func runHTTP3CheckWithTLSConfig(ctx context.Context, target string, options map[
 	if port == "" {
 		port = "443"
 	}
-	udpTarget := net.JoinHostPort(parsed.Hostname(), port)
-	udpResult, udpErr := runUDPProbe(ctx, udpTarget, map[string]any{"payload": "", "wait_response": false, "read_timeout_ms": 500})
+	udpTarget := net.JoinHostPort(pinnedIP.String(), port)
+	udpOptions := mergeAgentOptions(options, map[string]any{"payload": "", "wait_response": false, "read_timeout_ms": 500})
+	udpResult, udpErr := runUDPProbe(ctx, udpTarget, udpOptions)
 	if udpErr != nil {
 		result["udp_443_reachable"] = false
 		result["udp_error"] = udpErr.Error()
@@ -87,7 +89,7 @@ func runHTTP3CheckWithTLSConfig(ctx context.Context, target string, options map[
 	if originalHost != "" {
 		headers["host"] = originalHost
 	}
-	latency, responseIP, http3Response, err := runHTTP3RequestWithTLSConfig(ctx, method, target, headers, body, options, tlsConfig)
+	latency, responseIP, http3Response, err := runHTTP3RequestWithResolver(ctx, method, target, headers, body, options, tlsConfig, resolver)
 	for key, value := range http3Response {
 		result[key] = value
 	}
@@ -110,14 +112,23 @@ func runHTTP3Request(ctx context.Context, method string, target string, headers 
 }
 
 func runHTTP3RequestWithTLSConfig(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any, tlsConfig *tls.Config) (float64, string, map[string]any, error) {
+	return runHTTP3RequestWithResolver(ctx, method, target, headers, body, options, tlsConfig, newProbeTargetResolver(options))
+}
+
+func runHTTP3RequestWithResolver(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any, tlsConfig *tls.Config, resolver *probeTargetResolver) (float64, string, map[string]any, error) {
 	if method == "" {
 		method = http.MethodGet
+	}
+	if _, err := validateHTTPProbeURL(target, true); err != nil {
+		return 0, "", nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, strings.NewReader(body))
 	if err != nil {
 		return 0, "", nil, err
 	}
-	allowPrivate := allowPrivateHTTPDestinations(options)
+	if resolver == nil {
+		resolver = newProbeTargetResolver(options)
+	}
 	originalHost := originalHostOption(options)
 	if originalHost != "" {
 		req.Host = originalHost
@@ -144,22 +155,16 @@ func runHTTP3RequestWithTLSConfig(ctx context.Context, method string, target str
 			MaxIdleTimeout:       deadlineTimeout(ctx, 10*time.Second),
 		},
 		Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
-			host, _, err := net.SplitHostPort(addr)
+			resolved, err := resolver.resolveHostPort(ctx, addr)
 			if err != nil {
 				return nil, err
 			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", strings.Trim(host, "[]"))
-			if err != nil {
-				return nil, err
+			if tlsCfg.ServerName == "" {
+				tlsCfg = tlsCfg.Clone()
+				tlsCfg.ServerName = resolved.Host
 			}
-			if !allowPrivate {
-				for _, ip := range ips {
-					if !isPublicIP(ip) {
-						return nil, errUnsafeHTTPDestination
-					}
-				}
-			}
-			conn, err := quic.DialAddr(ctx, addr, tlsCfg, cfg)
+			pinned := net.JoinHostPort(resolved.IP.String(), resolved.Port)
+			conn, err := quic.DialAddr(ctx, pinned, tlsCfg, cfg)
 			if err == nil {
 				responseIP = remoteAddrIP(conn.RemoteAddr())
 			}
@@ -170,7 +175,7 @@ func runHTTP3RequestWithTLSConfig(ctx context.Context, method string, target str
 	client := &http.Client{
 		Transport:     transport,
 		Timeout:       deadlineTimeout(ctx, 10*time.Second),
-		CheckRedirect: safeHTTPRedirectPolicy(allowPrivate),
+		CheckRedirect: safeHTTPRedirectPolicy(resolver.allowPrivate),
 	}
 	started := time.Now()
 	resp, err := client.Do(req)

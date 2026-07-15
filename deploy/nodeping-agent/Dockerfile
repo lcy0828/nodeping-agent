@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25.12-alpine AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -41,5 +41,5 @@ VOLUME ["/var/lib/nodeping-agent"]
 
 USER nodeping
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 CMD /usr/local/bin/nodeping-agent doctor --json >/dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD /usr/local/bin/nodeping-agent liveness >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/nodeping-agent"]

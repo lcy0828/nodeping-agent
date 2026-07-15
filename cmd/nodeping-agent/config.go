@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -17,6 +16,7 @@ import (
 const (
 	defaultAgentTaskConcurrency = 10
 	maxAgentTaskConcurrency     = 1000
+	defaultStreamRetryMax       = 10 * time.Second
 )
 
 func loadConfig() config {
@@ -31,20 +31,26 @@ func loadConfig() config {
 	flag.StringVar(&cfg.UpgradeUnit, "upgrade-unit", env("NODEPING_AGENT_UPGRADE_UNIT", "nodeping-agent-update.service"), "fixed systemd unit used for remote upgrades")
 	flag.StringVar(&cfg.UpgradeScript, "upgrade-script", env("NODEPING_AGENT_UPGRADE_SCRIPT", "/opt/nodeping-agent/nodeping-agent-update"), "fixed script used for remote upgrades")
 	flag.StringVar(&cfg.UpgradeRequestFile, "upgrade-request-file", env("NODEPING_AGENT_UPGRADE_REQUEST_FILE", defaultUpgradeRequestFile()), "fixed request file watched by the systemd upgrade path")
+	flag.StringVar(&cfg.ReleaseProxyFile, "release-proxy-file", env("NODEPING_AGENT_RELEASE_PROXY_FILE", defaultReleaseProxyFile()), "backend-managed release proxy catalog")
+	flag.StringVar(&cfg.LatestVersionFile, "latest-version-file", env("NODEPING_AGENT_LATEST_VERSION_FILE", defaultLatestVersionFile()), "backend-managed latest release version cache")
 	flag.DurationVar(&cfg.HeartbeatInterval, "heartbeat", envDuration("NODEPING_HEARTBEAT_INTERVAL", 20*time.Second), "heartbeat interval")
 	flag.DurationVar(&cfg.PublicIPInterval, "public-ip-interval", envDuration("NODEPING_PUBLIC_IP_INTERVAL", 10*time.Minute), "public IP report interval")
 	flag.DurationVar(&cfg.StreamIdleTimeout, "stream-idle-timeout", envDuration("NODEPING_STREAM_IDLE_TIMEOUT", 90*time.Second), "task stream idle timeout before reconnect")
 	flag.DurationVar(&cfg.StreamRetryMin, "stream-retry-min", envDuration("NODEPING_STREAM_RETRY_MIN", 2*time.Second), "minimum task stream reconnect delay")
-	flag.DurationVar(&cfg.StreamRetryMax, "stream-retry-max", envDuration("NODEPING_STREAM_RETRY_MAX", 30*time.Second), "maximum task stream reconnect delay")
+	flag.DurationVar(&cfg.StreamRetryMax, "stream-retry-max", envDuration("NODEPING_STREAM_RETRY_MAX", defaultStreamRetryMax), "maximum task stream reconnect delay")
+	flag.DurationVar(&cfg.ShutdownDrain, "shutdown-drain-timeout", envDuration("NODEPING_SHUTDOWN_DRAIN_TIMEOUT", 15*time.Second), "maximum time to drain running tasks before cancellation")
 	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("NODEPING_CONCURRENCY", defaultAgentTaskConcurrency), "fallback concurrency for older backends; current backends control concurrency per task")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.Doctor, "doctor", false, "run diagnostics and exit")
 	flag.BoolVar(&cfg.DoctorJSON, "json", false, "print doctor result as JSON")
+	flag.BoolVar(&cfg.Liveness, "liveness", false, "check local agent process liveness and exit")
 	flag.Parse()
 	for _, arg := range flag.Args() {
 		switch arg {
 		case "doctor":
 			cfg.Doctor = true
+		case "liveness":
+			cfg.Liveness = true
 		case "--json", "-json", "json":
 			cfg.DoctorJSON = true
 		}
@@ -59,16 +65,21 @@ func loadConfig() config {
 	cfg.UpgradeUnit = strings.TrimSpace(cfg.UpgradeUnit)
 	cfg.UpgradeScript = strings.TrimSpace(cfg.UpgradeScript)
 	cfg.UpgradeRequestFile = strings.TrimSpace(cfg.UpgradeRequestFile)
+	cfg.ReleaseProxyFile = strings.TrimSpace(cfg.ReleaseProxyFile)
+	cfg.LatestVersionFile = strings.TrimSpace(cfg.LatestVersionFile)
 	cfg.Version = "nodeping-agent/" + version
-	if cfg.PrintVersion {
+	if cfg.PrintVersion || cfg.Liveness {
 		return cfg
 	}
 	if cfg.ServerURL == "" || (cfg.Token == "" && cfg.AgentToken == "" && strings.TrimSpace(readAgentTokenFile(cfg.AgentTokenFile)) == "") {
 		if cfg.Doctor {
-			cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+			cfg.HTTPClient = newControlPlaneHTTPClient(30 * time.Second)
 			return cfg
 		}
 		log.Fatal("NODEPING_SERVER_URL and either NODEPING_AGENT_TOKEN or NODEPING_TOKEN are required")
+	}
+	if _, err := validateSecureBaseURL(cfg.ServerURL, "NODEPING_SERVER_URL"); err != nil {
+		log.Fatal(err)
 	}
 	if cfg.AgentToken == "" {
 		cfg.AgentToken = readAgentTokenFile(cfg.AgentTokenFile)
@@ -87,7 +98,13 @@ func loadConfig() config {
 	if cfg.StreamRetryMax < cfg.StreamRetryMin {
 		cfg.StreamRetryMax = cfg.StreamRetryMin
 	}
-	cfg.HTTPClient = &http.Client{Timeout: 30 * time.Second}
+	if cfg.ShutdownDrain <= 0 {
+		cfg.ShutdownDrain = 15 * time.Second
+	}
+	if cfg.ShutdownDrain > 2*time.Minute {
+		cfg.ShutdownDrain = 2 * time.Minute
+	}
+	cfg.HTTPClient = newControlPlaneHTTPClient(30 * time.Second)
 	return cfg
 }
 
@@ -258,6 +275,28 @@ func defaultUpgradeRequestFile() string {
 		return ""
 	}
 	return filepath.Join(dir, "nodeping", "update-request.json")
+}
+
+func defaultReleaseProxyFile() string {
+	if runtime.GOOS == "linux" {
+		return "/var/lib/nodeping-agent/release-proxies.tsv"
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, "nodeping", "release-proxies.tsv")
+}
+
+func defaultLatestVersionFile() string {
+	if runtime.GOOS == "linux" {
+		return "/var/lib/nodeping-agent/latest-version"
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, "nodeping", "latest-version")
 }
 
 func readAgentIDFile(path string) string {

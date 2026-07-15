@@ -7,53 +7,44 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
-	"time"
 )
 
-var errUnsafeHTTPDestination = errors.New("HTTP target resolved to a private or reserved IP")
+var errUnsafeHTTPDestination = errUnsafeProbeDestination
 
 func safeHTTPTransport(ctx context.Context, originalHost string, allowPrivate bool) *http.Transport {
+	resolver := &probeTargetResolver{allowPrivate: allowPrivate, cache: make(map[string]netip.Addr)}
+	return safeHTTPTransportWithResolver(originalHost, resolver)
+}
+
+func safeHTTPTransportWithResolver(originalHost string, resolver *probeTargetResolver) *http.Transport {
+	if resolver == nil {
+		resolver = newProbeTargetResolver(nil)
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	transport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
-		return safeDialContext(ctx, network, address, allowPrivate)
+		return resolver.dialContext(ctx, network, address)
+	}
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		if transport.TLSClientConfig.MinVersion == 0 {
+			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+		}
 	}
 	if originalHost != "" {
-		if transport.TLSClientConfig == nil {
-			transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		} else {
-			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
-			if transport.TLSClientConfig.MinVersion == 0 {
-				transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-			}
-		}
 		transport.TLSClientConfig.ServerName = strings.Trim(originalHost, "[]")
 	}
 	return transport
 }
 
 func safeDialContext(ctx context.Context, network string, address string, allowPrivate bool) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return nil, err
-	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", strings.Trim(host, "[]"))
-	if err != nil {
-		return nil, err
-	}
-	if !allowPrivate {
-		for _, ip := range ips {
-			if !isPublicIP(ip) {
-				return nil, errUnsafeHTTPDestination
-			}
-		}
-	}
-	if len(ips) == 0 {
-		return nil, errors.New("HTTP target did not resolve to an IP")
-	}
-	dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 5*time.Second)}
-	return dialer.DialContext(ctx, network, net.JoinHostPort(publicDialIP(ips[0]), port))
+	resolver := &probeTargetResolver{allowPrivate: allowPrivate, cache: make(map[string]netip.Addr)}
+	return resolver.dialContext(ctx, network, address)
 }
 
 func safeHTTPRedirectPolicy(allowPrivate bool) func(*http.Request, []*http.Request) error {
@@ -66,27 +57,41 @@ func checkSafeHTTPRedirect(req *http.Request, via []*http.Request, allowPrivate 
 	if len(via) >= 5 {
 		return errors.New("stopped after 5 redirects")
 	}
-	if allowPrivate {
-		return nil
-	}
 	if req == nil || req.URL == nil {
 		return errors.New("invalid redirect target")
+	}
+	scheme := strings.ToLower(strings.TrimSpace(req.URL.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return errors.New("redirect target must use http or https")
+	}
+	if len(via) > 0 && via[len(via)-1] != nil && via[len(via)-1].URL != nil &&
+		strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && scheme == "http" {
+		return errors.New("HTTPS redirect downgrade is not allowed")
+	}
+	for _, header := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
+		req.Header.Del(header)
 	}
 	host := strings.Trim(req.URL.Hostname(), "[]")
 	if host == "" {
 		return errors.New("redirect target host is required")
 	}
+	if _, err := validateProbePort(defaultURLPort(req.URL)); err != nil {
+		return err
+	}
+	if allowPrivate {
+		return nil
+	}
 	if strings.EqualFold(host, "localhost") {
 		return errUnsafeHTTPDestination
 	}
-	if ip := net.ParseIP(host); ip != nil && !isPublicIP(ip) {
+	if addr, err := netip.ParseAddr(host); err == nil && !isPublicProbeAddr(addr) {
 		return errUnsafeHTTPDestination
 	}
 	return nil
 }
 
 func allowPrivateHTTPDestinations(options map[string]any) bool {
-	return boolOptionDefault(options, "allow_private_redirects", false) || boolOptionDefault(options, "allow_private_targets", false)
+	return trustedPrivateTargetTask(options)
 }
 
 func publicDialIP(ip net.IP) string {
@@ -117,23 +122,68 @@ func requirePublicResolverHost(ctx context.Context, server string) error {
 	if strings.EqualFold(host, "localhost") {
 		return fmt.Errorf("resolver address must be public")
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		if !isPublicIP(ip) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if !isPublicProbeAddr(addr) {
 			return fmt.Errorf("resolver address must be public")
 		}
 		return nil
 	}
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	addrs, err := lookupProbeNetIP(ctx, "ip", host)
 	if err != nil {
 		return err
 	}
-	if len(ips) == 0 {
+	if len(addrs) == 0 {
 		return fmt.Errorf("resolver address did not resolve")
 	}
-	for _, ip := range ips {
-		if !isPublicIP(ip) {
+	for _, addr := range addrs {
+		if !isPublicProbeAddr(addr) {
 			return fmt.Errorf("resolver address must resolve to public IPs")
 		}
 	}
 	return nil
+}
+
+func validateHTTPProbeURL(raw string, requireHTTPS bool) (*url.URL, error) {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return nil, errors.New("HTTP target is required")
+	}
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return nil, err
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if (scheme != "http" && scheme != "https") || (requireHTTPS && scheme != "https") {
+		if requireHTTPS {
+			return nil, errors.New("HTTP/3 target must use https")
+		}
+		return nil, errors.New("HTTP target must use http or https")
+	}
+	if parsed.Opaque != "" || parsed.Host == "" || parsed.User != nil {
+		return nil, errors.New("HTTP target URL is invalid")
+	}
+	if _, err := validateProbeHost(parsed.Hostname()); err != nil {
+		return nil, err
+	}
+	if _, err := validateProbePort(defaultURLPort(parsed)); err != nil {
+		return nil, err
+	}
+	return parsed, nil
+}
+
+func defaultURLPort(target *url.URL) string {
+	if target == nil {
+		return ""
+	}
+	if port := target.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(target.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }

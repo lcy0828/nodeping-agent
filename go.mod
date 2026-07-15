@@ -1,10 +1,10 @@
 module nodeping
 
-go 1.25.0
+go 1.25.12
 
 require (
 	github.com/go-sql-driver/mysql v1.7.1
-	github.com/golang-jwt/jwt/v5 v5.2.0
+	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/jonas-p/go-shp v0.1.1
 	github.com/oschwald/geoip2-golang v1.13.0

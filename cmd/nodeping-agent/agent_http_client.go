@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func postJSON(ctx context.Context, cfg config, path string, payload any, out any) error {
@@ -19,12 +20,20 @@ func postAgentJSON(ctx context.Context, cfg config, path string, payload any, ou
 }
 
 func getJSONWithToken(ctx context.Context, cfg config, token string, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.ServerURL+path, nil)
+	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := cfg.HTTPClient.Do(req)
+	client := cfg.HTTPClient
+	if client == nil {
+		client = newControlPlaneHTTPClient(30 * time.Second)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -44,13 +53,21 @@ func postJSONWithToken(ctx context.Context, cfg config, token string, path strin
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.ServerURL+path, bytes.NewReader(raw))
+	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, path)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := cfg.HTTPClient.Do(req)
+	client := cfg.HTTPClient
+	if client == nil {
+		client = newControlPlaneHTTPClient(30 * time.Second)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}

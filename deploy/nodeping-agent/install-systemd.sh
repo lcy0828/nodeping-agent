@@ -69,6 +69,8 @@ EnvironmentFile=$ETC_DIR/nodeping-agent.env
 ExecStart=$INSTALL_BIN
 Restart=always
 RestartSec=5s
+TimeoutStopSec=35s
+KillSignal=SIGTERM
 WorkingDirectory=$STATE_DIR
 
 NoNewPrivileges=true
@@ -106,6 +108,7 @@ preflight() {
 	require_command groupadd
 	require_command useradd
 	require_command install
+	require_command mktemp
 	if ! command -v ping >/dev/null 2>&1; then
 		say_err "未找到 ping 命令；运行 ICMP 检测前请安装 iputils-ping/iputils" "ping command not found; install iputils-ping/iputils before running ICMP checks"
 		exit 1
@@ -199,17 +202,20 @@ if ! grep -Eq 'your-nodeping\.example|np_xxx' "$ETC_DIR/nodeping-agent.env"; the
 	# shellcheck disable=SC1090
 	. "$ETC_DIR/nodeping-agent.env"
 	set +a
-	if "$INSTALL_BIN" doctor --json >/tmp/nodeping-agent-doctor.json 2>/tmp/nodeping-agent-doctor.err; then
+	doctor_dir="$(mktemp -d)"
+	if "$INSTALL_BIN" doctor --json >"$doctor_dir/result.json" 2>"$doctor_dir/error.log"; then
 		"$INSTALL_BIN" doctor || true
 		say "nodeping-agent 自检通过" "nodeping-agent doctor passed"
 	else
-		cat /tmp/nodeping-agent-doctor.err >&2 || true
+		cat "$doctor_dir/error.log" >&2 || true
 		say_err "nodeping-agent 自检发现问题；请检查配置并查看 journalctl -u nodeping-agent" "nodeping-agent doctor reported issues; check configuration and journalctl -u nodeping-agent"
 		systemctl_quiet stop nodeping-agent.service || true
 		systemctl status nodeping-agent.service --no-pager -l >&2 || true
 		journalctl -u nodeping-agent.service -n 60 --no-pager >&2 || true
+		rm -rf "$doctor_dir"
 		exit 1
 	fi
+	rm -rf "$doctor_dir"
 else
 	say "nodeping-agent.service 已启用，但因环境文件仍包含占位值未启动" "nodeping-agent.service enabled but not started because env still contains placeholders"
 fi

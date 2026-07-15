@@ -18,16 +18,20 @@ type config struct {
 	UpgradeUnit        string
 	UpgradeScript      string
 	UpgradeRequestFile string
+	ReleaseProxyFile   string
+	LatestVersionFile  string
 	HeartbeatInterval  time.Duration
 	PublicIPInterval   time.Duration
 	StreamIdleTimeout  time.Duration
 	StreamRetryMin     time.Duration
 	StreamRetryMax     time.Duration
+	ShutdownDrain      time.Duration
 	Concurrency        int
 	HTTPClient         *http.Client
 	PrintVersion       bool
 	Doctor             bool
 	DoctorJSON         bool
+	Liveness           bool
 }
 
 type taskRequest struct {
@@ -40,6 +44,8 @@ type taskRequest struct {
 	TimeoutMS      int             `json:"timeout_ms,omitempty"`
 	MaxConcurrency int             `json:"max_concurrency,omitempty"`
 	CreatedAt      time.Time       `json:"created_at"`
+	Operation      string          `json:"operation,omitempty"`
+	CancelTaskID   string          `json:"cancel_task_id,omitempty"`
 }
 
 type taskResult struct {
@@ -65,8 +71,24 @@ type taskEvent struct {
 }
 
 type registerResponse struct {
-	AgentID    string `json:"agent_id"`
-	AgentToken string `json:"agent_token"`
+	AgentID        string              `json:"agent_id"`
+	AgentToken     string              `json:"agent_token"`
+	ReleaseProxies []agentReleaseProxy `json:"release_proxies"`
+	LatestVersion  string              `json:"latest_version"`
+}
+
+type heartbeatResponse struct {
+	ReleaseProxies []agentReleaseProxy `json:"release_proxies"`
+	LatestVersion  string              `json:"latest_version"`
+}
+
+type agentReleaseProxy struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	BaseURL    string `json:"base_url"`
+	Mode       string `json:"mode"`
+	QueryParam string `json:"query_param,omitempty"`
+	Priority   int    `json:"priority"`
 }
 
 type agentStatusResponse struct {

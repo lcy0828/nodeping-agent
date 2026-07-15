@@ -71,9 +71,9 @@ func stringOptionAny(options map[string]any, key string) string {
 	switch value := options[key].(type) {
 	case string:
 		return value
-	case fmt.Stringer:
-		return value.String()
 	case json.Number:
+		return value.String()
+	case fmt.Stringer:
 		return value.String()
 	case nil:
 		return ""

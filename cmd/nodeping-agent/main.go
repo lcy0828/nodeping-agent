@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 var (
@@ -24,6 +25,12 @@ func main() {
 	defer stop()
 	if cfg.PrintVersion {
 		fmt.Printf("nodeping-agent version=%s commit=%s date=%s\n", version, commit, buildDate)
+		return
+	}
+	if cfg.Liveness {
+		if err := checkLocalAgentLiveness(); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 	if cfg.Doctor {
@@ -55,6 +62,16 @@ func run(ctx context.Context, cfg config) error {
 			}
 		}
 		cfg.AgentToken = strings.TrimSpace(registerResp.AgentToken)
+		if registerResp.ReleaseProxies != nil {
+			if err := persistAgentReleaseProxies(cfg.ReleaseProxyFile, registerResp.ReleaseProxies); err != nil {
+				log.Printf("store release proxy catalog failed: %v", err)
+			}
+		}
+		if strings.TrimSpace(registerResp.LatestVersion) != "" {
+			if err := persistAgentLatestVersion(cfg.LatestVersionFile, registerResp.LatestVersion); err != nil {
+				log.Printf("store latest agent version failed: %v", err)
+			}
+		}
 	}
 	if cfg.AgentToken == "" {
 		return errors.New("register response did not include agent_token")
@@ -64,22 +81,33 @@ func run(ctx context.Context, cfg config) error {
 	}
 	log.Printf("registered agent_id=%s server=%s", cfg.AgentID, cfg.ServerURL)
 	var wg sync.WaitGroup
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	loopCtx, cancelLoops := context.WithCancel(ctx)
+	defer cancelLoops()
+	taskExecutor := newAgentTaskExecutor(context.WithoutCancel(ctx), cfg)
+	defer taskExecutor.Cancel()
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		heartbeatLoop(ctx, cfg)
+		heartbeatLoop(loopCtx, cfg)
 	}()
 	go func() {
 		defer wg.Done()
-		publicIPLoop(ctx, cfg)
+		publicIPLoop(loopCtx, cfg)
 	}()
 	go func() {
 		defer wg.Done()
-		taskStreamLoop(ctx, cfg)
+		taskStreamLoop(loopCtx, cfg, taskExecutor)
 	}()
 	<-ctx.Done()
+	taskExecutor.StopAccepting()
+	cancelLoops()
 	wg.Wait()
+	if !taskExecutor.Wait(cfg.ShutdownDrain) {
+		log.Printf("task drain timed out after %s; canceling running tasks", cfg.ShutdownDrain)
+		taskExecutor.Cancel()
+		if !taskExecutor.Wait(15 * time.Second) {
+			log.Printf("running tasks did not stop within final reporting window")
+		}
+	}
 	return ctx.Err()
 }

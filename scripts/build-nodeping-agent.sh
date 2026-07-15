@@ -54,6 +54,7 @@ rm -f "$DIST_DIR"/nodeping-agent_"$VERSION"_checksums.txt
 rm -f "$DIST_DIR"/nodeping-agent_"$VERSION"_manifest.json
 rm -f "$DIST_DIR"/latest.txt
 rm -f "$DIST_DIR"/install-release.sh
+rm -f "$DIST_DIR"/install-docker.sh
 rm -f "$DIST_DIR"/compose.yml
 rm -f "$DIST_DIR"/docker.env.example
 rm -f "$DIST_DIR"/update-docker.sh
@@ -62,6 +63,8 @@ rm -f "$DIST_DIR"/PLATFORMS.md
 rm -f "$DIST_DIR"/RELEASE_NOTES.md
 
 checksums_file="$DIST_DIR/nodeping-agent_${VERSION}_checksums.txt"
+manifest_entries="$DIST_DIR/.nodeping-agent_${VERSION}_manifest.entries"
+rm -f "$manifest_entries"
 
 echo "building nodeping-agent version=$VERSION commit=$COMMIT date=$BUILD_DATE"
 
@@ -75,6 +78,7 @@ EOF
 	fi
 	goarm=""
 	target_id="${goos}_${goarch}"
+	manifest_arch="$goarch"
 	if [ "$goarch" = "arm" ]; then
 		case "${variant:-}" in
 			v*) goarm="${variant#v}" ;;
@@ -82,6 +86,7 @@ EOF
 			*) echo "invalid arm variant in platform: $platform" >&2; exit 1 ;;
 		esac
 		target_id="${goos}_${goarch}v${goarm}"
+		manifest_arch="${goarch}v${goarm}"
 	elif [ -n "${variant:-}" ]; then
 		echo "unexpected platform variant: $platform" >&2
 		exit 1
@@ -121,22 +126,27 @@ EOF
 	cp "$ROOT_DIR/deploy/nodeping-agent/compose.yml" "$package_dir/nodeping-agent/compose.yml"
 	cp "$ROOT_DIR/deploy/nodeping-agent/docker.env.example" "$package_dir/nodeping-agent/docker.env.example"
 	cp "$ROOT_DIR/deploy/nodeping-agent/install-release.sh" "$package_dir/nodeping-agent/install-release.sh"
+	cp "$ROOT_DIR/deploy/nodeping-agent/install-docker.sh" "$package_dir/nodeping-agent/install-docker.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/install-systemd.sh" "$package_dir/nodeping-agent/install-systemd.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/uninstall-systemd.sh" "$package_dir/nodeping-agent/uninstall-systemd.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/update-nodeping-agent.sh" "$package_dir/nodeping-agent/update-nodeping-agent.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/update-docker.sh" "$package_dir/nodeping-agent/update-docker.sh"
 	chmod 0755 "$package_dir/nodeping-agent/$binary_name" \
 		"$package_dir/nodeping-agent/install-release.sh" \
+		"$package_dir/nodeping-agent/install-docker.sh" \
 		"$package_dir/nodeping-agent/install-systemd.sh" \
 		"$package_dir/nodeping-agent/uninstall-systemd.sh" \
 		"$package_dir/nodeping-agent/update-nodeping-agent.sh" \
 		"$package_dir/nodeping-agent/update-docker.sh"
 
 	tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
-	(
+	checksum_line="$(
 		cd "$DIST_DIR"
 		sha256_file "$artifact"
-	) >> "$checksums_file"
+	)"
+	printf '%s\n' "$checksum_line" >> "$checksums_file"
+	artifact_sha256="${checksum_line%%[[:space:]]*}"
+	printf '%s\t%s\t%s\t%s\n' "$artifact" "$goos" "$manifest_arch" "$artifact_sha256" >> "$manifest_entries"
 	rm -rf "$package_dir"
 	trap - EXIT
 	echo "built $artifact"
@@ -152,8 +162,23 @@ write_release_notes_file "$DIST_DIR/RELEASE_NOTES.md"
 	printf '  "version": "%s",\n' "$VERSION"
 	printf '  "commit": "%s",\n' "$COMMIT"
 	printf '  "build_date": "%s",\n' "$BUILD_DATE"
-	printf '  "checksums": "nodeping-agent_%s_checksums.txt"\n' "$VERSION"
+	printf '  "checksums": "nodeping-agent_%s_checksums.txt",\n' "$VERSION"
+	printf '  "schema_version": 1,\n'
+	printf '  "artifacts": [\n'
+	entry_number=0
+	entry_count="$(wc -l < "$manifest_entries" | tr -d '[:space:]')"
+	while IFS=$'\t' read -r artifact_name artifact_os artifact_arch artifact_sha256; do
+		entry_number=$((entry_number + 1))
+		comma=,
+		if [ "$entry_number" -eq "$entry_count" ]; then
+			comma=
+		fi
+		printf '    {"name": "%s", "os": "%s", "arch": "%s", "sha256": "%s"}%s\n' \
+			"$artifact_name" "$artifact_os" "$artifact_arch" "$artifact_sha256" "$comma"
+	done < "$manifest_entries"
+	printf '  ]\n'
 	printf '}\n'
 } > "$DIST_DIR/nodeping-agent_${VERSION}_manifest.json"
+rm -f "$manifest_entries"
 
 echo "release files written to $DIST_DIR"

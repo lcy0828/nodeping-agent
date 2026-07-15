@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/url"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -49,6 +50,7 @@ func heartbeatLoop(ctx context.Context, cfg config) {
 	defer ticker.Stop()
 	for {
 		dependencies := cachedDependencySnapshot(ctx, cfg)
+		var response heartbeatResponse
 		if err := postAgentJSON(ctx, cfg, "/api/agent/v1/heartbeat", map[string]any{
 			"agent_id":          cfg.AgentID,
 			"agent_token":       cfg.AgentToken,
@@ -58,8 +60,19 @@ func heartbeatLoop(ctx context.Context, cfg config) {
 			"capabilities":      dependencies.Capabilities,
 			"concurrency":       cfg.Concurrency,
 			"dependency_status": dependencies,
-		}, nil); err != nil {
+		}, &response); err != nil {
 			log.Printf("heartbeat failed: %v", err)
+		} else {
+			if response.ReleaseProxies != nil {
+				if err := persistAgentReleaseProxies(cfg.ReleaseProxyFile, response.ReleaseProxies); err != nil {
+					log.Printf("store release proxy catalog failed: %v", err)
+				}
+			}
+			if strings.TrimSpace(response.LatestVersion) != "" {
+				if err := persistAgentLatestVersion(cfg.LatestVersionFile, response.LatestVersion); err != nil {
+					log.Printf("store latest agent version failed: %v", err)
+				}
+			}
 		}
 		select {
 		case <-ctx.Done():

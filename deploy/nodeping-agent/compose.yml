@@ -1,9 +1,20 @@
 services:
   nodeping-agent:
-    image: ${NODEPING_AGENT_IMAGE:-ghcr.io/lcy0828/nodeping-agent}:${NODEPING_AGENT_IMAGE_VERSION:-latest}
+    image: ${NODEPING_AGENT_IMAGE:-hub.ilatency.com/ghcr.io/lcy0828/nodeping-agent}:${NODEPING_AGENT_IMAGE_VERSION:-latest}
     restart: unless-stopped
+    read_only: true
+    pids_limit: 128
+    mem_limit: ${NODEPING_AGENT_MEMORY_LIMIT:-256m}
+    cpus: ${NODEPING_AGENT_CPU_LIMIT:-1.0}
+    stop_grace_period: ${NODEPING_AGENT_STOP_GRACE_PERIOD:-35s}
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     cap_add:
       - NET_RAW
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
     environment:
       NODEPING_SERVER_URL: ${NODEPING_SERVER_URL:?set NODEPING_SERVER_URL}
       NODEPING_TOKEN: ${NODEPING_TOKEN:?set NODEPING_TOKEN}
@@ -14,9 +25,15 @@ services:
       NODEPING_HEARTBEAT_INTERVAL: ${NODEPING_HEARTBEAT_INTERVAL:-20s}
       NODEPING_PUBLIC_IP_INTERVAL: ${NODEPING_PUBLIC_IP_INTERVAL:-10m}
       NODEPING_CONCURRENCY: ${NODEPING_CONCURRENCY:-10}
+      NODEPING_SHUTDOWN_DRAIN_TIMEOUT: ${NODEPING_SHUTDOWN_DRAIN_TIMEOUT:-15s}
       NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}
     volumes:
       - nodeping-agent-data:/var/lib/nodeping-agent
+    logging:
+      driver: json-file
+      options:
+        max-size: ${NODEPING_AGENT_LOG_MAX_SIZE:-10m}
+        max-file: ${NODEPING_AGENT_LOG_MAX_FILES:-3}
 
 volumes:
   nodeping-agent-data:

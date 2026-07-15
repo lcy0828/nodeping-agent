@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"sort"
@@ -89,21 +91,66 @@ func commandVersion(ctx context.Context, path string, args ...string) string {
 	return ""
 }
 
-func mtrSupportsJSON(ctx context.Context, path string) bool {
+type mtrJSONProbeResult struct {
+	Supported   bool
+	Unsupported bool
+	TimedOut    bool
+	Output      []byte
+	Err         error
+}
+
+func probeMTRJSON(ctx context.Context, path string) mtrJSONProbeResult {
 	if path == "" {
-		return false
+		return mtrJSONProbeResult{Err: errors.New("mtr path is empty")}
 	}
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+
+	helpCtx, helpCancel := context.WithTimeout(ctx, 2*time.Second)
+	helpOutput, helpErr := exec.CommandContext(helpCtx, path, "--help").CombinedOutput()
+	helpCancel()
+
+	args := []string{"-r", "-c", "1", "-n", "-j"}
+	if helpErr == nil && strings.Contains(strings.ToLower(string(helpOutput)), "--gracetime") {
+		args = append(args, "-G", "1")
+	}
+	args = append(args, "127.0.0.1")
+
+	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, path, "-r", "-c", "1", "-n", "-j", "127.0.0.1").CombinedOutput()
-	if err != nil && mtrShouldFallbackToText(out, err) {
-		return false
+	out, err := exec.CommandContext(probeCtx, path, args...).CombinedOutput()
+	trimmed := []byte(strings.TrimSpace(string(out)))
+	if err == nil && len(trimmed) > 0 && json.Valid(trimmed) {
+		return mtrJSONProbeResult{Supported: true, Output: out}
 	}
-	if mtrShouldFallbackToText(out, err) {
-		return false
+	result := mtrJSONProbeResult{Output: out, Err: err}
+	if mtrJSONUnsupported(out) {
+		result.Unsupported = true
+		return result
 	}
-	text := strings.TrimLeft(string(out), " \t\r\n")
-	return strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[")
+	if probeCtx.Err() != nil {
+		result.TimedOut = true
+		result.Err = probeCtx.Err()
+		return result
+	}
+	if result.Err == nil {
+		result.Err = errors.New("mtr returned invalid JSON")
+	}
+	return result
+}
+
+func mtrSupportsJSON(ctx context.Context, path string) bool {
+	return probeMTRJSON(ctx, path).Supported
+}
+
+func mtrProbeDiagnostic(result mtrJSONProbeResult) string {
+	diagnostic := strings.Join(strings.Fields(strings.TrimSpace(string(result.Output))), " ")
+	if diagnostic == "" && result.Err != nil {
+		diagnostic = result.Err.Error()
+	}
+	const maxDiagnosticLength = 240
+	if len(diagnostic) > maxDiagnosticLength {
+		diagnostic = diagnostic[:maxDiagnosticLength] + "..."
+	}
+	return diagnostic
 }
 
 func installHint(binary string) string {

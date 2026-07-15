@@ -32,6 +32,16 @@ func runPing(ctx context.Context, target string) (float64, error) {
 	return elapsedMS(started), nil
 }
 
+func runPingWithOptions(ctx context.Context, target string, options map[string]any) (float64, string, error) {
+	resolver := newProbeTargetResolver(options)
+	addr, err := resolver.resolveHost(ctx, strings.TrimSpace(target))
+	if err != nil {
+		return 0, "", err
+	}
+	latency, err := runPing(ctx, addr.String())
+	return latency, addr.String(), err
+}
+
 func runTCPPing(ctx context.Context, target string) (float64, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
@@ -45,6 +55,16 @@ func runTCPPing(ctx context.Context, target string) (float64, error) {
 	}
 	_ = conn.Close()
 	return elapsedMS(started), nil
+}
+
+func runTCPPingWithOptions(ctx context.Context, target string, options map[string]any) (float64, string, error) {
+	resolver := newProbeTargetResolver(options)
+	resolved, err := resolver.resolveHostPort(ctx, strings.TrimSpace(target))
+	if err != nil {
+		return 0, "", err
+	}
+	latency, err := runTCPPing(ctx, net.JoinHostPort(resolved.IP.String(), resolved.Port))
+	return latency, resolved.IP.String(), err
 }
 
 func parsePingLatency(out string) float64 {

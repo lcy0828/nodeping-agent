@@ -35,7 +35,7 @@ const (
 )
 
 func runMTR(ctx context.Context, target string, options map[string]any) (map[string]any, error) {
-	cfg, err := newMTRRunConfig(target, options)
+	cfg, err := newMTRRunConfig(ctx, target, options)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +48,7 @@ func runMTR(ctx context.Context, target string, options map[string]any) (map[str
 }
 
 func runMTRWithProgress(ctx context.Context, cfg config, task taskRequest, target string) (map[string]any, error) {
-	mtrCfg, err := newMTRRunConfig(target, task.Options)
+	mtrCfg, err := newMTRRunConfig(ctx, target, task.Options)
 	if err != nil {
 		return nil, err
 	}
@@ -78,10 +78,15 @@ func runMTRWithProgress(ctx context.Context, cfg config, task taskRequest, targe
 	return result, nil
 }
 
-func newMTRRunConfig(target string, options map[string]any) (*mtrRunConfig, error) {
+func newMTRRunConfig(ctx context.Context, target string, options map[string]any) (*mtrRunConfig, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
 		return nil, errors.New("mtr target is required")
+	}
+	resolver := newProbeTargetResolver(options)
+	resolved, err := resolver.resolveHost(ctx, target)
+	if err != nil {
+		return nil, err
 	}
 	path, err := exec.LookPath("mtr")
 	if err != nil {
@@ -111,7 +116,7 @@ func newMTRRunConfig(target string, options map[string]any) (*mtrRunConfig, erro
 		return nil, fmt.Errorf("unsupported mtr protocol: %s", protocol)
 	}
 	return &mtrRunConfig{
-		Target:       target,
+		Target:       resolved.String(),
 		Path:         path,
 		ReportCycles: reportCycles,
 		MaxHops:      maxHops,
@@ -144,7 +149,7 @@ func runMTRRaw(ctx context.Context, cfg *mtrRunConfig, emit func(map[string]any)
 	}
 
 	started := time.Now()
-	aggregate := newMTRAggregate(cfg, started, firstResolvedIP(ctx, cfg.Target))
+	aggregate := newMTRAggregate(cfg, started, cfg.Target)
 	var raw bytes.Buffer
 	lastEmitted := 0
 	rawTransmits := 0
@@ -359,7 +364,7 @@ func runMTRReport(ctx context.Context, cfg *mtrRunConfig, cycles int) (map[strin
 }
 
 func finalizeMTRResult(ctx context.Context, cfg *mtrRunConfig, started time.Time, result map[string]any, raw []byte, cmdErr error) map[string]any {
-	targetIP := firstResolvedIP(ctx, cfg.Target)
+	targetIP := cfg.Target
 	hops, _ := result["hops"].([]map[string]any)
 	result["mtr"] = elapsedMS(started)
 	result["hop_count"] = len(hops)

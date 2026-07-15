@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +28,7 @@ func runAgentUpgrade(ctx context.Context, cfg config, payload map[string]any, op
 	}
 	releaseBaseURL := strings.TrimSpace(stringOptionAny(options, "release_base_url"))
 	if releaseBaseURL != "" {
-		if parsed, err := url.Parse(releaseBaseURL); err != nil || parsed.Scheme == "" || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		if _, err := validateSecureBaseURL(releaseBaseURL, "release_base_url"); err != nil {
 			return nil, errors.New("invalid release_base_url")
 		}
 	}

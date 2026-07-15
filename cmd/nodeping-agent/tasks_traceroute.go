@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -17,6 +16,12 @@ func runTraceroute(ctx context.Context, target string, options map[string]any) (
 	if target == "" {
 		return nil, errors.New("traceroute target is required")
 	}
+	resolver := newProbeTargetResolver(options)
+	resolved, err := resolver.resolveHost(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	targetIP := resolved.String()
 	path, err := exec.LookPath("traceroute")
 	if err != nil {
 		return nil, errors.New("traceroute command not found")
@@ -40,11 +45,10 @@ func runTraceroute(ctx context.Context, target string, options map[string]any) (
 	default:
 		return nil, fmt.Errorf("unsupported traceroute protocol: %s", protocol)
 	}
-	args = append(args, target)
+	args = append(args, targetIP)
 	started := time.Now()
 	out, cmdErr := exec.CommandContext(ctx, path, args...).CombinedOutput()
 	hops := parseTraceHops(string(out))
-	targetIP := firstResolvedIP(ctx, target)
 	reached := traceReachedTarget(hops, targetIP)
 	if cmdErr != nil && len(hops) == 0 {
 		return nil, fmt.Errorf("traceroute failed: %s", strings.TrimSpace(string(out)))
@@ -149,30 +153,4 @@ func tracePathMaps(raw any) []map[string]any {
 	default:
 		return nil
 	}
-}
-
-func firstResolvedIP(ctx context.Context, target string) string {
-	host := strings.TrimSpace(target)
-	if parsed, err := url.Parse(host); err == nil && parsed.Hostname() != "" {
-		host = parsed.Hostname()
-	}
-	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-		host = parsedHost
-	}
-	host = strings.Trim(host, "[]")
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.String()
-	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", host)
-	if err != nil {
-		return ""
-	}
-	for _, ip := range ips {
-		if ip != nil {
-			return ip.String()
-		}
-	}
-	return ""
 }

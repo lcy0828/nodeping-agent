@@ -19,12 +19,26 @@ func executeAndReport(ctx context.Context, cfg config, task taskRequest) {
 	}
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	acceptedCtx, acceptedCancel := context.WithTimeout(taskCtx, minDuration(timeout, 2*time.Second))
+	if err := postAgentJSON(acceptedCtx, cfg, "/api/agent/v1/tasks/"+url.PathEscape(task.ID)+"/events", taskEvent{
+		TaskID: task.ID, Status: "running", Message: "agent started task", CreatedAt: time.Now().UTC(),
+	}, nil); err != nil && taskCtx.Err() == nil {
+		log.Printf("report task acceptance failed task_id=%s: %v", task.ID, err)
+	}
+	acceptedCancel()
 	result := executeTask(taskCtx, cfg, task)
-	reportCtx, reportCancel := context.WithTimeout(ctx, 15*time.Second)
+	reportCtx, reportCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer reportCancel()
 	if err := postAgentResultWithRetry(reportCtx, cfg, task.ID, result); err != nil {
 		log.Printf("report task result failed task_id=%s: %v", task.ID, err)
 	}
+}
+
+func minDuration(left time.Duration, right time.Duration) time.Duration {
+	if left > 0 && left < right {
+		return left
+	}
+	return right
 }
 
 func postAgentResultWithRetry(ctx context.Context, cfg config, taskID string, result taskResult) error {
@@ -64,33 +78,37 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	case "ping":
 		target, _ := payloadString(payload, "ping")
 		targetSummary = target
-		latency, err = runPing(ctx, target)
+		latency, responseIP, err = runPingWithOptions(ctx, target, task.Options)
 		response = map[string]any{"ping": latency}
-		responseIP = literalIP(target)
+		if responseIP != "" {
+			response["response_ip"] = responseIP
+		}
 	case "tcp_ping":
 		target, _ := payloadString(payload, "tcp_ping")
 		targetSummary = target
-		latency, err = runTCPPing(ctx, target)
+		latency, responseIP, err = runTCPPingWithOptions(ctx, target, task.Options)
 		response = map[string]any{"tcp_ping": latency}
-		responseIP = hostLiteralIP(target)
+		if responseIP != "" {
+			response["response_ip"] = responseIP
+		}
 	case "long_ping":
 		target, _ := payloadString(payload, "long_ping")
 		targetSummary = target
 		response, err = runLongPingWithProgress(ctx, cfg, task, target)
 		latency = floatFromMap(response, "avg_latency_ms")
-		responseIP = literalIP(target)
+		responseIP = stringFromMap(response, "response_ip")
 	case "long_tcp_ping":
 		target, _ := payloadString(payload, "long_tcp_ping")
 		targetSummary = target
 		response, err = runLongTCPPingWithProgress(ctx, cfg, task, target)
 		latency = floatFromMap(response, "avg_latency_ms")
-		responseIP = hostLiteralIP(target)
+		responseIP = stringFromMap(response, "response_ip")
 	case "udp_probe":
 		target, _ := payloadString(payload, "udp_probe")
 		targetSummary = target
 		response, err = runUDPProbe(ctx, target, task.Options)
 		latency = udpProbeTaskLatency(response)
-		responseIP = hostLiteralIP(target)
+		responseIP = stringFromMap(response, "response_ip")
 	case "http_ping":
 		target, httpPingOptions := httpPingPayload(payload)
 		targetSummary = target
@@ -126,7 +144,7 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	case "tls_check":
 		tlsPayload := tlsCheckPayload(payload)
 		targetSummary = tlsTargetSummary(tlsPayload)
-		response, err = runTLSCheck(ctx, tlsPayload)
+		response, err = runTLSCheck(ctx, tlsPayload, task.Options)
 		responseIP = stringFromMap(response, "response_ip")
 	case "traceroute":
 		target, _ := payloadString(payload, "traceroute")
@@ -158,6 +176,28 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	}
 	result.FinishedAt = time.Now().UTC()
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			result.Status = "cancelled"
+			result.Success = false
+			result.ErrorCode = "TASK_CANCELLED"
+			result.ErrorMessage = "task cancelled"
+			result.LatencyMS = elapsedMS(started)
+			result.ResponseIP = responseIP
+			result.Result = response
+			result.Extra = taskResultExtra(task, targetSummary)
+			return result
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			result.Status = "timeout"
+			result.Success = false
+			result.ErrorCode = "TASK_TIMEOUT"
+			result.ErrorMessage = "task timed out"
+			result.LatencyMS = elapsedMS(started)
+			result.ResponseIP = responseIP
+			result.Result = response
+			result.Extra = taskResultExtra(task, targetSummary)
+			return result
+		}
 		result.Status = "failed"
 		result.Success = false
 		result.ErrorCode = "TASK_FAILED"

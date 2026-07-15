@@ -15,6 +15,12 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 	if target == "" {
 		return nil, errors.New("udp_probe target is required")
 	}
+	resolver := newProbeTargetResolver(options)
+	resolved, err := resolver.resolveHostPort(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	pinnedTarget := net.JoinHostPort(resolved.IP.String(), resolved.Port)
 	payloadMode := strings.ToLower(strings.TrimSpace(stringOptionAny(options, "payload_mode")))
 	payloadText := stringOptionAny(options, "payload")
 	payloadBytes := []byte(payloadText)
@@ -23,7 +29,7 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 		dnsQueryDomain = "example.com"
 	}
 	if payloadMode == "" || payloadMode == "auto" {
-		if payloadText == "" && udpTargetPort(target) == "53" {
+		if payloadText == "" && resolved.Port == "53" {
 			payloadMode = "dns_query"
 		} else {
 			payloadMode = "text"
@@ -53,7 +59,7 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 	}
 	dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 3*time.Second)}
 	started := time.Now()
-	conn, err := dialer.DialContext(ctx, "udp", target)
+	conn, err := dialer.DialContext(ctx, "udp", pinnedTarget)
 	if err != nil {
 		return nil, err
 	}
@@ -73,6 +79,7 @@ func runUDPProbe(ctx context.Context, target string, options map[string]any) (ma
 	result := map[string]any{
 		"udp_probe":          sendLatencyMS,
 		"target":             target,
+		"target_ip":          resolved.IP.String(),
 		"sent_bytes":         sent,
 		"payload_mode":       payloadMode,
 		"wait_response":      waitResponse,

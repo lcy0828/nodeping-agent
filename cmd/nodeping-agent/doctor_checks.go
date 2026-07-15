@@ -114,10 +114,22 @@ func checkMTRCommand(ctx context.Context) doctorCheck {
 		return doctorCheck{Key: "mtr_command", Name: "mtr command", Status: "warn", Severity: "required_for_capability", Message: "mtr not found; related diagnostic task will fail until installed", Remediation: installHint("mtr"), Capabilities: []string{"mtr"}}
 	}
 	check := doctorCheck{Key: "mtr_command", Name: "mtr command", Status: "ok", Severity: "required_for_capability", Message: path, Path: path, Version: commandVersion(ctx, path, "--version"), Capabilities: []string{"mtr"}}
-	if !mtrSupportsJSON(ctx, path) {
+	probe := probeMTRJSON(ctx, path)
+	if probe.Unsupported {
 		check.Status = "warn"
 		check.Message = path + " does not support -j; text fallback will be used"
 		check.Remediation = upgradeHint("mtr")
+	} else if !probe.Supported {
+		check.Status = "fail"
+		if probe.TimedOut {
+			check.Message = path + " runtime check timed out"
+		} else {
+			check.Message = path + " runtime check failed"
+		}
+		if diagnostic := mtrProbeDiagnostic(probe); diagnostic != "" {
+			check.Message += ": " + diagnostic
+		}
+		check.Remediation = "run mtr as the Agent user and verify packet helper permissions; Docker installs require NET_RAW"
 	}
 	return check
 }

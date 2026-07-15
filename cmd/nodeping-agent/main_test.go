@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -27,6 +28,76 @@ import (
 
 	"github.com/quic-go/quic-go/http3"
 )
+
+func trustedPrivateTaskOptions(values map[string]any) map[string]any {
+	out := map[string]any{
+		"allow_private_targets": true,
+		"health_check":          true,
+		"health_check_kind":     "service_http",
+	}
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
+func TestProbeTargetResolverRequiresTrustedHealthMarkersForPrivateTargets(t *testing.T) {
+	resolver := newProbeTargetResolver(map[string]any{"allow_private_targets": true})
+	if _, err := resolver.resolveHost(context.Background(), "127.0.0.1"); !errors.Is(err, errUnsafeProbeDestination) {
+		t.Fatalf("single private marker error = %v, want unsafe destination", err)
+	}
+
+	resolver = newProbeTargetResolver(trustedPrivateTaskOptions(nil))
+	addr, err := resolver.resolveHost(context.Background(), "127.0.0.1")
+	if err != nil || addr.String() != "127.0.0.1" {
+		t.Fatalf("trusted private target addr=%v err=%v", addr, err)
+	}
+}
+
+func TestProbeTargetResolverRejectsReservedAndOptionTargets(t *testing.T) {
+	resolver := newProbeTargetResolver(nil)
+	for _, target := range []string{"100.64.0.1", "192.0.2.1", "2001:db8::1", "-I"} {
+		if _, err := resolver.resolveHost(context.Background(), target); err == nil {
+			t.Fatalf("resolveHost(%q) succeeded, want rejection", target)
+		}
+	}
+	if _, err := resolver.resolveHostPort(context.Background(), "-connect:443"); err == nil {
+		t.Fatal("option-like host:port target succeeded")
+	}
+	if _, err := resolver.resolveHostPort(context.Background(), "1.1.1.1:https"); err == nil {
+		t.Fatal("named port target succeeded")
+	}
+}
+
+func TestProbeTargetResolverPinsFirstPublicResolutionAndRejectsMixedAnswers(t *testing.T) {
+	originalLookup := lookupProbeNetIP
+	defer func() { lookupProbeNetIP = originalLookup }()
+
+	calls := 0
+	lookupProbeNetIP = func(context.Context, string, string) ([]netip.Addr, error) {
+		calls++
+		if calls == 1 {
+			return []netip.Addr{netip.MustParseAddr("1.1.1.1")}, nil
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	resolver := newProbeTargetResolver(nil)
+	first, err := resolver.resolveHost(context.Background(), "probe.example")
+	if err != nil {
+		t.Fatalf("first resolution: %v", err)
+	}
+	second, err := resolver.resolveHost(context.Background(), "probe.example")
+	if err != nil || second != first || calls != 1 {
+		t.Fatalf("pinned resolution first=%v second=%v calls=%d err=%v", first, second, calls, err)
+	}
+
+	lookupProbeNetIP = func(context.Context, string, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("10.0.0.1")}, nil
+	}
+	if _, err := newProbeTargetResolver(nil).resolveHost(context.Background(), "mixed.example"); !errors.Is(err, errUnsafeProbeDestination) {
+		t.Fatalf("mixed resolution error = %v, want unsafe destination", err)
+	}
+}
 
 func TestDNSServerAddressDefaultsPort(t *testing.T) {
 	tests := map[string]string{
@@ -71,6 +142,19 @@ func TestReadSSETasksIgnoresKeepaliveComments(t *testing.T) {
 	}
 }
 
+func TestReadSSETasksDecodesCancellationControl(t *testing.T) {
+	stream := "event: task\ndata: {\"task_id\":\"task-1\",\"operation\":\"cancel\",\"cancel_task_id\":\"task-1\"}\n\n"
+	var got taskRequest
+	if err := readSSETasks(context.Background(), strings.NewReader(stream), time.Second, func(task taskRequest) {
+		got = task
+	}); err != nil {
+		t.Fatalf("readSSETasks returned error: %v", err)
+	}
+	if got.Operation != "cancel" || got.CancelTaskID != "task-1" {
+		t.Fatalf("cancellation control = %+v", got)
+	}
+}
+
 func TestReadSSETasksReturnsIdleTimeout(t *testing.T) {
 	pr, pw := io.Pipe()
 	defer pr.Close()
@@ -97,6 +181,19 @@ func TestTaskStreamHTTPClientKeepsLongLivedConnection(t *testing.T) {
 	}
 }
 
+func TestTaskStreamReconnectDelayIsJitteredWithinConfiguredMaximum(t *testing.T) {
+	base := 10 * time.Second
+	for range 100 {
+		got := taskStreamReconnectDelay(base)
+		if got < 8*time.Second || got > base {
+			t.Fatalf("reconnect delay=%s, want within [8s, 10s]", got)
+		}
+	}
+	if got := taskStreamReconnectDelay(0); got != 0 {
+		t.Fatalf("zero reconnect delay=%s, want zero", got)
+	}
+}
+
 func TestConsumeTaskStreamReportsWhetherConnectionWasEstablished(t *testing.T) {
 	streamClosed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/event-stream")
@@ -116,7 +213,7 @@ func TestConsumeTaskStreamReportsWhetherConnectionWasEstablished(t *testing.T) {
 		StreamRetryMax:    time.Millisecond,
 		Concurrency:       1,
 		HTTPClient:        streamClosed.Client(),
-	}, newTaskConcurrencyLimiter(1))
+	}, newTaskConcurrencyLimiter(1), newAgentTaskExecutor(context.Background(), config{}))
 	if !connected || err == nil || !strings.Contains(err.Error(), "task stream closed") {
 		t.Fatalf("consumeTaskStream connected=%v err=%v, want connected closed stream", connected, err)
 	}
@@ -134,7 +231,7 @@ func TestConsumeTaskStreamReportsWhetherConnectionWasEstablished(t *testing.T) {
 		StreamRetryMax:    time.Millisecond,
 		Concurrency:       1,
 		HTTPClient:        statusFailed.Client(),
-	}, newTaskConcurrencyLimiter(1))
+	}, newTaskConcurrencyLimiter(1), newAgentTaskExecutor(context.Background(), config{}))
 	if connected || err == nil || !strings.Contains(err.Error(), "stream status 503") {
 		t.Fatalf("consumeTaskStream connected=%v err=%v, want pre-connect status error", connected, err)
 	}
@@ -282,7 +379,7 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		_, _ = w.Write([]byte(`{"ok":true,"agent_id":"agent-test","agent_token":"agent-token","server_time":"2026-06-23T00:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"ok":true,"agent_id":"agent-test","agent_token":"agent-token","latest_version":"v1.2.3","server_time":"2026-06-23T00:00:00Z"}`))
 	}))
 	defer server.Close()
 
@@ -300,6 +397,9 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	}
 	if resp.AgentID != "agent-test" || resp.AgentToken != "agent-token" {
 		t.Fatalf("register response = %+v", resp)
+	}
+	if resp.LatestVersion != "v1.2.3" {
+		t.Fatalf("latest version = %q, want v1.2.3", resp.LatestVersion)
 	}
 	if payload["server_url"] != server.URL {
 		t.Fatalf("server_url = %#v, want %q; payload=%+v", payload["server_url"], server.URL, payload)
@@ -378,6 +478,53 @@ func TestTaskConcurrencyLimiterFollowsServerLimit(t *testing.T) {
 	}
 	limiter.Release()
 	limiter.Release()
+}
+
+func TestAgentTaskExecutorCancelsRunningTask(t *testing.T) {
+	executor := newAgentTaskExecutor(context.Background(), config{})
+	started := make(chan struct{})
+	stopped := make(chan error, 1)
+	executor.run = func(ctx context.Context, _ config, _ taskRequest) {
+		close(started)
+		<-ctx.Done()
+		stopped <- ctx.Err()
+	}
+	if !executor.Start(taskRequest{ID: "cancel-me"}, nil) {
+		t.Fatal("task did not start")
+	}
+	<-started
+	executor.CancelTask("cancel-me")
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("task stopped with %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("running task did not stop after cancellation")
+	}
+	if !executor.Wait(time.Second) {
+		t.Fatal("executor did not drain cancelled task")
+	}
+}
+
+func TestAgentTaskExecutorBoundsUnknownCancellationTombstones(t *testing.T) {
+	executor := newAgentTaskExecutor(context.Background(), config{})
+	executor.mu.Lock()
+	executor.cancelled["expired"] = time.Now().Add(-cancelledTaskTTL)
+	for index := 0; index <= maxCancelledTasks; index++ {
+		executor.cancelled[fmt.Sprintf("task-%d", index)] = time.Now().Add(time.Duration(index) * time.Nanosecond)
+	}
+	executor.cleanupCancelledLocked(time.Now())
+	executor.trimCancelledLocked()
+	_, expiredPresent := executor.cancelled["expired"]
+	count := len(executor.cancelled)
+	executor.mu.Unlock()
+	if expiredPresent {
+		t.Fatal("expired cancellation tombstone was retained")
+	}
+	if count > maxCancelledTasks {
+		t.Fatalf("cancellation tombstones = %d, max %d", count, maxCancelledTasks)
+	}
 }
 
 func TestRunAgentDoctorReturnsStructuredChecks(t *testing.T) {
@@ -540,7 +687,7 @@ func TestRunTLSCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse tls server url: %v", err)
 	}
-	got, err := runTLSCheck(context.Background(), map[string]any{"host": parsed.Host, "server_name": "example.com"})
+	got, err := runTLSCheck(context.Background(), map[string]any{"host": parsed.Host, "server_name": "example.com"}, trustedPrivateTaskOptions(nil))
 	if err == nil {
 		t.Fatalf("expected hostname verification failure for self-signed test cert, got result %+v", got)
 	}
@@ -659,6 +806,54 @@ func TestLongProbeProgressReporterPostsEachSample(t *testing.T) {
 	if events[1].Extra["event_kind"] != "long_probe_sample" || events[1].Extra["task_type"] != "long_ping" {
 		t.Fatalf("unexpected event extra: %+v", events[1].Extra)
 	}
+	if _, exists := events[1].Extra["samples"]; exists {
+		t.Fatalf("progress event repeated full sample history: %+v", events[1].Extra)
+	}
+	latest, ok := events[1].Extra["latest_sample"].(map[string]any)
+	if !ok || latest["seq"] != float64(2) || latest["latency_ms"] != float64(9) {
+		t.Fatalf("latest sample = %#v", events[1].Extra["latest_sample"])
+	}
+}
+
+func TestLongProbeProgressEmitterDoesNotBlockOnSlowServer(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestStarted <- struct{}{}:
+		default:
+		}
+		<-releaseRequest
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+
+	emitter := newLongProbeProgressEmitter(context.Background(), config{
+		ServerURL:  server.URL,
+		AgentToken: "agent-token",
+		HTTPClient: server.Client(),
+	}, taskRequest{ID: "slow-task"}, "long_ping")
+	emitter.Emit(map[string]any{"sample_count": 100, "completed_count": 1})
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("progress request did not start")
+	}
+
+	started := time.Now()
+	for seq := 2; seq <= 1000; seq++ {
+		emitter.Emit(map[string]any{"sample_count": 1000, "completed_count": seq})
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("coalesced Emit calls blocked for %s", elapsed)
+	}
+
+	close(releaseRequest)
+	emitter.Close()
+	server.Close()
+
+	// Close is idempotent and later progress is ignored instead of panicking.
+	emitter.Close()
+	emitter.Emit(map[string]any{"sample_count": 1000, "completed_count": 1000})
 }
 
 func TestMTRProgressReporterPostsEachReport(t *testing.T) {
@@ -715,7 +910,7 @@ func TestRunUDPProbe(t *testing.T) {
 		}
 	}()
 
-	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), map[string]any{"payload": "hello", "wait_response": true, "read_timeout_ms": 1000})
+	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), trustedPrivateTaskOptions(map[string]any{"payload": "hello", "wait_response": true, "read_timeout_ms": 1000}))
 	if err != nil {
 		t.Fatalf("runUDPProbe: %v", err)
 	}
@@ -732,7 +927,7 @@ func TestRunUDPProbeTimeoutKeepsSendLatencySeparate(t *testing.T) {
 	}
 	defer conn.Close()
 
-	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), map[string]any{"payload": "hello", "wait_response": true, "read_timeout_ms": 200})
+	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), trustedPrivateTaskOptions(map[string]any{"payload": "hello", "wait_response": true, "read_timeout_ms": 200}))
 	if err != nil {
 		t.Fatalf("runUDPProbe: %v", err)
 	}
@@ -766,7 +961,7 @@ func TestRunUDPProbeSendsDNSQueryPayload(t *testing.T) {
 		}
 	}()
 
-	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), map[string]any{"payload_mode": "dns_query", "dns_query_domain": "example.com", "wait_response": false})
+	result, err := runUDPProbe(context.Background(), conn.LocalAddr().String(), trustedPrivateTaskOptions(map[string]any{"payload_mode": "dns_query", "dns_query_domain": "example.com", "wait_response": false}))
 	if err != nil {
 		t.Fatalf("runUDPProbe: %v", err)
 	}
@@ -790,16 +985,18 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	}))
 	defer server.Close()
 
-	latency, responseIP, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
-		"expected_status":       200,
-		"expect_body_contains":  "nodeping",
-		"allow_private_targets": true,
-	})
+	latency, responseIP, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", trustedPrivateTaskOptions(map[string]any{
+		"expected_status":      200,
+		"expect_body_contains": "nodeping",
+	}))
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
 	}
-	if latency <= 0 || result["status_code"] != 200 || result["http3_advertised"] != true || result["body"] != "nodeping-ok" {
+	if latency <= 0 || result["status_code"] != 200 || result["http3_advertised"] != true {
 		t.Fatalf("unexpected http result latency=%v result=%+v", latency, result)
+	}
+	if _, exists := result["body"]; exists {
+		t.Fatalf("HTTP response body must not be returned: %+v", result)
 	}
 	serverIP := hostLiteralIP(server.Listener.Addr().String())
 	if responseIP != serverIP || result["response_ip"] != serverIP {
@@ -807,21 +1004,23 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	}
 }
 
-func TestRunHTTPRequestReturnsTruncatedBody(t *testing.T) {
+func TestRunHTTPRequestReportsTruncationWithoutReturningBody(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("nodeping-body"))
 	}))
 	defer server.Close()
 
-	_, _, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
-		"max_body_bytes":        4,
-		"allow_private_targets": true,
-	})
+	_, _, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", trustedPrivateTaskOptions(map[string]any{
+		"max_body_bytes": 4,
+	}))
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
 	}
-	if result["body"] != "node" || result["body_truncated"] != true || result["body_bytes"] != 4 {
+	if result["body_truncated"] != true || result["body_bytes"] != 4 {
 		t.Fatalf("unexpected truncated body result: %+v", result)
+	}
+	if _, exists := result["body"]; exists {
+		t.Fatalf("truncated HTTP response body must not be returned: %+v", result)
 	}
 }
 
@@ -833,10 +1032,9 @@ func TestRunHTTPRequestUsesOriginalHostHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, _, _, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", map[string]any{
-		"original_host":         "origin.example.com",
-		"allow_private_targets": true,
-	})
+	_, _, _, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", trustedPrivateTaskOptions(map[string]any{
+		"original_host": "origin.example.com",
+	}))
 	if err != nil {
 		t.Fatalf("runHTTPRequest: %v", err)
 	}
@@ -861,7 +1059,7 @@ func TestExecuteTaskHTTPPingAcceptsObjectPayloadWithOriginalHost(t *testing.T) {
 		ID:       "http-ping-object-payload",
 		TaskType: "http_ping",
 		Payload:  payload,
-		Options:  map[string]any{"allow_private_targets": true},
+		Options:  trustedPrivateTaskOptions(nil),
 	})
 	if !result.Success {
 		t.Fatalf("executeTask failed: %+v", result)
@@ -882,7 +1080,7 @@ func TestExecuteTaskHTTPPingIncludesResponseIP(t *testing.T) {
 		ID:       "http-ping-response-ip",
 		TaskType: "http_ping",
 		Payload:  payload,
-		Options:  map[string]any{"allow_private_targets": true},
+		Options:  trustedPrivateTaskOptions(nil),
 	})
 	serverIP := hostLiteralIP(server.Listener.Addr().String())
 	if !result.Success {
@@ -910,7 +1108,7 @@ func TestExecuteTaskHTTPRequestFailureKeepsResponseIP(t *testing.T) {
 		ID:       "http-request-failed-response-ip",
 		TaskType: "http_request",
 		Payload:  payload,
-		Options:  map[string]any{"expected_status": 200, "allow_private_targets": true},
+		Options:  trustedPrivateTaskOptions(map[string]any{"expected_status": 200}),
 	})
 	serverIP := hostLiteralIP(server.Listener.Addr().String())
 	if result.Success {
@@ -961,11 +1159,10 @@ func TestRunHTTP3CheckPerformsRealRequest(t *testing.T) {
 	roots.AddCert(parsedCert)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	result, err := runHTTP3CheckWithTLSConfig(ctx, "https://"+conn.LocalAddr().String()+"/real", map[string]any{
-		"expected_status":       http.StatusAccepted,
-		"expect_body_contains":  "h3-ok",
-		"allow_private_targets": true,
-	}, &tls.Config{
+	result, err := runHTTP3CheckWithTLSConfig(ctx, "https://"+conn.LocalAddr().String()+"/real", trustedPrivateTaskOptions(map[string]any{
+		"expected_status":      http.StatusAccepted,
+		"expect_body_contains": "h3-ok",
+	}), &tls.Config{
 		RootCAs:    roots,
 		ServerName: "127.0.0.1",
 		MinVersion: tls.VersionTLS12,
@@ -1015,7 +1212,7 @@ OUT
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	result, err := runMTR(context.Background(), "example.com", map[string]any{"report_cycles": 5, "max_hops": 8})
+	result, err := runMTR(context.Background(), "93.184.216.34", map[string]any{"report_cycles": 5, "max_hops": 8})
 	if err != nil {
 		t.Fatalf("runMTR: %v result=%+v", err, result)
 	}
@@ -1100,14 +1297,14 @@ func TestNewMTRRunConfigDefaultsAndClampsToOneHundredSamples(t *testing.T) {
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	cfg, err := newMTRRunConfig("192.0.2.1", nil)
+	cfg, err := newMTRRunConfig(context.Background(), "192.0.2.1", trustedPrivateTaskOptions(nil))
 	if err != nil {
 		t.Fatalf("newMTRRunConfig default: %v", err)
 	}
 	if cfg.ReportCycles != 100 {
 		t.Fatalf("default report cycles = %d, want 100", cfg.ReportCycles)
 	}
-	cfg, err = newMTRRunConfig("192.0.2.1", map[string]any{"report_cycles": 1000})
+	cfg, err = newMTRRunConfig(context.Background(), "192.0.2.1", trustedPrivateTaskOptions(map[string]any{"report_cycles": 1000}))
 	if err != nil {
 		t.Fatalf("newMTRRunConfig clamp: %v", err)
 	}
@@ -1262,7 +1459,7 @@ OUT
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	result, err := runMTRWithProgress(context.Background(), config{}, taskRequest{
 		ID:      "mtr-fallback",
-		Options: map[string]any{"report_cycles": 2, "max_hops": 8},
+		Options: trustedPrivateTaskOptions(map[string]any{"report_cycles": 2, "max_hops": 8}),
 	}, "192.0.2.1")
 	if err != nil {
 		t.Fatalf("runMTRWithProgress: %v", err)
@@ -1293,7 +1490,7 @@ OUT
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	result, err := runMTR(context.Background(), "example.com", map[string]any{"report_cycles": 5, "max_hops": 8})
+	result, err := runMTR(context.Background(), "93.184.216.34", map[string]any{"report_cycles": 5, "max_hops": 8})
 	if err != nil {
 		t.Fatalf("runMTR: %v result=%+v", err, result)
 	}
@@ -1333,6 +1530,75 @@ echo "unexpected"
 	check := checkMTRCommand(context.Background())
 	if check.Status != "warn" || !strings.Contains(check.Message, "text fallback") {
 		t.Fatalf("checkMTRCommand status = %+v, want text fallback warning", check)
+	}
+}
+
+func TestCheckMTRCommandUsesShortGracePeriod(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+if [ "$1" = "--version" ]; then
+  echo "mtr 0.96"
+  exit 0
+fi
+if [ "$1" = "--help" ]; then
+  echo "-j, --json output json"
+  echo "-G, --gracetime SECONDS wait for responses"
+  exit 0
+fi
+has_json=
+has_grace=
+for arg in "$@"; do
+  [ "$arg" = "-j" ] && has_json=1
+  [ "$arg" = "-G" ] && has_grace=1
+done
+if [ -z "$has_json" ] || [ -z "$has_grace" ]; then
+  echo "missing short JSON probe options" >&2
+  exit 1
+fi
+echo '{"report":{"hubs":[]}}'
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	check := checkMTRCommand(context.Background())
+	if check.Status != "ok" || check.Version != "mtr 0.96" {
+		t.Fatalf("checkMTRCommand = %+v, want working JSON probe", check)
+	}
+}
+
+func TestCheckMTRCommandReportsRuntimeFailureSeparately(t *testing.T) {
+	dir := t.TempDir()
+	mtrPath := filepath.Join(dir, "mtr")
+	script := `#!/usr/bin/env sh
+if [ "$1" = "--version" ]; then
+  echo "mtr 0.96"
+  exit 0
+fi
+if [ "$1" = "--help" ]; then
+  echo "-j, --json output json"
+  echo "-G, --gracetime SECONDS wait for responses"
+  exit 0
+fi
+echo "mtr-packet: Failure to open IPv4 sockets: Operation not permitted" >&2
+exit 1
+`
+	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake mtr: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if mtrSupportsJSON(context.Background(), mtrPath) {
+		t.Fatal("mtrSupportsJSON should reject a runtime permission failure")
+	}
+	check := checkMTRCommand(context.Background())
+	if check.Status != "fail" || !strings.Contains(check.Message, "runtime check failed") || strings.Contains(check.Message, "does not support") {
+		t.Fatalf("checkMTRCommand = %+v, want runtime failure", check)
+	}
+	if !strings.Contains(check.Remediation, "NET_RAW") {
+		t.Fatalf("remediation = %q, want packet permission guidance", check.Remediation)
 	}
 }
 

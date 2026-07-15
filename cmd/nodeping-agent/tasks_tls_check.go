@@ -11,7 +11,11 @@ import (
 	"time"
 )
 
-func runTLSCheck(ctx context.Context, payload map[string]any) (map[string]any, error) {
+func runTLSCheck(ctx context.Context, payload map[string]any, optionSets ...map[string]any) (map[string]any, error) {
+	var options map[string]any
+	if len(optionSets) > 0 {
+		options = optionSets[0]
+	}
 	host := strings.TrimSpace(fmt.Sprint(payload["host"]))
 	if host == "" {
 		host = strings.TrimSpace(fmt.Sprint(payload["target"]))
@@ -20,6 +24,9 @@ func runTLSCheck(ctx context.Context, payload map[string]any) (map[string]any, e
 		return nil, errors.New("tls host is required")
 	}
 	if parsed, err := url.Parse(host); err == nil && parsed.Hostname() != "" {
+		if parsed.User != nil || (parsed.Scheme != "https" && parsed.Scheme != "tls") {
+			return nil, errors.New("tls target URL is invalid")
+		}
 		host = parsed.Hostname()
 		if parsed.Port() != "" {
 			host = net.JoinHostPort(host, parsed.Port())
@@ -39,14 +46,29 @@ func runTLSCheck(ctx context.Context, payload map[string]any) (map[string]any, e
 	if h, _, err := net.SplitHostPort(host); err == nil && serverName == host {
 		serverName = strings.Trim(h, "[]")
 	}
+	serverName = strings.Trim(serverName, "[]")
+	if _, err := validateProbeHost(serverName); err != nil {
+		return nil, fmt.Errorf("invalid TLS server name: %w", err)
+	}
+	resolver := newProbeTargetResolver(options)
+	resolved, err := resolver.resolveHostPort(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	pinnedTarget := net.JoinHostPort(resolved.IP.String(), resolved.Port)
 	dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 5*time.Second)}
 	started := time.Now()
-	conn, err := tls.DialWithDialer(&dialer, "tcp", host, &tls.Config{
+	rawConn, err := dialer.DialContext(ctx, "tcp", pinnedTarget)
+	if err != nil {
+		return nil, err
+	}
+	conn := tls.Client(rawConn, &tls.Config{
 		ServerName:         serverName,
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: false,
 	})
-	if err != nil {
+	if err := conn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
 		return nil, err
 	}
 	defer conn.Close()

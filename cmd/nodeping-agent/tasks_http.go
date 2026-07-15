@@ -19,12 +19,16 @@ func runHTTPPing(ctx context.Context, target string, options map[string]any) (fl
 }
 
 func runHTTPRequest(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any) (float64, string, map[string]any, error) {
+	return runHTTPRequestWithResolver(ctx, method, target, headers, body, options, newProbeTargetResolver(options))
+}
+
+func runHTTPRequestWithResolver(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any, resolver *probeTargetResolver) (float64, string, map[string]any, error) {
 	if method == "" {
 		method = http.MethodGet
 	}
 	target = strings.TrimSpace(target)
-	if target == "" {
-		return 0, "", nil, errors.New("http target is required")
+	if _, err := validateHTTPProbeURL(target, false); err != nil {
+		return 0, "", nil, err
 	}
 	trace := &httpTimingTrace{}
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace.clientTrace()), method, target, strings.NewReader(body))
@@ -38,9 +42,12 @@ func runHTTPRequest(ctx context.Context, method string, target string, headers m
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	allowPrivate := allowPrivateHTTPDestinations(options)
-	transport := safeHTTPTransport(ctx, originalHost, allowPrivate)
-	client := &http.Client{Timeout: deadlineTimeout(ctx, 10*time.Second), Transport: transport, CheckRedirect: safeHTTPRedirectPolicy(allowPrivate)}
+	if resolver == nil {
+		resolver = newProbeTargetResolver(options)
+	}
+	transport := safeHTTPTransportWithResolver(originalHost, resolver)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: deadlineTimeout(ctx, 10*time.Second), Transport: transport, CheckRedirect: safeHTTPRedirectPolicy(resolver.allowPrivate)}
 	started := time.Now()
 	resp, err := client.Do(req)
 	if err != nil {
@@ -74,13 +81,6 @@ func runHTTPRequest(ctx context.Context, method string, target string, headers m
 	}
 	if responseIP != "" {
 		result["response_ip"] = responseIP
-	}
-	bodyForResult := readBody
-	if len(readBody) > maxBodyBytes {
-		bodyForResult = readBody[:maxBodyBytes]
-	}
-	if maxBodyBytes > 0 && len(readBody) > 0 {
-		result["body"] = string(bodyForResult)
 	}
 	for key, value := range trace.timings(started) {
 		result[key] = value

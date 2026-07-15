@@ -9,26 +9,28 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
 
-func taskStreamLoop(ctx context.Context, cfg config) {
+func taskStreamLoop(ctx context.Context, cfg config, executor *agentTaskExecutor) {
 	limiter := newTaskConcurrencyLimiter(cfg.Concurrency)
 	retryDelay := cfg.StreamRetryMin
 	for {
-		connected, err := consumeTaskStream(ctx, cfg, limiter)
+		connected, err := consumeTaskStream(ctx, cfg, limiter, executor)
 		if err != nil && ctx.Err() == nil {
 			if connected {
 				retryDelay = cfg.StreamRetryMin
 			}
-			log.Printf("task stream stopped: %v; reconnecting in %s", err, retryDelay)
+			wait := taskStreamReconnectDelay(retryDelay)
+			log.Printf("task stream stopped: %v; reconnecting in %s", err, wait)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(retryDelay):
+			case <-time.After(wait):
 			}
 			retryDelay *= 2
 			if retryDelay > cfg.StreamRetryMax {
@@ -45,8 +47,24 @@ func taskStreamLoop(ctx context.Context, cfg config) {
 	}
 }
 
-func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrencyLimiter) (bool, error) {
-	endpoint := cfg.ServerURL + "/api/agent/v1/tasks/stream?agent_id=" + url.QueryEscape(cfg.AgentID)
+func taskStreamReconnectDelay(base time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	spread := base / 5
+	if spread <= 0 {
+		return base
+	}
+	return base - time.Duration(rand.Int64N(int64(spread)+1))
+}
+
+func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrencyLimiter, executor *agentTaskExecutor) (bool, error) {
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, "/api/agent/v1/tasks/stream?agent_id="+url.QueryEscape(cfg.AgentID))
+	if err != nil {
+		return false, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return false, err
@@ -63,16 +81,23 @@ func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrency
 		return false, fmt.Errorf("stream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	log.Printf("task stream connected")
-	err = readSSETasks(ctx, resp.Body, cfg.StreamIdleTimeout, func(task taskRequest) {
+	err = readSSETasks(streamCtx, resp.Body, cfg.StreamIdleTimeout, func(task taskRequest) {
+		if strings.EqualFold(strings.TrimSpace(task.Operation), "cancel") {
+			if executor != nil {
+				executor.CancelTask(strings.TrimSpace(task.CancelTaskID))
+			}
+			return
+		}
 		if task.MaxConcurrency > 0 {
 			limiter.SetLimit(task.MaxConcurrency)
 		}
-		if !limiter.Acquire(ctx) {
-			return
-		}
 		go func() {
-			defer limiter.Release()
-			executeAndReport(ctx, cfg, task)
+			if !limiter.Acquire(streamCtx) {
+				return
+			}
+			if executor == nil || !executor.Start(task, limiter) {
+				limiter.Release()
+			}
 		}()
 	})
 	if err == nil {
@@ -83,7 +108,9 @@ func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrency
 
 func taskStreamHTTPClient(cfg config) *http.Client {
 	if cfg.HTTPClient == nil {
-		return &http.Client{}
+		client := newControlPlaneHTTPClient(0)
+		client.Timeout = 0
+		return client
 	}
 	client := *cfg.HTTPClient
 	client.Timeout = 0
