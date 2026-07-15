@@ -88,6 +88,7 @@ func TestPersistAgentLatestVersionNormalizesAndPreservesLastGood(t *testing.T) {
 }
 
 func TestHeartbeatPersistsReleaseMetadata(t *testing.T) {
+	heartbeatReceived := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/agent/v1/heartbeat" {
 			http.NotFound(w, r)
@@ -95,6 +96,10 @@ func TestHeartbeatPersistsReleaseMetadata(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"latest_version":"v2.3.4","release_proxies":[{"id":7,"name":"GHFast","base_url":"https://ghfast.top/","mode":"query","query_param":"q","priority":400}]}`)
+		select {
+		case heartbeatReceived <- struct{}{}:
+		default:
+		}
 	}))
 	defer server.Close()
 
@@ -120,6 +125,12 @@ func TestHeartbeatPersistsReleaseMetadata(t *testing.T) {
 		cancel()
 		<-done
 	}()
+
+	select {
+	case <-heartbeatReceived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("heartbeat request was not received")
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
