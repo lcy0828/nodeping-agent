@@ -23,7 +23,19 @@ jobs:
           cache: true
 
       - name: Test
-        run: go test -count=1 ./...
+        shell: bash
+        run: |
+          set -o pipefail
+          output_file="$(mktemp)"
+          if go test -count=1 ./... 2>&1 | tee "$output_file"; then
+            exit 0
+          fi
+          diagnostic="$(tail -c 4000 "$output_file")"
+          diagnostic="${diagnostic//'%'/'%25'}"
+          diagnostic="${diagnostic//$'\r'/'%0D'}"
+          diagnostic="${diagnostic//$'\n'/'%0A'}"
+          printf '::error title=Go tests failed::%s\n' "$diagnostic"
+          exit 1
 
       - name: Build default release artifacts
         run: |
