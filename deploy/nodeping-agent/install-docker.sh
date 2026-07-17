@@ -141,6 +141,7 @@ install -m 0600 /dev/null "$PROJECT_DIRECTORY/.env"
 	printf 'NODEPING_AGENT_DOCKER_IMAGE_GLOBAL="%s"\n' "$(env_quote "$DOCKER_IMAGE_GLOBAL")"
 	printf 'NODEPING_AGENT_IMAGE="%s"\n' "$(env_quote "$selected_image")"
 	printf 'NODEPING_AGENT_IMAGE_VERSION="%s"\n' "$(env_quote "$IMAGE_VERSION")"
+	printf 'NODEPING_AGENT_DEPLOY_BASE_URL="%s"\n' "$(env_quote "$DEPLOY_BASE_URL")"
 } > "$PROJECT_DIRECTORY/.env"
 chmod 0600 "$PROJECT_DIRECTORY/.env"
 

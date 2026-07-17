@@ -13,6 +13,8 @@ PULL_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS:-300}"
 READINESS_STABLE_SECONDS="${NODEPING_AGENT_DOCKER_READINESS_STABLE_SECONDS:-10}"
 ALLOW_DOWNGRADE="${NODEPING_AGENT_ALLOW_DOWNGRADE:-0}"
 EVENT_TOKEN=""
+PREVIOUS_COMPOSE_FILE=""
+COMPOSE_UPDATED=0
 
 say() {
 	printf '%s / %s\n' "$1" "$2"
@@ -28,9 +30,9 @@ is_loopback_http_url() {
 }
 
 validate_secure_url() {
-	local url="$1"
+	local url="$1" name="${2:-NODEPING_SERVER_URL}"
 	if [[ "$url" =~ [[:space:]@] ]] || { [[ "$url" != https://* ]] && ! is_loopback_http_url "$url"; }; then
-		say_err "NODEPING_SERVER_URL 必须使用 HTTPS（仅 localhost/回环地址允许 HTTP）" "NODEPING_SERVER_URL must use HTTPS (HTTP is allowed only for localhost/loopback development)"
+		say_err "$name 必须使用 HTTPS（仅 localhost/回环地址允许 HTTP）" "$name must use HTTPS (HTTP is allowed only for localhost/loopback development)"
 		return 1
 	fi
 }
@@ -65,6 +67,27 @@ set_dotenv_value() {
 	mv -f "$temporary" "$ENV_FILE"
 }
 
+download_file() {
+	local source_url="$1" destination="$2"
+	validate_secure_url "$source_url" "deployment URL" >/dev/null 2>&1 || return 1
+	if command -v curl >/dev/null 2>&1; then
+		if [[ "$source_url" == https://* ]]; then
+			curl -fsSL --connect-timeout 8 --max-time 60 --proto '=https' --proto-redir '=https' "$source_url" -o "$destination"
+		else
+			curl -fsSL --connect-timeout 8 --max-time 60 --proto '=http,https' --proto-redir '=https' "$source_url" -o "$destination"
+		fi
+	elif command -v wget >/dev/null 2>&1; then
+		if [[ "$source_url" == https://* ]]; then
+			wget --https-only --timeout=60 --tries=1 -qO "$destination" "$source_url"
+		else
+			wget --max-redirect=0 --timeout=60 --tries=1 -qO "$destination" "$source_url"
+		fi
+	else
+		return 1
+	fi
+	[ -s "$destination" ] && ! LC_ALL=C head -c 512 "$destination" | LC_ALL=C grep -aEiq '^[[:space:]]*(<!DOCTYPE html|<html)'
+}
+
 validate_image() {
 	local name="$1" value="$2"
 	if [ -z "$value" ] || [[ "$value" =~ [[:space:]@] ]] || [[ "$value" == -* ]] || [[ ! "$value" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
@@ -97,6 +120,10 @@ DOCKER_IMAGE_CN="${DOCKER_IMAGE_CN:-hub.ilatency.com/ghcr.io/lcy0828/nodeping-ag
 DOCKER_IMAGE_GLOBAL="${NODEPING_AGENT_DOCKER_IMAGE_GLOBAL:-$(dotenv_value NODEPING_AGENT_DOCKER_IMAGE_GLOBAL)}"
 DOCKER_IMAGE_GLOBAL="${DOCKER_IMAGE_GLOBAL:-ghcr.io/lcy0828/nodeping-agent}"
 ORIGINAL_IMAGE="${NODEPING_AGENT_IMAGE:-$(dotenv_value NODEPING_AGENT_IMAGE)}"
+DEPLOY_BASE_URL="${NODEPING_AGENT_DEPLOY_BASE_URL:-$(dotenv_value NODEPING_AGENT_DEPLOY_BASE_URL)}"
+DEPLOY_BASE_URL="${DEPLOY_BASE_URL:-https://hub.ilatency.com/https://raw.githubusercontent.com/lcy0828/nodeping-agent/main/deploy/nodeping-agent}"
+SYNC_DEPLOYMENT="${NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT:-$(dotenv_value NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT)}"
+SYNC_DEPLOYMENT="${SYNC_DEPLOYMENT:-1}"
 case "$DISTRIBUTION_MODE" in
 	cn)
 		PRIMARY_IMAGE="$DOCKER_IMAGE_CN"
@@ -110,9 +137,13 @@ case "$DISTRIBUTION_MODE" in
 esac
 validate_image "NODEPING_AGENT_DOCKER_IMAGE_CN" "$DOCKER_IMAGE_CN"
 validate_image "NODEPING_AGENT_DOCKER_IMAGE_GLOBAL" "$DOCKER_IMAGE_GLOBAL"
+case "$SYNC_DEPLOYMENT" in 0|1) ;; *) say_err "NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT 必须为 0 或 1" "NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT must be 0 or 1"; exit 2 ;; esac
 
 if [ -n "$SERVER_URL" ]; then
-	validate_secure_url "$SERVER_URL"
+	validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL"
+fi
+if [ "$SYNC_DEPLOYMENT" = "1" ]; then
+	validate_secure_url "$DEPLOY_BASE_URL" "NODEPING_AGENT_DEPLOY_BASE_URL"
 fi
 if [[ ! "$SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
 	say_err "SERVICE 名称无效" "invalid SERVICE name"
@@ -138,6 +169,51 @@ compose() {
 	else
 		docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
 	fi
+}
+
+uses_default_compose_file() {
+	[ "$COMPOSE_FILE" = "$PROJECT_DIRECTORY/compose.yml" ] || [ "$COMPOSE_FILE" = "compose.yml" ]
+}
+
+restore_previous_compose() {
+	if [ "$COMPOSE_UPDATED" = "1" ] && [ -n "$PREVIOUS_COMPOSE_FILE" ] && [ -f "$PREVIOUS_COMPOSE_FILE" ]; then
+		cp -p "$PREVIOUS_COMPOSE_FILE" "$PROJECT_DIRECTORY/compose.yml"
+		COMPOSE_UPDATED=0
+	fi
+}
+
+cleanup_compose_backup() {
+	if [ -n "$PREVIOUS_COMPOSE_FILE" ]; then
+		rm -f "$PREVIOUS_COMPOSE_FILE"
+	fi
+}
+
+trap cleanup_compose_backup EXIT
+
+sync_default_compose() {
+	[ "$SYNC_DEPLOYMENT" = "1" ] || return 0
+	uses_default_compose_file || return 0
+	local target="$PROJECT_DIRECTORY/compose.yml" candidate
+	[ -f "$target" ] || return 1
+	candidate="$(mktemp "$PROJECT_DIRECTORY/.compose.yml.download.XXXXXX")"
+	if ! download_file "${DEPLOY_BASE_URL%/}/compose.yml" "$candidate"; then
+		rm -f "$candidate"
+		return 1
+	fi
+	chmod 0644 "$candidate"
+	if ! docker compose --env-file "$ENV_FILE" -f "$candidate" config --quiet; then
+		rm -f "$candidate"
+		return 1
+	fi
+	if command -v cmp >/dev/null 2>&1 && cmp -s "$candidate" "$target"; then
+		rm -f "$candidate"
+		return 0
+	fi
+	PREVIOUS_COMPOSE_FILE="$(mktemp "$PROJECT_DIRECTORY/.compose.yml.backup.XXXXXX")"
+	cp -p "$target" "$PREVIOUS_COMPOSE_FILE"
+	mv -f "$candidate" "$target"
+	COMPOSE_UPDATED=1
+	say "Docker Compose 部署配置已更新" "Docker Compose deployment configuration updated"
 }
 
 compose_pull() {
@@ -297,6 +373,7 @@ rollback_docker() {
 	local reason="$1"
 	emit_upgrade_event "update_failed" "$CURRENT_VERSION" "$TARGET_VERSION" "$reason"
 	emit_upgrade_event "rollback_started" "$TARGET_VERSION" "$CURRENT_VERSION" "$reason"
+	restore_previous_compose
 	if [ -z "$BEFORE_IMAGE_ID" ] || [ -z "$BEFORE_IMAGE_REF" ] || [[ "$BEFORE_IMAGE_REF" == *@* ]]; then
 		emit_upgrade_event "rollback_failed" "$TARGET_VERSION" "$CURRENT_VERSION" "previous docker image reference is unavailable"
 		return 1
@@ -318,6 +395,10 @@ rollback_docker() {
 	return 1
 }
 
+if ! sync_default_compose; then
+	say_err "无法同步或校验新版 Compose，继续使用现有部署配置" "could not sync or validate the current Compose file; continuing with the existing deployment configuration"
+fi
+
 if [ "${NODEPING_AGENT_DOCKER_BUILD:-0}" = "1" ]; then
 	if ! compose up -d --build "$SERVICE"; then
 		rollback_docker "docker compose build/update failed" || true
@@ -327,6 +408,7 @@ else
 	select_image "$PRIMARY_IMAGE"
 	if ! compose_pull; then
 		if [ "$FALLBACK_IMAGE" = "$PRIMARY_IMAGE" ]; then
+			restore_previous_compose
 			restore_original_image
 			emit_upgrade_event "update_failed" "$CURRENT_VERSION" "$TARGET_VERSION" "docker compose pull failed"
 			exit 1
@@ -334,6 +416,7 @@ else
 		say "主镜像源拉取失败，正在尝试备用镜像源" "primary image source failed; trying fallback image source"
 		select_image "$FALLBACK_IMAGE"
 		if ! compose_pull; then
+			restore_previous_compose
 			restore_original_image
 			emit_upgrade_event "update_failed" "$CURRENT_VERSION" "$TARGET_VERSION" "both Docker image sources failed"
 			exit 1

@@ -95,7 +95,7 @@ func checkPingCommand(ctx context.Context) doctorCheck {
 	defer cancel()
 	_, err = runPing(pingCtx, "127.0.0.1")
 	if err != nil {
-		return doctorCheck{Key: "ping_command", Name: "ping command", Status: "fail", Severity: "required_for_capability", Message: err.Error(), Path: path, Remediation: "grant CAP_NET_RAW or install a ping binary with the required permission", Capabilities: []string{"ping", "long_ping"}, Required: true}
+		return doctorCheck{Key: "ping_command", Name: "ping command", Status: "fail", Severity: "required_for_capability", Message: err.Error(), Path: path, Remediation: rawSocketPermissionRemediation(), Capabilities: []string{"ping", "long_ping"}, Required: true}
 	}
 	return doctorCheck{Key: "ping_command", Name: "ping command", Status: "ok", Severity: "required_for_capability", Message: path, Path: path, Version: commandVersion(ctx, path, "-V"), Capabilities: []string{"ping", "long_ping"}, Required: true}
 }
@@ -129,9 +129,16 @@ func checkMTRCommand(ctx context.Context) doctorCheck {
 		if diagnostic := mtrProbeDiagnostic(probe); diagnostic != "" {
 			check.Message += ": " + diagnostic
 		}
-		check.Remediation = "run mtr as the Agent user and verify packet helper permissions; Docker installs require NET_RAW"
+		check.Remediation = rawSocketPermissionRemediation()
 	}
 	return check
+}
+
+func rawSocketPermissionRemediation() string {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("NODEPING_INSTALL_MODE")), "docker") {
+		return "refresh the Docker Compose deployment and recreate the container with user 0:0 and NET_RAW"
+	}
+	return "grant CAP_NET_RAW to the Agent service user and verify ping/mtr packet helper permissions"
 }
 
 func checkDNS(ctx context.Context) doctorCheck {

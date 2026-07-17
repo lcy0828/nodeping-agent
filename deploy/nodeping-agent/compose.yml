@@ -2,6 +2,9 @@ services:
   nodeping-agent:
     image: ${NODEPING_AGENT_IMAGE:-hub.ilatency.com/ghcr.io/lcy0828/nodeping-agent}:${NODEPING_AGENT_IMAGE_VERSION:-latest}
     restart: unless-stopped
+    # Root keeps NET_RAW effective even when the host restricts ping_group_range.
+    # Every other capability is dropped and privilege escalation remains disabled.
+    user: "0:0"
     read_only: true
     pids_limit: 128
     mem_limit: ${NODEPING_AGENT_MEMORY_LIMIT:-256m}

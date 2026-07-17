@@ -1589,6 +1589,7 @@ exit 1
 		t.Fatalf("write fake mtr: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("NODEPING_INSTALL_MODE", "docker")
 
 	if mtrSupportsJSON(context.Background(), mtrPath) {
 		t.Fatal("mtrSupportsJSON should reject a runtime permission failure")
@@ -1597,7 +1598,7 @@ exit 1
 	if check.Status != "fail" || !strings.Contains(check.Message, "runtime check failed") || strings.Contains(check.Message, "does not support") {
 		t.Fatalf("checkMTRCommand = %+v, want runtime failure", check)
 	}
-	if !strings.Contains(check.Remediation, "NET_RAW") {
+	if !strings.Contains(check.Remediation, "user 0:0") || !strings.Contains(check.Remediation, "NET_RAW") {
 		t.Fatalf("remediation = %q, want packet permission guidance", check.Remediation)
 	}
 }
