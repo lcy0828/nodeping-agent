@@ -415,7 +415,7 @@ cp "$MOCK_COMPOSE_SOURCE" "$destination"
 	}
 }
 
-func TestUpdateDockerMigratesLegacyIdentityAndCleansSameBackendDuplicates(t *testing.T) {
+func TestUpdateDockerMigratesLegacyIdentityAndCleansSameBackendDuplicatesWithCanonicalIDs(t *testing.T) {
 	scriptPath, err := filepath.Abs("update-docker.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -465,11 +465,17 @@ func TestUpdateDockerMigratesLegacyIdentityAndCleansSameBackendDuplicates(t *tes
 
 	mockDocker := `#!/usr/bin/env bash
 set -eu
+current_full='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+current_short='aaaaaaaaaaaa'
+duplicate_same_full='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+duplicate_same_short='bbbbbbbbbbbb'
+duplicate_other_full='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
+duplicate_other_short='cccccccccccc'
 printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 if [ "${1:-}" = "compose" ]; then
 	case " $* " in
 		*" ps -q "*)
-			if [ -f "$MOCK_CURRENT_STATE" ]; then printf 'current-container\n'; fi
+			if [ -f "$MOCK_CURRENT_STATE" ]; then printf '%s\n' "$current_full"; fi
 			;;
 		*" up "*) touch "$MOCK_CURRENT_STATE" ;;
 		*" ps "*) printf 'nodeping-agent running\n' ;;
@@ -480,7 +486,7 @@ if [ "${1:-}" = "ps" ]; then
 	case " $* " in
 		*" -aq "*)
 			if [ -f "$MOCK_CURRENT_STATE" ]; then
-				printf 'current-container\nduplicate-same\nduplicate-other\n'
+				printf '%s\n%s\n%s\n' "$current_short" "$duplicate_same_short" "$duplicate_other_short"
 			else
 				printf 'legacy-container\n'
 			fi
@@ -499,17 +505,24 @@ if [ "${1:-}" = "exec" ]; then
 	esac
 	exit 0
 fi
-	if [ "${1:-}" = "inspect" ]; then
-		container="${*: -1}"
-		case " $* " in
-			*".Mounts"*) printf 'volume|/var/lib/docker/volumes/legacy/_data\n' ;;
+if [ "${1:-}" = "inspect" ]; then
+	container="${*: -1}"
+	case " $* " in
+		*".Mounts"*) printf 'volume|/var/lib/docker/volumes/legacy/_data\n' ;;
+		*"{{.Id}}"*)
+			case "$container" in
+				"$current_short"|"$current_full") printf '%s\n' "$current_full" ;;
+				"$duplicate_same_short"|"$duplicate_same_full") printf '%s\n' "$duplicate_same_full" ;;
+				"$duplicate_other_short"|"$duplicate_other_full") printf '%s\n' "$duplicate_other_full" ;;
+			esac
+			;;
 		*"State.Running"*) printf 'true none\n' ;;
 		*".Config.Image"*) printf 'global.example/nodeping-agent:v1.2.3\n' ;;
-			*".Config.Env"*)
-				case "$container" in
-					legacy-container) printf 'NODEPING_SERVER_URL=https://agent.example\n' ;;
-					duplicate-same) printf 'NODEPING_SERVER_URL=https://agent.example/\n' ;;
-				duplicate-other) printf 'NODEPING_SERVER_URL=https://other.example\n' ;;
+		*".Config.Env"*)
+			case "$container" in
+				legacy-container) printf 'NODEPING_SERVER_URL=https://agent.example\n' ;;
+				"$duplicate_same_full") printf 'NODEPING_SERVER_URL=https://agent.example/\n' ;;
+				"$duplicate_other_full") printf 'NODEPING_SERVER_URL=https://other.example\n' ;;
 			esac
 			;;
 		*) printf 'sha256:test\n' ;;
@@ -565,10 +578,13 @@ exit 0
 		t.Fatal(err)
 	}
 	logText := string(dockerLog)
-	if !strings.Contains(logText, "rm -f duplicate-same") {
+	if !strings.Contains(logText, "rm -f bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
 		t.Fatalf("same-backend duplicate was not removed:\n%s", logText)
 	}
-	if strings.Contains(logText, "rm -f duplicate-other") {
+	if strings.Contains(logText, "rm -f aaaaaaaaaaaa") || strings.Contains(logText, "rm -f aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+		t.Fatalf("current container was removed because its full ID did not match Docker's short ID:\n%s", logText)
+	}
+	if strings.Contains(logText, "rm -f cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc") {
 		t.Fatalf("different-backend container was removed:\n%s", logText)
 	}
 }

@@ -297,7 +297,15 @@ select_image() {
 }
 
 container_id() {
-	compose ps -q "$SERVICE" 2>/dev/null | head -n 1
+	# Include stopped containers so a failed deployment remains available for
+	# inspection instead of being mistaken for a legacy duplicate.
+	compose ps -q --all "$SERVICE" 2>/dev/null | head -n 1
+}
+
+canonical_container_id() {
+	local id="$1"
+	[ -n "$id" ] || return 0
+	docker inspect --format '{{.Id}}' "$id" 2>/dev/null || true
 }
 
 legacy_container_id() {
@@ -391,12 +399,20 @@ migrate_legacy_agent_state() {
 }
 
 cleanup_duplicate_agent_containers() {
-	local current_id="$1" id candidate_server removed=0
+	local current_id="$1" current_canonical_id id candidate_canonical_id candidate_server removed=0
+	current_canonical_id="$(canonical_container_id "$current_id")"
+	if [ -z "$current_canonical_id" ]; then
+		say_err "无法确认当前 Agent 容器，已跳过重复容器清理" "could not identify the current Agent container; duplicate cleanup was skipped"
+		return 1
+	fi
 	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
-		[ -n "$id" ] && [ "$id" != "$current_id" ] || continue
-		candidate_server="$(container_server_url "$id")"
+		[ -n "$id" ] || continue
+		candidate_canonical_id="$(canonical_container_id "$id")"
+		[ -n "$candidate_canonical_id" ] || continue
+		[ "$candidate_canonical_id" != "$current_canonical_id" ] || continue
+		candidate_server="$(container_server_url "$candidate_canonical_id")"
 		[ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ] || continue
-		if docker rm -f "$id" >/dev/null; then
+		if docker rm -f "$candidate_canonical_id" >/dev/null; then
 			removed=$((removed + 1))
 		fi
 	done
@@ -523,15 +539,15 @@ emit_upgrade_event() {
 	payload="{\"agent_id\":\"$(json_escape "$agent_id")\",\"event\":\"$(json_escape "$event")\",\"from_version\":\"$(json_escape "$from_version")\",\"to_version\":\"$(json_escape "$to_version")\",\"message\":\"$(json_escape "$message")\"}"
 	if command -v curl >/dev/null 2>&1; then
 		if [[ "$SERVER_URL" == https://* ]]; then
-			curl -fsS -m 8 --proto '=https' --proto-redir '=https' -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
+			curl -fsS -m 8 --proto '=https' --proto-redir '=https' -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null 2>&1 || true
 		else
-			curl -fsS -m 8 --proto '=http,https' --proto-redir '=https' -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
+			curl -fsS -m 8 --proto '=http,https' --proto-redir '=https' -H "Authorization: Bearer $token" -H "Content-Type: application/json" -d "$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null 2>&1 || true
 		fi
 	elif command -v wget >/dev/null 2>&1; then
 		if [[ "$SERVER_URL" == https://* ]]; then
-			wget --https-only -qO- --timeout=8 --header="Authorization: Bearer $token" --header="Content-Type: application/json" --post-data="$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
+			wget --https-only -qO- --timeout=8 --header="Authorization: Bearer $token" --header="Content-Type: application/json" --post-data="$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null 2>&1 || true
 		else
-			wget --max-redirect=0 -qO- --timeout=8 --header="Authorization: Bearer $token" --header="Content-Type: application/json" --post-data="$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null || true
+			wget --max-redirect=0 -qO- --timeout=8 --header="Authorization: Bearer $token" --header="Content-Type: application/json" --post-data="$payload" "${SERVER_URL%/}/api/agent/v1/upgrade-event" >/dev/null 2>&1 || true
 		fi
 	fi
 }
@@ -630,13 +646,24 @@ if [ -n "$CURRENT_VERSION" ] && version_is_lower "$NEW_VERSION" "$CURRENT_VERSIO
 	rollback_docker "docker image downgrade is blocked by policy" || true
 	exit 1
 fi
+current_container="$(container_id)"
+if [ -z "$current_container" ]; then
+	rollback_docker "updated container disappeared before duplicate cleanup" || true
+	exit 1
+fi
+if ! cleanup_duplicate_agent_containers "$current_container"; then
+	rollback_docker "could not safely identify the current container during duplicate cleanup" || true
+	exit 1
+fi
+if ! container_is_ready "$current_container"; then
+	rollback_docker "updated container stopped during duplicate cleanup" || true
+	exit 1
+fi
 if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
 	emit_upgrade_event "up_to_date" "$CURRENT_VERSION" "$NEW_VERSION" "docker image already current"
 else
 	emit_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$NEW_VERSION" "docker deployment updated"
 fi
-
-cleanup_duplicate_agent_containers "$(container_id)"
 
 say "Docker 部署已更新" "docker deployment updated"
 compose ps "$SERVICE"
