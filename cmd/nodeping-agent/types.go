@@ -11,6 +11,7 @@ type config struct {
 	Token              string
 	AgentToken         string
 	AgentTokenFile     string
+	AgentIDFile        string
 	AgentID            string
 	Name               string
 	Version            string

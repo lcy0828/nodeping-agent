@@ -165,8 +165,20 @@ func checkAgentTokenFile(cfg config) doctorCheck {
 	if cfg.AgentTokenFile == "" {
 		return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: "NODEPING_AGENT_TOKEN_FILE is empty", Required: true}
 	}
-	if token := readAgentTokenFile(cfg.AgentTokenFile); token != "" {
+	if info, err := os.Stat(cfg.AgentTokenFile); err == nil {
+		if info.IsDir() {
+			return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: "token path is a directory", Path: cfg.AgentTokenFile, Required: true}
+		}
+		raw, readErr := os.ReadFile(cfg.AgentTokenFile)
+		if readErr != nil {
+			return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: readErr.Error(), Path: cfg.AgentTokenFile, Required: true}
+		}
+		if strings.TrimSpace(string(raw)) == "" {
+			return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: "token file is empty", Path: cfg.AgentTokenFile, Required: true}
+		}
 		return doctorCheck{Key: "token_file", Name: "token file", Status: "ok", Severity: "required", Message: "readable", Path: cfg.AgentTokenFile, Required: true}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return doctorCheck{Key: "token_file", Name: "token file", Status: "fail", Severity: "required", Message: err.Error(), Path: cfg.AgentTokenFile, Required: true}
 	}
 	dir := cfg.AgentTokenFile
 	if index := strings.LastIndex(dir, string(os.PathSeparator)); index > 0 {

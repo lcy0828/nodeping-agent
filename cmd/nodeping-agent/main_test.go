@@ -21,6 +21,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -262,6 +263,49 @@ func TestDoctorAgentTokenFileWritable(t *testing.T) {
 	check := checkAgentTokenFile(config{AgentTokenFile: filepath.Join(t.TempDir(), "agent-token")})
 	if check.Status != "ok" {
 		t.Fatalf("checkAgentTokenFile = %+v", check)
+	}
+}
+
+func TestDoctorAgentTokenFileRejectsEmptyFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-token")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check := checkAgentTokenFile(config{AgentTokenFile: path})
+	if check.Status != "fail" || !strings.Contains(check.Message, "empty") {
+		t.Fatalf("checkAgentTokenFile = %+v", check)
+	}
+}
+
+func TestPrepareAgentStatePersistsIdentityBeforeRegistration(t *testing.T) {
+	dir := t.TempDir()
+	idPath := filepath.Join(dir, "agent-id")
+	tokenPath := filepath.Join(dir, "agent-token")
+	wantID := "agent-12345678-1234-4123-9123-123456789abc"
+	if err := prepareAgentState(config{AgentID: wantID, AgentIDFile: idPath, AgentTokenFile: tokenPath}); err != nil {
+		t.Fatalf("prepareAgentState: %v", err)
+	}
+	if got := readAgentIDFile(idPath); got != wantID {
+		t.Fatalf("stored agent ID = %q, want %q", got, wantID)
+	}
+	if _, err := os.Stat(tokenPath); !os.IsNotExist(err) {
+		t.Fatalf("token probe should not create the token file: %v", err)
+	}
+}
+
+func TestPrepareAgentStateRejectsTokenDirectory(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "agent-token")
+	if err := os.Mkdir(tokenPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := prepareAgentState(config{
+		AgentID:        "agent-12345678-1234-4123-9123-123456789abc",
+		AgentIDFile:    filepath.Join(dir, "agent-id"),
+		AgentTokenFile: tokenPath,
+	})
+	if err == nil {
+		t.Fatal("prepareAgentState succeeded with a directory token path")
 	}
 }
 
@@ -1001,6 +1045,36 @@ func TestRunHTTPRequestAssertionsAndTimings(t *testing.T) {
 	serverIP := hostLiteralIP(server.Listener.Addr().String())
 	if responseIP != serverIP || result["response_ip"] != serverIP {
 		t.Fatalf("response IP = %q result=%+v, want %q", responseIP, result, serverIP)
+	}
+}
+
+func TestRunHTTPRequestExtractsPublicIPsWithoutReturningBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ip":"104.224.157.78","private":"192.168.2.28","duplicate":"104.224.157.78"}`))
+	}))
+	defer server.Close()
+
+	_, _, result, err := runHTTPRequest(context.Background(), http.MethodGet, server.URL, nil, "", trustedPrivateTaskOptions(map[string]any{
+		"extract_public_ips": true,
+	}))
+	if err != nil {
+		t.Fatalf("runHTTPRequest: %v", err)
+	}
+	if _, exists := result["body"]; exists {
+		t.Fatalf("HTTP response body must not be returned: %+v", result)
+	}
+	ips, ok := result["public_ips"].([]string)
+	if !ok || len(ips) != 1 || ips[0] != "104.224.157.78" {
+		t.Fatalf("public_ips = %#v, want only the validated public address", result["public_ips"])
+	}
+}
+
+func TestExtractPublicIPsFromHTTPBodySupportsCommonEchoFormats(t *testing.T) {
+	body := []byte("当前 IP：220.196.237.31 来自中国\n{\"ip\":\"2606:4700:4700::1111\"}\n")
+	got := extractPublicIPsFromHTTPBody(body)
+	want := []string{"220.196.237.31", "2606:4700:4700::1111"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractPublicIPsFromHTTPBody() = %#v, want %#v", got, want)
 	}
 }
 

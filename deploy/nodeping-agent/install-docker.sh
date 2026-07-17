@@ -32,6 +32,7 @@ DOCKER_IMAGE_CN="${NODEPING_AGENT_DOCKER_IMAGE_CN:-hub.ilatency.com/ghcr.io/lcy0
 DOCKER_IMAGE_GLOBAL="${NODEPING_AGENT_DOCKER_IMAGE_GLOBAL:-ghcr.io/lcy0828/nodeping-agent}"
 IMAGE_VERSION="${NODEPING_AGENT_IMAGE_VERSION:-latest}"
 PROJECT_DIRECTORY="${NODEPING_AGENT_DOCKER_PROJECT_DIRECTORY:-/opt/nodeping-agent}"
+DATA_DIRECTORY="${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-$PROJECT_DIRECTORY/data}"
 AGENT_ID="${NODEPING_AGENT_ID:-}"
 AGENT_NAME="${NODEPING_AGENT_NAME:-NodePing Docker Agent}"
 
@@ -113,10 +114,18 @@ case "$PROJECT_DIRECTORY" in
 	/*) ;;
 	*) say_err "安装目录必须是绝对路径" "project directory must be absolute"; exit 2 ;;
 esac
-if [[ ! "$PROJECT_DIRECTORY" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
-	say_err "安装目录只能包含字母、数字、点、下划线、横线和斜线" "project directory contains unsupported characters"
-	exit 2
-fi
+for directory_item in "project:$PROJECT_DIRECTORY" "data:$DATA_DIRECTORY"; do
+	directory_name="${directory_item%%:*}"
+	directory_value="${directory_item#*:}"
+	case "$directory_value" in
+		/*) ;;
+		*) say_err "$directory_name 目录必须是绝对路径" "$directory_name directory must be absolute"; exit 2 ;;
+	esac
+	if [[ ! "$directory_value" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+		say_err "$directory_name 目录只能包含字母、数字、点、下划线、横线和斜线" "$directory_name directory contains unsupported characters"
+		exit 2
+	fi
+done
 
 validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL"
 validate_secure_url "$DEPLOY_BASE_URL" "NODEPING_AGENT_DEPLOY_BASE_URL"
@@ -147,6 +156,7 @@ download_file "${DEPLOY_BASE_URL%/}/update-docker.sh" "$tmp_dir/update-docker.sh
 bash -n "$tmp_dir/update-docker.sh"
 
 install -d -m 0700 "$PROJECT_DIRECTORY"
+install -d -m 0700 "$DATA_DIRECTORY"
 install -m 0644 "$tmp_dir/compose.yml" "$PROJECT_DIRECTORY/compose.yml"
 install -m 0755 "$tmp_dir/update-docker.sh" "$PROJECT_DIRECTORY/update-docker.sh"
 CONTROL_DIRECTORY="$PROJECT_DIRECTORY/control"
@@ -195,6 +205,7 @@ install -m 0600 /dev/null "$PROJECT_DIRECTORY/.env"
 	printf 'NODEPING_AGENT_IMAGE="%s"\n' "$(env_quote "$selected_image")"
 	printf 'NODEPING_AGENT_IMAGE_VERSION="%s"\n' "$(env_quote "$IMAGE_VERSION")"
 	printf 'NODEPING_AGENT_DEPLOY_BASE_URL="%s"\n' "$(env_quote "$DEPLOY_BASE_URL")"
+	printf 'NODEPING_AGENT_DOCKER_DATA_DIRECTORY="%s"\n' "$(env_quote "$DATA_DIRECTORY")"
 	printf 'NODEPING_AGENT_UPGRADE_MODE="%s"\n' "$(env_quote "$REMOTE_UPGRADE_MODE")"
 	printf 'NODEPING_AGENT_UPGRADE_REQUEST_FILE="/run/nodeping-agent/update-request.json"\n'
 	printf 'NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY="%s"\n' "$(env_quote "$CONTROL_DIRECTORY")"

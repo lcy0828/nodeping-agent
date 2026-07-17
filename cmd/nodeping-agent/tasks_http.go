@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -79,6 +80,11 @@ func runHTTPRequestWithResolver(ctx context.Context, method string, target strin
 		"http_request": latency,
 		"body_bytes":   len(readBody),
 	}
+	if boolOptionDefault(options, "extract_public_ips", false) {
+		if publicIPs := extractPublicIPsFromHTTPBody(readBody); len(publicIPs) > 0 {
+			result["public_ips"] = publicIPs
+		}
+	}
 	if responseIP != "" {
 		result["response_ip"] = responseIP
 	}
@@ -100,6 +106,46 @@ func runHTTPRequestWithResolver(ctx context.Context, method string, target strin
 		result["body_bytes"] = maxBodyBytes
 	}
 	return latency, responseIP, result, nil
+}
+
+func extractPublicIPsFromHTTPBody(body []byte) []string {
+	const maxExtractedPublicIPs = 8
+	var result []string
+	for _, field := range strings.FieldsFunc(string(body), func(r rune) bool {
+		return !(r == ':' || r == '.' || r == '%' || r == '[' || r == ']' ||
+			(r >= '0' && r <= '9') ||
+			(r >= 'a' && r <= 'f') ||
+			(r >= 'A' && r <= 'F'))
+	}) {
+		candidate := strings.Trim(strings.TrimSpace(field), "[]")
+		if zoneIndex := strings.LastIndex(candidate, "%"); zoneIndex > 0 {
+			candidate = candidate[:zoneIndex]
+		}
+		addr, err := netip.ParseAddr(candidate)
+		if err != nil {
+			continue
+		}
+		addr = addr.Unmap()
+		if !isPublicProbeAddr(addr) {
+			continue
+		}
+		ipText := addr.String()
+		seen := false
+		for _, existing := range result {
+			if existing == ipText {
+				seen = true
+				break
+			}
+		}
+		if seen {
+			continue
+		}
+		result = append(result, ipText)
+		if len(result) >= maxExtractedPublicIPs {
+			break
+		}
+	}
+	return result
 }
 
 func originalHostOption(options map[string]any) string {

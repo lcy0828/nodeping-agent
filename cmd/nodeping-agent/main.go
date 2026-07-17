@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +46,9 @@ func main() {
 }
 
 func run(ctx context.Context, cfg config) error {
+	if err := prepareAgentState(cfg); err != nil {
+		return err
+	}
 	if cfg.AgentToken != "" && agentTokenCanContinue(ctx, cfg) {
 		log.Printf("continuing with stored agent token agent_id=%s server=%s", cfg.AgentID, cfg.ServerURL)
 	} else {
@@ -57,11 +61,14 @@ func run(ctx context.Context, cfg config) error {
 		}
 		if agentID := strings.TrimSpace(registerResp.AgentID); agentID != "" {
 			cfg.AgentID = agentID
-			if err := writeAgentIDFile(defaultAgentIDFile(), cfg.AgentID); err != nil {
-				log.Printf("store agent id failed: %v", err)
+			if err := writeAgentIDFile(cfg.AgentIDFile, cfg.AgentID); err != nil {
+				return fmt.Errorf("store registered agent id: %w", err)
 			}
 		}
 		cfg.AgentToken = strings.TrimSpace(registerResp.AgentToken)
+		if cfg.AgentToken == "" {
+			return errors.New("register response did not include agent_token")
+		}
 		if registerResp.ReleaseProxies != nil {
 			if err := persistAgentReleaseProxies(cfg.ReleaseProxyFile, registerResp.ReleaseProxies); err != nil {
 				log.Printf("store release proxy catalog failed: %v", err)
@@ -77,7 +84,7 @@ func run(ctx context.Context, cfg config) error {
 		return errors.New("register response did not include agent_token")
 	}
 	if err := writeAgentTokenFile(cfg.AgentTokenFile, cfg.AgentToken); err != nil {
-		log.Printf("store agent token failed: %v", err)
+		return fmt.Errorf("store agent token: %w", err)
 	}
 	log.Printf("registered agent_id=%s server=%s", cfg.AgentID, cfg.ServerURL)
 	var wg sync.WaitGroup
@@ -110,4 +117,50 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 	return ctx.Err()
+}
+
+func prepareAgentState(cfg config) error {
+	if strings.TrimSpace(cfg.AgentIDFile) == "" {
+		return errors.New("NODEPING_AGENT_ID_FILE is required")
+	}
+	if err := writeAgentIDFile(cfg.AgentIDFile, cfg.AgentID); err != nil {
+		return fmt.Errorf("store agent id before startup: %w", err)
+	}
+	if strings.TrimSpace(cfg.AgentTokenFile) == "" {
+		return errors.New("NODEPING_AGENT_TOKEN_FILE is required")
+	}
+	if err := ensureStateFileWritable(cfg.AgentTokenFile); err != nil {
+		return fmt.Errorf("prepare agent token file before startup: %w", err)
+	}
+	return nil
+}
+
+func ensureStateFileWritable(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return errors.New("state file path is empty")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
+		file, openErr := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0)
+		if openErr != nil {
+			return openErr
+		}
+		return file.Close()
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	temporary, err := os.CreateTemp(dir, ".nodeping-agent-write-test-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	if closeErr := temporary.Close(); closeErr != nil {
+		_ = os.Remove(temporaryPath)
+		return closeErr
+	}
+	return os.Remove(temporaryPath)
 }

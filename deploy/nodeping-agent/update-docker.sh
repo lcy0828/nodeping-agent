@@ -6,6 +6,7 @@ ENV_FILE="${ENV_FILE:-$SCRIPT_DIR/.env}"
 SERVICE="${SERVICE:-nodeping-agent}"
 PROJECT_DIRECTORY="${PROJECT_DIRECTORY:-$SCRIPT_DIR}"
 COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_DIRECTORY/compose.yml}"
+DATA_DIRECTORY="${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-}"
 SERVER_URL="${NODEPING_SERVER_URL:-}"
 AGENT_ID="${NODEPING_AGENT_ID:-}"
 UPDATE_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_UPDATE_TIMEOUT_SECONDS:-90}"
@@ -158,6 +159,10 @@ DOCKER_IMAGE_GLOBAL="${DOCKER_IMAGE_GLOBAL:-ghcr.io/lcy0828/nodeping-agent}"
 ORIGINAL_IMAGE="${NODEPING_AGENT_IMAGE:-$(dotenv_value NODEPING_AGENT_IMAGE)}"
 DEPLOY_BASE_URL="${NODEPING_AGENT_DEPLOY_BASE_URL:-$(dotenv_value NODEPING_AGENT_DEPLOY_BASE_URL)}"
 DEPLOY_BASE_URL="${DEPLOY_BASE_URL:-https://hub.ilatency.com/https://raw.githubusercontent.com/lcy0828/nodeping-agent/main/deploy/nodeping-agent}"
+if [ -z "$DATA_DIRECTORY" ]; then
+	DATA_DIRECTORY="$(dotenv_value NODEPING_AGENT_DOCKER_DATA_DIRECTORY)"
+fi
+DATA_DIRECTORY="${DATA_DIRECTORY:-$PROJECT_DIRECTORY/data}"
 SYNC_DEPLOYMENT="${NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT:-$(dotenv_value NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT)}"
 SYNC_DEPLOYMENT="${SYNC_DEPLOYMENT:-1}"
 case "$DISTRIBUTION_MODE" in
@@ -185,12 +190,27 @@ if [[ ! "$SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
 	say_err "SERVICE 名称无效" "invalid SERVICE name"
 	exit 2
 fi
+case "$DATA_DIRECTORY" in
+	/*) ;;
+	*) say_err "Agent 数据目录必须是绝对路径" "Agent data directory must be absolute"; exit 2 ;;
+esac
+if [[ ! "$DATA_DIRECTORY" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+	say_err "Agent 数据目录包含不支持的字符" "Agent data directory contains unsupported characters"
+	exit 2
+fi
+case "$DATA_DIRECTORY" in
+	/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+		say_err "Agent 数据目录不能指向系统顶层目录" "Agent data directory must not be a top-level system directory"
+		exit 2
+		;;
+esac
 case "$UPDATE_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) say_err "更新超时必须为正整数" "update timeout must be a positive integer"; exit 2 ;; esac
 case "$PULL_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) say_err "镜像拉取超时必须为正整数" "image pull timeout must be a positive integer"; exit 2 ;; esac
 case "$READINESS_STABLE_SECONDS" in ''|*[!0-9]*|0) say_err "readiness 稳定窗口必须为正整数" "readiness stable window must be a positive integer"; exit 2 ;; esac
 case "$ALLOW_DOWNGRADE" in 0|1) ;; *) say_err "NODEPING_AGENT_ALLOW_DOWNGRADE 必须为 0 或 1" "NODEPING_AGENT_ALLOW_DOWNGRADE must be 0 or 1"; exit 2 ;; esac
 
 cd "$PROJECT_DIRECTORY"
+set_dotenv_value NODEPING_AGENT_DOCKER_DATA_DIRECTORY "$DATA_DIRECTORY"
 
 ORIGINAL_IMAGE_VERSION="${NODEPING_AGENT_IMAGE_VERSION:-$(dotenv_value NODEPING_AGENT_IMAGE_VERSION)}"
 if ! consume_update_request; then
@@ -280,6 +300,111 @@ container_id() {
 	compose ps -q "$SERVICE" 2>/dev/null | head -n 1
 }
 
+legacy_container_id() {
+	local id candidate_server
+	id="$(container_id)"
+	if [ -n "$id" ]; then
+		printf '%s' "$id"
+		return 0
+	fi
+	for id in $(docker ps -q --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
+		candidate_server="$(container_server_url "$id")"
+		if [ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ]; then
+			printf '%s' "$id"
+			return 0
+		fi
+	done
+	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
+		candidate_server="$(container_server_url "$id")"
+		if [ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ]; then
+			printf '%s' "$id"
+			return 0
+		fi
+	done
+}
+
+container_server_url() {
+	local value
+	value="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sed -n 's/^NODEPING_SERVER_URL=//p' | tail -n 1)"
+	printf '%s' "${value%/}"
+}
+
+normalize_data_directory_permissions() {
+	install -d -m 0700 "$DATA_DIRECTORY" || return 1
+	chown 0:0 "$DATA_DIRECTORY" || return 1
+	chmod 0700 "$DATA_DIRECTORY" || return 1
+	local filename path
+	for filename in agent-id agent-token release-proxies.tsv latest-version; do
+		path="$DATA_DIRECTORY/$filename"
+		[ -e "$path" ] || continue
+		if [ ! -f "$path" ] || [ -L "$path" ]; then
+			say_err "Agent 状态路径不是普通文件：$path" "Agent state path is not a regular file: $path"
+			return 1
+		fi
+		chown 0:0 "$path" || return 1
+		chmod 0600 "$path" || return 1
+	done
+}
+
+data_directory_has_complete_identity() {
+	[ -s "$DATA_DIRECTORY/agent-id" ] && [ -s "$DATA_DIRECTORY/agent-token" ]
+}
+
+migrate_legacy_agent_state() {
+	local id="$1"
+	normalize_data_directory_permissions || return 1
+	if data_directory_has_complete_identity || [ -z "$id" ]; then
+		return 0
+	fi
+	local mount_info mount_type mount_source
+	mount_info="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/nodeping-agent"}}{{printf "%s|%s" .Type .Source}}{{end}}{{end}}' "$id" 2>/dev/null || true)"
+	mount_type="${mount_info%%|*}"
+	mount_source="${mount_info#*|}"
+	case "$mount_type" in
+		volume|bind) ;;
+		*) say_err "无法确认旧容器的 Agent 数据挂载" "could not identify the legacy Agent data mount"; return 1 ;;
+	esac
+	if [ -z "$mount_source" ] || [ "$mount_source" = "$mount_info" ]; then
+		say_err "旧容器的 Agent 数据挂载来源为空" "the legacy Agent data mount source is empty"
+		return 1
+	fi
+	if [ "$mount_source" = "$DATA_DIRECTORY" ]; then
+		say_err "当前 Agent 数据目录缺少完整的 ID 或 Token" "the current Agent data directory is missing its ID or token"
+		return 1
+	fi
+	local filename copied=0
+	for filename in agent-id agent-token release-proxies.tsv latest-version; do
+		[ -s "$DATA_DIRECTORY/$filename" ] && continue
+		if ! docker cp "$id:/var/lib/nodeping-agent/$filename" "$DATA_DIRECTORY/$filename" >/dev/null 2>&1; then
+			continue
+		fi
+		copied=$((copied + 1))
+	done
+	normalize_data_directory_permissions || return 1
+	if ! data_directory_has_complete_identity; then
+		say_err "旧容器缺少可迁移的 Agent ID 或 Token" "the legacy container does not contain a complete Agent ID and token"
+		return 1
+	fi
+	if [ "$copied" -gt 0 ]; then
+		say "已将旧 Docker 数据卷状态迁移到 $DATA_DIRECTORY" "migrated legacy Docker volume state to $DATA_DIRECTORY"
+	fi
+}
+
+cleanup_duplicate_agent_containers() {
+	local current_id="$1" id candidate_server removed=0
+	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
+		[ -n "$id" ] && [ "$id" != "$current_id" ] || continue
+		candidate_server="$(container_server_url "$id")"
+		[ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ] || continue
+		if docker rm -f "$id" >/dev/null; then
+			removed=$((removed + 1))
+		fi
+	done
+	if [ "$removed" -gt 0 ]; then
+		say "已清理 $removed 个同后端的旧重复 Agent 容器" "removed $removed duplicate legacy Agent container(s) for the same backend"
+	fi
+}
+
 container_agent_version() {
 	local id="$1"
 	if [ -n "$id" ]; then
@@ -345,6 +470,10 @@ container_agent_token() {
 		printf '%s' "$NODEPING_AGENT_TOKEN"
 		return 0
 	fi
+	if [ -r "$DATA_DIRECTORY/agent-token" ]; then
+		tr -d '[:space:]' < "$DATA_DIRECTORY/agent-token"
+		return 0
+	fi
 	if [ -n "$id" ]; then
 		docker exec "$id" sh -c 'tr -d "[:space:]" < "${NODEPING_AGENT_TOKEN_FILE:-/var/lib/nodeping-agent/agent-token}"' 2>/dev/null || true
 	fi
@@ -352,6 +481,14 @@ container_agent_token() {
 
 container_agent_id() {
 	local id="$1"
+	if [ -n "$AGENT_ID" ]; then
+		printf '%s' "$AGENT_ID"
+		return 0
+	fi
+	if [ -r "$DATA_DIRECTORY/agent-id" ]; then
+		tr -d '[:space:]' < "$DATA_DIRECTORY/agent-id"
+		return 0
+	fi
 	if [ -z "$id" ]; then
 		return 0
 	fi
@@ -399,7 +536,11 @@ emit_upgrade_event() {
 	fi
 }
 
-before_container="$(container_id)"
+before_container="$(legacy_container_id)"
+if ! migrate_legacy_agent_state "$before_container"; then
+	say_err "Agent 身份状态迁移失败，已停止更新以避免创建重复节点" "Agent identity migration failed; update stopped to avoid creating a duplicate node"
+	exit 1
+fi
 CURRENT_VERSION="$(container_agent_version "$before_container")"
 BEFORE_IMAGE_ID="$(container_image_id "$before_container")"
 BEFORE_IMAGE_REF="$(container_image_ref "$before_container")"
@@ -494,6 +635,8 @@ if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
 else
 	emit_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$NEW_VERSION" "docker deployment updated"
 fi
+
+cleanup_duplicate_agent_containers "$(container_id)"
 
 say "Docker 部署已更新" "docker deployment updated"
 compose ps "$SERVICE"

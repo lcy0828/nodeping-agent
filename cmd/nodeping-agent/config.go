@@ -25,6 +25,7 @@ func loadConfig() config {
 	flag.StringVar(&cfg.Token, "token", env("NODEPING_TOKEN", ""), "NodePing binding token")
 	flag.StringVar(&cfg.AgentToken, "agent-token", env("NODEPING_AGENT_TOKEN", ""), "NodePing agent token")
 	flag.StringVar(&cfg.AgentTokenFile, "agent-token-file", env("NODEPING_AGENT_TOKEN_FILE", defaultAgentTokenFile()), "NodePing agent token file")
+	flag.StringVar(&cfg.AgentIDFile, "agent-id-file", env("NODEPING_AGENT_ID_FILE", defaultAgentIDFile()), "NodePing agent identity file")
 	flag.StringVar(&cfg.AgentID, "agent-id", env("NODEPING_AGENT_ID", ""), "stable agent id")
 	flag.StringVar(&cfg.Name, "name", env("NODEPING_AGENT_NAME", hostname()), "agent display name")
 	flag.StringVar(&cfg.UpgradeMode, "upgrade-mode", env("NODEPING_AGENT_UPGRADE_MODE", "auto"), "remote upgrade mode: auto, request_file, systemd, script, or disabled")
@@ -59,6 +60,7 @@ func loadConfig() config {
 	cfg.Token = strings.TrimSpace(cfg.Token)
 	cfg.AgentToken = strings.TrimSpace(cfg.AgentToken)
 	cfg.AgentTokenFile = strings.TrimSpace(cfg.AgentTokenFile)
+	cfg.AgentIDFile = strings.TrimSpace(cfg.AgentIDFile)
 	cfg.AgentID = strings.TrimSpace(cfg.AgentID)
 	cfg.Name = strings.TrimSpace(cfg.Name)
 	cfg.UpgradeMode = strings.ToLower(strings.TrimSpace(cfg.UpgradeMode))
@@ -84,7 +86,7 @@ func loadConfig() config {
 	if cfg.AgentToken == "" {
 		cfg.AgentToken = readAgentTokenFile(cfg.AgentTokenFile)
 	}
-	cfg.AgentID = resolveAgentIDForConfig(cfg.AgentID, cfg.AgentToken, defaultAgentIDFile())
+	cfg.AgentID = resolveAgentIDForConfig(cfg.AgentID, cfg.AgentToken, cfg.AgentIDFile)
 	if cfg.Name == "" {
 		cfg.Name = cfg.AgentID
 	}

@@ -8,6 +8,33 @@ import (
 	"testing"
 )
 
+func writeExecutable(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func installMockChown(t *testing.T, binDirectory string) {
+	t.Helper()
+	writeExecutable(t, filepath.Join(binDirectory, "chown"), "#!/usr/bin/env bash\nexit 0\n")
+}
+
+func writeCompleteAgentIdentity(t *testing.T, dataDirectory string) {
+	t.Helper()
+	if err := os.MkdirAll(dataDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"agent-id":    "agent-test\n",
+		"agent-token": "token-test\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dataDirectory, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestUpdateDockerFallsBackToAlternateImageSource(t *testing.T) {
 	scriptPath, err := filepath.Abs("update-docker.sh")
 	if err != nil {
@@ -29,6 +56,7 @@ func TestUpdateDockerFallsBackToAlternateImageSource(t *testing.T) {
 			if err := os.Mkdir(binDirectory, 0o755); err != nil {
 				t.Fatal(err)
 			}
+			installMockChown(t, binDirectory)
 			mockDocker := `#!/usr/bin/env bash
 set -eu
 if [ "${1:-}" = "compose" ]; then
@@ -133,6 +161,8 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 	}
 	text := string(compose)
 	for _, required := range []string{
+		"name: nodeping-agent",
+		"container_name: nodeping-agent",
 		"user: \"0:0\"",
 		"no-new-privileges:true",
 		"cap_drop:\n      - ALL",
@@ -140,6 +170,8 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 		"read_only: true",
 		"NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}",
 		"NODEPING_AGENT_UPGRADE_REQUEST_FILE: ${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/run/nodeping-agent/update-request.json}",
+		"NODEPING_AGENT_ID_FILE: /var/lib/nodeping-agent/agent-id",
+		"${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-./data}:/var/lib/nodeping-agent",
 		"${NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY:-./control}:/run/nodeping-agent",
 	} {
 		if !strings.Contains(text, required) {
@@ -158,6 +190,7 @@ func TestInstallDockerConfiguresHostUpgradeWatcher(t *testing.T) {
 		"REMOTE_UPGRADE_MODE=request_file",
 		"nodeping-agent-docker-update.path",
 		"NODEPING_AGENT_DOCKER_REQUEST_FILE=$CONTROL_DIRECTORY/update-request.json",
+		"NODEPING_AGENT_DOCKER_DATA_DIRECTORY=\"%s\"",
 		"NODEPING_AGENT_UPGRADE_MODE=\"%s\"",
 		"NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY=\"%s\"",
 	} {
@@ -177,6 +210,9 @@ func TestUpdateDockerConsumesRemoteUpgradeRequest(t *testing.T) {
 	if err := os.Mkdir(binDirectory, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	installMockChown(t, binDirectory)
+	dataDirectory := filepath.Join(directory, "data")
+	writeCompleteAgentIdentity(t, dataDirectory)
 	composePath := filepath.Join(directory, "compose.yml")
 	if err := os.WriteFile(composePath, []byte("services:\n  nodeping-agent:\n    image: ${NODEPING_AGENT_IMAGE}:${NODEPING_AGENT_IMAGE_VERSION}\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -188,6 +224,7 @@ func TestUpdateDockerConsumesRemoteUpgradeRequest(t *testing.T) {
 		"NODEPING_AGENT_DOCKER_IMAGE_GLOBAL=global.example/nodeping-agent",
 		"NODEPING_AGENT_IMAGE=global.example/nodeping-agent",
 		"NODEPING_AGENT_IMAGE_VERSION=latest",
+		"NODEPING_AGENT_DOCKER_DATA_DIRECTORY=" + dataDirectory,
 		"",
 	}, "\n")
 	if err := os.WriteFile(envPath, []byte(envFile), 0o600); err != nil {
@@ -274,6 +311,9 @@ func TestUpdateDockerSyncsDefaultComposeBeforeRecreate(t *testing.T) {
 	if err := os.Mkdir(binDirectory, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	installMockChown(t, binDirectory)
+	dataDirectory := filepath.Join(directory, "data")
+	writeCompleteAgentIdentity(t, dataDirectory)
 	oldCompose := "services:\n  nodeping-agent:\n    image: ${NODEPING_AGENT_IMAGE}:${NODEPING_AGENT_IMAGE_VERSION}\n"
 	newCompose := "services:\n  nodeping-agent:\n    image: ${NODEPING_AGENT_IMAGE}:${NODEPING_AGENT_IMAGE_VERSION}\n    user: \"0:0\"\n"
 	composePath := filepath.Join(directory, "compose.yml")
@@ -292,6 +332,7 @@ func TestUpdateDockerSyncsDefaultComposeBeforeRecreate(t *testing.T) {
 		"NODEPING_AGENT_IMAGE=global.example/nodeping-agent",
 		"NODEPING_AGENT_IMAGE_VERSION=v1.2.3",
 		"NODEPING_AGENT_DEPLOY_BASE_URL=https://deploy.example/nodeping-agent",
+		"NODEPING_AGENT_DOCKER_DATA_DIRECTORY=" + dataDirectory,
 		"",
 	}, "\n")
 	if err := os.WriteFile(envPath, []byte(envFile), 0o600); err != nil {
@@ -371,5 +412,250 @@ cp "$MOCK_COMPOSE_SOURCE" "$destination"
 	}
 	if !strings.Contains(string(dockerLog), "config --quiet") || !strings.Contains(string(dockerLog), "up -d nodeping-agent") {
 		t.Fatalf("expected Compose validation and recreate, log:\n%s", dockerLog)
+	}
+}
+
+func TestUpdateDockerMigratesLegacyIdentityAndCleansSameBackendDuplicates(t *testing.T) {
+	scriptPath, err := filepath.Abs("update-docker.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	binDirectory := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installMockChown(t, binDirectory)
+
+	dataDirectory := filepath.Join(directory, "data")
+	legacyStateDirectory := filepath.Join(directory, "legacy-state")
+	if err := os.Mkdir(legacyStateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyFiles := map[string]string{
+		"agent-id":            "agent-legacy\n",
+		"agent-token":         "token-legacy\n",
+		"release-proxies.tsv": "https://proxy.example/\n",
+		"latest-version":      "v0.0.28\n",
+	}
+	for name, value := range legacyFiles {
+		if err := os.WriteFile(filepath.Join(legacyStateDirectory, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	composePath := filepath.Join(directory, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  nodeping-agent:\n    image: ${NODEPING_AGENT_IMAGE}:${NODEPING_AGENT_IMAGE_VERSION}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(directory, ".env")
+	envFile := strings.Join([]string{
+		"NODEPING_SERVER_URL=https://agent.example",
+		"NODEPING_AGENT_DISTRIBUTION_MODE=global",
+		"NODEPING_AGENT_DOCKER_IMAGE_CN=cn.example/nodeping-agent",
+		"NODEPING_AGENT_DOCKER_IMAGE_GLOBAL=global.example/nodeping-agent",
+		"NODEPING_AGENT_IMAGE=global.example/nodeping-agent",
+		"NODEPING_AGENT_IMAGE_VERSION=v1.2.3",
+		"NODEPING_AGENT_DOCKER_DATA_DIRECTORY=" + dataDirectory,
+		"",
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(envFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mockDocker := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+if [ "${1:-}" = "compose" ]; then
+	case " $* " in
+		*" ps -q "*)
+			if [ -f "$MOCK_CURRENT_STATE" ]; then printf 'current-container\n'; fi
+			;;
+		*" up "*) touch "$MOCK_CURRENT_STATE" ;;
+		*" ps "*) printf 'nodeping-agent running\n' ;;
+	esac
+	exit 0
+fi
+if [ "${1:-}" = "ps" ]; then
+	case " $* " in
+		*" -aq "*)
+			if [ -f "$MOCK_CURRENT_STATE" ]; then
+				printf 'current-container\nduplicate-same\nduplicate-other\n'
+			else
+				printf 'legacy-container\n'
+			fi
+			;;
+	esac
+	exit 0
+fi
+if [ "${1:-}" = "cp" ]; then
+	filename="${2##*/}"
+	cp "$MOCK_LEGACY_STATE/$filename" "$3"
+	exit 0
+fi
+if [ "${1:-}" = "exec" ]; then
+	case " $* " in
+		*" -version "*) printf 'nodeping-agent version=v1.2.3 commit=test\n' ;;
+	esac
+	exit 0
+fi
+	if [ "${1:-}" = "inspect" ]; then
+		container="${*: -1}"
+		case " $* " in
+			*".Mounts"*) printf 'volume|/var/lib/docker/volumes/legacy/_data\n' ;;
+		*"State.Running"*) printf 'true none\n' ;;
+		*".Config.Image"*) printf 'global.example/nodeping-agent:v1.2.3\n' ;;
+			*".Config.Env"*)
+				case "$container" in
+					legacy-container) printf 'NODEPING_SERVER_URL=https://agent.example\n' ;;
+					duplicate-same) printf 'NODEPING_SERVER_URL=https://agent.example/\n' ;;
+				duplicate-other) printf 'NODEPING_SERVER_URL=https://other.example\n' ;;
+			esac
+			;;
+		*) printf 'sha256:test\n' ;;
+	esac
+	exit 0
+fi
+exit 0
+`
+	writeExecutable(t, filepath.Join(binDirectory, "docker"), mockDocker)
+
+	logPath := filepath.Join(directory, "docker.log")
+	currentStatePath := filepath.Join(directory, "current.state")
+	command := exec.Command("bash", scriptPath)
+	command.Dir = directory
+	command.Env = append(os.Environ(),
+		"PATH="+binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"ENV_FILE="+envPath,
+		"PROJECT_DIRECTORY="+directory,
+		"COMPOSE_FILE="+composePath,
+		"MOCK_DOCKER_LOG="+logPath,
+		"MOCK_CURRENT_STATE="+currentStatePath,
+		"MOCK_LEGACY_STATE="+legacyStateDirectory,
+		"NODEPING_AGENT_DOCKER_UPDATE_TIMEOUT_SECONDS=5",
+		"NODEPING_AGENT_DOCKER_READINESS_STABLE_SECONDS=1",
+		"NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS=5",
+		"NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT=0",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("update-docker.sh failed: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "migrated legacy Docker volume state") {
+		t.Fatalf("migration was not reported:\n%s", output)
+	}
+	for name, want := range legacyFiles {
+		content, err := os.ReadFile(filepath.Join(dataDirectory, name))
+		if err != nil {
+			t.Fatalf("read migrated %s: %v", name, err)
+		}
+		if string(content) != want {
+			t.Fatalf("migrated %s = %q, want %q", name, content, want)
+		}
+		info, err := os.Stat(filepath.Join(dataDirectory, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("migrated %s mode = %o, want 600", name, info.Mode().Perm())
+		}
+	}
+	dockerLog, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(dockerLog)
+	if !strings.Contains(logText, "rm -f duplicate-same") {
+		t.Fatalf("same-backend duplicate was not removed:\n%s", logText)
+	}
+	if strings.Contains(logText, "rm -f duplicate-other") {
+		t.Fatalf("different-backend container was removed:\n%s", logText)
+	}
+}
+
+func TestUpdateDockerStopsWhenLegacyIdentityIsIncomplete(t *testing.T) {
+	scriptPath, err := filepath.Abs("update-docker.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	binDirectory := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	installMockChown(t, binDirectory)
+	legacyStateDirectory := filepath.Join(directory, "legacy-state")
+	if err := os.Mkdir(legacyStateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyStateDirectory, "agent-id"), []byte("agent-legacy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dataDirectory := filepath.Join(directory, "data")
+	composePath := filepath.Join(directory, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  nodeping-agent:\n    image: test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(directory, ".env")
+	envFile := strings.Join([]string{
+		"NODEPING_AGENT_DISTRIBUTION_MODE=global",
+		"NODEPING_AGENT_DOCKER_IMAGE_CN=cn.example/nodeping-agent",
+		"NODEPING_AGENT_DOCKER_IMAGE_GLOBAL=global.example/nodeping-agent",
+		"NODEPING_AGENT_IMAGE=global.example/nodeping-agent",
+		"NODEPING_AGENT_IMAGE_VERSION=v1.2.3",
+		"NODEPING_AGENT_DOCKER_DATA_DIRECTORY=" + dataDirectory,
+		"",
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(envFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mockDocker := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+if [ "${1:-}" = "compose" ]; then
+	case " $* " in *" ps -q "*) printf 'legacy-container\n' ;; esac
+	exit 0
+fi
+if [ "${1:-}" = "inspect" ]; then
+	case " $* " in *".Mounts"*) printf 'volume|/var/lib/docker/volumes/legacy/_data\n' ;; esac
+	exit 0
+fi
+if [ "${1:-}" = "cp" ]; then
+	filename="${2##*/}"
+	[ -f "$MOCK_LEGACY_STATE/$filename" ] || exit 1
+	cp "$MOCK_LEGACY_STATE/$filename" "$3"
+	exit 0
+fi
+exit 0
+`
+	writeExecutable(t, filepath.Join(binDirectory, "docker"), mockDocker)
+	logPath := filepath.Join(directory, "docker.log")
+	command := exec.Command("bash", scriptPath)
+	command.Dir = directory
+	command.Env = append(os.Environ(),
+		"PATH="+binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"ENV_FILE="+envPath,
+		"PROJECT_DIRECTORY="+directory,
+		"COMPOSE_FILE="+composePath,
+		"MOCK_DOCKER_LOG="+logPath,
+		"MOCK_LEGACY_STATE="+legacyStateDirectory,
+		"NODEPING_AGENT_DOCKER_UPDATE_TIMEOUT_SECONDS=5",
+		"NODEPING_AGENT_DOCKER_READINESS_STABLE_SECONDS=1",
+		"NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS=5",
+		"NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT=0",
+	)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("update unexpectedly succeeded:\n%s", output)
+	}
+	if !strings.Contains(string(output), "update stopped to avoid creating a duplicate node") {
+		t.Fatalf("missing fail-closed error:\n%s", output)
+	}
+	dockerLog, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(dockerLog), " pull ") || strings.Contains(string(dockerLog), " up ") {
+		t.Fatalf("container update started despite incomplete identity:\n%s", dockerLog)
 	}
 }
