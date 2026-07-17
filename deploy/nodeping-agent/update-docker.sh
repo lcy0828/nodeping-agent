@@ -12,9 +12,11 @@ UPDATE_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_UPDATE_TIMEOUT_SECONDS:-90}"
 PULL_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS:-300}"
 READINESS_STABLE_SECONDS="${NODEPING_AGENT_DOCKER_READINESS_STABLE_SECONDS:-10}"
 ALLOW_DOWNGRADE="${NODEPING_AGENT_ALLOW_DOWNGRADE:-0}"
+UPDATE_REQUEST_FILE="${NODEPING_AGENT_DOCKER_REQUEST_FILE:-$PROJECT_DIRECTORY/control/update-request.json}"
 EVENT_TOKEN=""
 PREVIOUS_COMPOSE_FILE=""
 COMPOSE_UPDATED=0
+ORIGINAL_IMAGE_VERSION=""
 
 say() {
 	printf '%s / %s\n' "$1" "$2"
@@ -65,6 +67,40 @@ set_dotenv_value() {
 	' "$ENV_FILE" > "$temporary"
 	chmod 0600 "$temporary"
 	mv -f "$temporary" "$ENV_FILE"
+}
+
+json_file_value() {
+	local file="$1" key="$2"
+	sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
+}
+
+normalize_requested_image_tag() {
+	local value="$1"
+	value="${value#nodeping-agent/}"
+	if [ "$value" = "latest" ]; then
+		printf '%s' "$value"
+		return 0
+	fi
+	case "$value" in
+		v[0-9]*.[0-9]*.[0-9]*) printf '%s' "$value" ;;
+		[0-9]*.[0-9]*.[0-9]*) printf 'v%s' "$value" ;;
+		*) printf '%s' "$value" ;;
+	esac
+}
+
+consume_update_request() {
+	[ -r "$UPDATE_REQUEST_FILE" ] || return 0
+	local requested
+	requested="$(json_file_value "$UPDATE_REQUEST_FILE" version || true)"
+	rm -f "$UPDATE_REQUEST_FILE"
+	requested="$(normalize_requested_image_tag "$requested")"
+	case "$requested" in
+		''|*[!A-Za-z0-9._-]*)
+			say_err "Docker 升级请求中的版本无效" "Docker upgrade request contains an invalid version"
+			return 1
+			;;
+	esac
+	set_dotenv_value NODEPING_AGENT_IMAGE_VERSION "$requested"
 }
 
 download_file() {
@@ -156,7 +192,11 @@ case "$ALLOW_DOWNGRADE" in 0|1) ;; *) say_err "NODEPING_AGENT_ALLOW_DOWNGRADE �
 
 cd "$PROJECT_DIRECTORY"
 
-TARGET_TAG="${NODEPING_AGENT_IMAGE_VERSION:-$(dotenv_value NODEPING_AGENT_IMAGE_VERSION)}"
+ORIGINAL_IMAGE_VERSION="${NODEPING_AGENT_IMAGE_VERSION:-$(dotenv_value NODEPING_AGENT_IMAGE_VERSION)}"
+if ! consume_update_request; then
+	exit 2
+fi
+TARGET_TAG="$(dotenv_value NODEPING_AGENT_IMAGE_VERSION)"
 TARGET_TAG="${TARGET_TAG:-latest}"
 TARGET_VERSION="$TARGET_TAG"
 if [ "$TARGET_TAG" != "latest" ]; then
@@ -315,7 +355,13 @@ container_agent_id() {
 	if [ -z "$id" ]; then
 		return 0
 	fi
-	docker exec "$id" /bin/sh -c 'printf "%s" "$NODEPING_AGENT_ID"' 2>/dev/null || true
+	docker exec "$id" /bin/sh -c '
+		if [ -n "${NODEPING_AGENT_ID:-}" ]; then
+			printf "%s" "$NODEPING_AGENT_ID"
+		elif [ -r /var/lib/nodeping-agent/agent-id ]; then
+			tr -d "[:space:]" < /var/lib/nodeping-agent/agent-id
+		fi
+	' 2>/dev/null || true
 }
 
 json_escape() {
@@ -367,6 +413,7 @@ restore_original_image() {
 	fi
 	image="${image:-$PRIMARY_IMAGE}"
 	select_image "$image"
+	set_dotenv_value NODEPING_AGENT_IMAGE_VERSION "${ORIGINAL_IMAGE_VERSION:-latest}"
 }
 
 rollback_docker() {

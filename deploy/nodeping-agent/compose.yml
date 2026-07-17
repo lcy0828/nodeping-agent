@@ -30,8 +30,10 @@ services:
       NODEPING_CONCURRENCY: ${NODEPING_CONCURRENCY:-10}
       NODEPING_SHUTDOWN_DRAIN_TIMEOUT: ${NODEPING_SHUTDOWN_DRAIN_TIMEOUT:-15s}
       NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}
+      NODEPING_AGENT_UPGRADE_REQUEST_FILE: ${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/run/nodeping-agent/update-request.json}
     volumes:
       - nodeping-agent-data:/var/lib/nodeping-agent
+      - ${NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY:-./control}:/run/nodeping-agent
     logging:
       driver: json-file
       options:

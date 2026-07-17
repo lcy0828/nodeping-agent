@@ -34,55 +34,55 @@ func checkUpgradeControl(cfg config) doctorCheck {
 	mode := normalizeUpgradeMode(cfg.UpgradeMode)
 	switch mode {
 	case "disabled":
-		return doctorCheck{Name: "upgrade control", Status: "warn", Message: "remote upgrade is disabled"}
+		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "warn", Message: "remote upgrade is disabled"}
 	case "request_file":
 		if cfg.UpgradeRequestFile == "" {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: "NODEPING_AGENT_UPGRADE_REQUEST_FILE is empty"}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: "NODEPING_AGENT_UPGRADE_REQUEST_FILE is empty"}
 		}
 		dir := filepath.Dir(cfg.UpgradeRequestFile)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: err.Error()}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: err.Error()}
 		}
 		testPath := cfg.UpgradeRequestFile + ".doctor"
 		if err := os.WriteFile(testPath, []byte("ok\n"), 0o600); err != nil {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: err.Error()}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: err.Error()}
 		}
 		_ = os.Remove(testPath)
-		return doctorCheck{Name: "upgrade control", Status: "ok", Message: "request file " + cfg.UpgradeRequestFile}
+		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "request file " + cfg.UpgradeRequestFile}
 	case "systemd":
 		if cfg.UpgradeUnit == "" {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: "NODEPING_AGENT_UPGRADE_UNIT is empty"}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: "NODEPING_AGENT_UPGRADE_UNIT is empty"}
 		}
 		if _, err := exec.LookPath("systemctl"); err != nil {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: "systemctl not found"}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: "systemctl not found"}
 		}
-		return doctorCheck{Name: "upgrade control", Status: "ok", Message: "systemd unit " + cfg.UpgradeUnit}
+		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "systemd unit " + cfg.UpgradeUnit}
 	case "script":
 		path, err := fixedUpgradeScriptPath(cfg.UpgradeScript)
 		if err != nil {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: err.Error()}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: err.Error()}
 		}
 		if info, err := os.Stat(path); err != nil {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: err.Error()}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: err.Error()}
 		} else if info.IsDir() || info.Mode()&0o111 == 0 {
-			return doctorCheck{Name: "upgrade control", Status: "fail", Message: "upgrade script is not executable"}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: "upgrade script is not executable"}
 		}
-		return doctorCheck{Name: "upgrade control", Status: "ok", Message: path}
+		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: path}
 	default:
 		if cfg.UpgradeRequestFile != "" && systemdUnitIsActive(upgradePathUnitName(cfg.UpgradeUnit)) {
-			return doctorCheck{Name: "upgrade control", Status: "ok", Message: "auto request file " + cfg.UpgradeRequestFile}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "auto request file " + cfg.UpgradeRequestFile}
 		}
 		if _, err := exec.LookPath("systemctl"); err == nil && cfg.UpgradeUnit != "" {
-			return doctorCheck{Name: "upgrade control", Status: "ok", Message: "auto systemd unit " + cfg.UpgradeUnit}
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "auto systemd unit " + cfg.UpgradeUnit}
 		}
 		if cfg.UpgradeScript != "" {
 			if path, err := fixedUpgradeScriptPath(cfg.UpgradeScript); err == nil {
 				if info, statErr := os.Stat(path); statErr == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
-					return doctorCheck{Name: "upgrade control", Status: "ok", Message: "auto script " + path}
+					return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "auto script " + path}
 				}
 			}
 		}
-		return doctorCheck{Name: "upgrade control", Status: "warn", Message: "remote upgrade is not configured; set NODEPING_AGENT_UPGRADE_MODE=request_file for systemd installs"}
+		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "warn", Message: "remote upgrade is not configured; set NODEPING_AGENT_UPGRADE_MODE=request_file for systemd installs"}
 	}
 }
 

@@ -138,10 +138,129 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 		"cap_drop:\n      - ALL",
 		"cap_add:\n      - NET_RAW",
 		"read_only: true",
+		"NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}",
+		"NODEPING_AGENT_UPGRADE_REQUEST_FILE: ${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/run/nodeping-agent/update-request.json}",
+		"${NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY:-./control}:/run/nodeping-agent",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("compose.yml missing %q", required)
 		}
+	}
+}
+
+func TestInstallDockerConfiguresHostUpgradeWatcher(t *testing.T) {
+	installer, err := os.ReadFile("install-docker.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(installer)
+	for _, required := range []string{
+		"REMOTE_UPGRADE_MODE=request_file",
+		"nodeping-agent-docker-update.path",
+		"NODEPING_AGENT_DOCKER_REQUEST_FILE=$CONTROL_DIRECTORY/update-request.json",
+		"NODEPING_AGENT_UPGRADE_MODE=\"%s\"",
+		"NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY=\"%s\"",
+	} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("install-docker.sh missing %q", required)
+		}
+	}
+}
+
+func TestUpdateDockerConsumesRemoteUpgradeRequest(t *testing.T) {
+	scriptPath, err := filepath.Abs("update-docker.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	binDirectory := filepath.Join(directory, "bin")
+	if err := os.Mkdir(binDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(directory, "compose.yml")
+	if err := os.WriteFile(composePath, []byte("services:\n  nodeping-agent:\n    image: ${NODEPING_AGENT_IMAGE}:${NODEPING_AGENT_IMAGE_VERSION}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(directory, ".env")
+	envFile := strings.Join([]string{
+		"NODEPING_AGENT_DISTRIBUTION_MODE=global",
+		"NODEPING_AGENT_DOCKER_IMAGE_CN=cn.example/nodeping-agent",
+		"NODEPING_AGENT_DOCKER_IMAGE_GLOBAL=global.example/nodeping-agent",
+		"NODEPING_AGENT_IMAGE=global.example/nodeping-agent",
+		"NODEPING_AGENT_IMAGE_VERSION=latest",
+		"",
+	}, "\n")
+	if err := os.WriteFile(envPath, []byte(envFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requestPath := filepath.Join(directory, "update-request.json")
+	if err := os.WriteFile(requestPath, []byte("{\"version\":\"0.0.27\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(directory, "version.state")
+	if err := os.WriteFile(statePath, []byte("v0.0.26\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mockDocker := `#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
+if [ "${1:-}" = "compose" ]; then
+	case " $* " in
+		*" ps -q "*) printf 'container-test\n' ;;
+		*" up "*) sed -n 's/^NODEPING_AGENT_IMAGE_VERSION=//p' "$MOCK_ENV_FILE" | tail -n 1 > "$MOCK_VERSION_STATE" ;;
+		*" ps "*) printf 'nodeping-agent running\n' ;;
+	esac
+	exit 0
+fi
+if [ "${1:-}" = "exec" ]; then
+	case " $* " in
+		*" -version "*) printf 'nodeping-agent version=%s commit=test\n' "$(cat "$MOCK_VERSION_STATE")" ;;
+	esac
+	exit 0
+fi
+if [ "${1:-}" = "inspect" ]; then
+	case " $* " in
+		*"State.Running"*) printf 'true none\n' ;;
+		*".Config.Image"*) printf 'global.example/nodeping-agent:v0.0.26\n' ;;
+		*) printf 'sha256:test\n' ;;
+	esac
+	exit 0
+fi
+exit 0
+`
+	mockPath := filepath.Join(binDirectory, "docker")
+	if err := os.WriteFile(mockPath, []byte(mockDocker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(directory, "docker.log")
+	command := exec.Command("bash", scriptPath)
+	command.Dir = directory
+	command.Env = append(os.Environ(),
+		"PATH="+binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"ENV_FILE="+envPath,
+		"PROJECT_DIRECTORY="+directory,
+		"COMPOSE_FILE="+composePath,
+		"NODEPING_AGENT_DOCKER_REQUEST_FILE="+requestPath,
+		"MOCK_DOCKER_LOG="+logPath,
+		"MOCK_ENV_FILE="+envPath,
+		"MOCK_VERSION_STATE="+statePath,
+		"NODEPING_AGENT_DOCKER_UPDATE_TIMEOUT_SECONDS=5",
+		"NODEPING_AGENT_DOCKER_READINESS_STABLE_SECONDS=1",
+		"NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS=5",
+		"NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT=0",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("update-docker.sh failed: %v\n%s", err, output)
+	}
+	updatedEnv, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updatedEnv), "NODEPING_AGENT_IMAGE_VERSION=v0.0.27\n") {
+		t.Fatalf("requested image version was not persisted:\n%s", updatedEnv)
+	}
+	if _, err := os.Stat(requestPath); !os.IsNotExist(err) {
+		t.Fatalf("upgrade request was not consumed: %v", err)
 	}
 }
 
