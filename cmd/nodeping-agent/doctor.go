@@ -65,6 +65,7 @@ func collectDependencySnapshot(ctx context.Context, cfg config) doctorSnapshot {
 		checkMTRCommand(ctx),
 		checkDNS(ctx),
 		checkAgentTokenFile(cfg),
+		checkUpgradeControl(cfg),
 	}
 	return doctorSnapshotFromChecks(checks, cfg)
 }

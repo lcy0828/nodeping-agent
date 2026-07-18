@@ -411,6 +411,8 @@ func TestAgentTokenCanContinueWhenBindingTokenInvalid(t *testing.T) {
 }
 
 func TestRegisterAgentReportsServerURL(t *testing.T) {
+	resetDependencySnapshotCacheForTest(t)
+
 	var payload map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/agent/v1/register" {
@@ -433,6 +435,7 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 		AgentID:     "agent-test",
 		Name:        "agent-test",
 		Version:     "nodeping-agent/test",
+		UpgradeMode: "disabled",
 		Concurrency: 7,
 		HTTPClient:  server.Client(),
 	})
@@ -467,6 +470,7 @@ func TestRegisterAgentReportsServerURL(t *testing.T) {
 	if checks, ok := dependencies["checks"].([]any); !ok || len(checks) == 0 {
 		t.Fatalf("dependency status checks missing: %+v", dependencies)
 	}
+	requireDependencyCheckStatus(t, dependencies, "upgrade_control", "warn")
 }
 
 func TestNormalizeAgentTaskConcurrency(t *testing.T) {
@@ -671,6 +675,37 @@ func stringSliceContains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func requireDependencyCheckStatus(t *testing.T, dependencies map[string]any, key string, wantStatus string) {
+	t.Helper()
+	checks, ok := dependencies["checks"].([]any)
+	if !ok {
+		t.Fatalf("dependency status checks type = %T, want []any: %+v", dependencies["checks"], dependencies)
+	}
+	for _, raw := range checks {
+		check, ok := raw.(map[string]any)
+		if !ok || check["key"] != key {
+			continue
+		}
+		if check["status"] != wantStatus {
+			t.Fatalf("dependency check %q status = %#v, want %q: %+v", key, check["status"], wantStatus, check)
+		}
+		return
+	}
+	t.Fatalf("dependency check %q missing: %+v", key, checks)
+}
+
+func resetDependencySnapshotCacheForTest(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		dependencySnapshotCache.Lock()
+		dependencySnapshotCache.snapshot = doctorSnapshot{}
+		dependencySnapshotCache.expires = time.Time{}
+		dependencySnapshotCache.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
 }
 
 func TestRunAgentUpgradeWritesRequestFile(t *testing.T) {
@@ -1471,35 +1506,77 @@ OUT
 	}
 }
 
+type triggeredDeadlineContext struct {
+	context.Context
+	done <-chan struct{}
+}
+
+func (c triggeredDeadlineContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c triggeredDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 func TestRunMTRRawReturnsPartialResultOnTimeout(t *testing.T) {
 	dir := t.TempDir()
 	mtrPath := filepath.Join(dir, "mtr")
+	readyPath := filepath.Join(dir, "ready")
+	t.Setenv("NODEPING_TEST_MTR_READY_FILE", readyPath)
 	script := `#!/usr/bin/env sh
-cat <<'OUT'
-x 0 1
-h 0 192.0.2.1
-p 0 1000 1
-OUT
-exec sleep 5
+printf '%s\n' 'x 0 1' 'h 0 192.0.2.1' 'p 0 1000 1'
+: > "$NODEPING_TEST_MTR_READY_FILE"
+exec sleep 30
 `
 	if err := os.WriteFile(mtrPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake mtr: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	started := time.Now()
-	result, _, err := runMTRRaw(ctx, &mtrRunConfig{
+	deadline := make(chan struct{})
+	readyResult := make(chan error, 1)
+	go func() {
+		waitUntil := time.Now().Add(5 * time.Second)
+		for {
+			_, err := os.Stat(readyPath)
+			if err == nil {
+				readyResult <- nil
+				close(deadline)
+				return
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				readyResult <- err
+				close(deadline)
+				return
+			}
+			if time.Now().After(waitUntil) {
+				readyResult <- errors.New("fake mtr did not write readiness marker")
+				close(deadline)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	ctx := triggeredDeadlineContext{Context: context.Background(), done: deadline}
+	result, raw, err := runMTRRaw(ctx, &mtrRunConfig{
 		Target:       "192.0.2.1",
 		Path:         mtrPath,
 		ReportCycles: 5,
 		MaxHops:      8,
 		Protocol:     "icmp",
 	}, nil)
+	if readyErr := <-readyResult; readyErr != nil {
+		t.Fatal(readyErr)
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context deadline", err)
 	}
-	if time.Since(started) > 2*time.Second {
-		t.Fatalf("timeout took too long: %s", time.Since(started))
+	if !bytes.Contains(raw, []byte("x 0 1")) || !bytes.Contains(raw, []byte("p 0 1000 1")) {
+		t.Fatalf("raw output was lost after timeout: %q", raw)
 	}
 	if result == nil || result["completed_count"] != 1 || result["stopped_early"] != true {
 		t.Fatalf("partial result = %+v", result)

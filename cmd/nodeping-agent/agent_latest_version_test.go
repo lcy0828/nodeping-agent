@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -88,16 +89,23 @@ func TestPersistAgentLatestVersionNormalizesAndPreservesLastGood(t *testing.T) {
 }
 
 func TestHeartbeatPersistsReleaseMetadata(t *testing.T) {
-	heartbeatReceived := make(chan struct{}, 1)
+	resetDependencySnapshotCacheForTest(t)
+
+	heartbeatReceived := make(chan map[string]any, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/agent/v1/heartbeat" {
 			http.NotFound(w, r)
 			return
 		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"latest_version":"v2.3.4","release_proxies":[{"id":7,"name":"GHFast","base_url":"https://ghfast.top/","mode":"query","query_param":"q","priority":400}]}`)
 		select {
-		case heartbeatReceived <- struct{}{}:
+		case heartbeatReceived <- payload:
 		default:
 		}
 	}))
@@ -111,14 +119,16 @@ func TestHeartbeatPersistsReleaseMetadata(t *testing.T) {
 	go func() {
 		defer close(done)
 		heartbeatLoop(ctx, config{
-			ServerURL:         server.URL,
-			AgentID:           "agent-test",
-			AgentToken:        "agent-token",
-			Version:           "nodeping-agent/test",
-			HeartbeatInterval: time.Hour,
-			LatestVersionFile: latestPath,
-			ReleaseProxyFile:  proxyPath,
-			HTTPClient:        server.Client(),
+			ServerURL:          server.URL,
+			AgentID:            "agent-test",
+			AgentToken:         "agent-token",
+			Version:            "nodeping-agent/test",
+			UpgradeMode:        "request_file",
+			UpgradeRequestFile: filepath.Join(dir, "control", "update-request.json"),
+			HeartbeatInterval:  time.Hour,
+			LatestVersionFile:  latestPath,
+			ReleaseProxyFile:   proxyPath,
+			HTTPClient:         server.Client(),
 		})
 	}()
 	defer func() {
@@ -127,7 +137,12 @@ func TestHeartbeatPersistsReleaseMetadata(t *testing.T) {
 	}()
 
 	select {
-	case <-heartbeatReceived:
+	case payload := <-heartbeatReceived:
+		dependencies, ok := payload["dependency_status"].(map[string]any)
+		if !ok {
+			t.Fatalf("dependency_status missing from heartbeat payload: %+v", payload)
+		}
+		requireDependencyCheckStatus(t, dependencies, "upgrade_control", "ok")
 	case <-time.After(10 * time.Second):
 		t.Fatal("heartbeat request was not received")
 	}
