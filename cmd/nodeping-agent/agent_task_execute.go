@@ -118,9 +118,9 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 			response["response_ip"] = responseIP
 		}
 	case "http_request":
-		target, method, headers, body := httpRequestPayload(payload)
+		target, method, headers, body, publishIPSourceResponseBody := httpRequestPayload(payload)
 		targetSummary = target
-		latency, responseIP, response, err = runHTTPRequest(ctx, method, target, headers, body, task.Options)
+		latency, responseIP, response, err = runHTTPRequestForTask(ctx, method, target, headers, body, task.Options, publishIPSourceResponseBody)
 	case "http3_check":
 		target, http3Options := http3CheckPayload(payload)
 		targetSummary = target
@@ -328,7 +328,7 @@ func isBlankAny(value any) bool {
 	return value == nil || text == "" || text == "<nil>"
 }
 
-func httpRequestPayload(payload map[string]any) (string, string, map[string]string, string) {
+func httpRequestPayload(payload map[string]any) (string, string, map[string]string, string, bool) {
 	raw, _ := payload["http_request"].(map[string]any)
 	if raw == nil {
 		raw = payload
@@ -345,7 +345,8 @@ func httpRequestPayload(payload map[string]any) (string, string, map[string]stri
 	if raw["body"] != nil {
 		body = fmt.Sprint(raw["body"])
 	}
-	return target, method, headers, body
+	publishIPSourceResponseBody := boolOptionDefault(raw, "publish_ip_source_response_body", false)
+	return target, method, headers, body, publishIPSourceResponseBody
 }
 
 func httpPingPayload(payload map[string]any) (string, map[string]any) {

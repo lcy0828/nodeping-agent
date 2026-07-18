@@ -14,16 +14,26 @@ import (
 	"time"
 )
 
+const maxPublishedIPSourceResponseBodyBytes = 64 << 10
+
 func runHTTPPing(ctx context.Context, target string, options map[string]any) (float64, string, error) {
 	latency, responseIP, _, err := runHTTPRequest(ctx, http.MethodGet, target, nil, "", options)
 	return latency, responseIP, err
 }
 
 func runHTTPRequest(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any) (float64, string, map[string]any, error) {
-	return runHTTPRequestWithResolver(ctx, method, target, headers, body, options, newProbeTargetResolver(options))
+	return runHTTPRequestForTask(ctx, method, target, headers, body, options, false)
 }
 
 func runHTTPRequestWithResolver(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any, resolver *probeTargetResolver) (float64, string, map[string]any, error) {
+	return runHTTPRequestWithResponsePolicy(ctx, method, target, headers, body, options, resolver, false)
+}
+
+func runHTTPRequestForTask(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any, publishIPSourceResponseBody bool) (float64, string, map[string]any, error) {
+	return runHTTPRequestWithResponsePolicy(ctx, method, target, headers, body, options, newProbeTargetResolver(options), publishIPSourceResponseBody)
+}
+
+func runHTTPRequestWithResponsePolicy(ctx context.Context, method string, target string, headers map[string]string, body string, options map[string]any, resolver *probeTargetResolver, publishIPSourceResponseBody bool) (float64, string, map[string]any, error) {
 	if method == "" {
 		method = http.MethodGet
 	}
@@ -62,6 +72,9 @@ func runHTTPRequestWithResolver(ctx context.Context, method string, target strin
 	if maxBodyBytes > 1<<20 {
 		maxBodyBytes = 1 << 20
 	}
+	if publishIPSourceResponseBody && maxBodyBytes > maxPublishedIPSourceResponseBodyBytes {
+		maxBodyBytes = maxPublishedIPSourceResponseBodyBytes
+	}
 	bodyLimit := int64(maxBodyBytes)
 	readBody, _ := io.ReadAll(io.LimitReader(resp.Body, bodyLimit+1))
 	latency := elapsedMS(started)
@@ -79,6 +92,13 @@ func runHTTPRequestWithResolver(ctx context.Context, method string, target strin
 		"status_code":  resp.StatusCode,
 		"http_request": latency,
 		"body_bytes":   len(readBody),
+	}
+	bodyForResult := readBody
+	if len(bodyForResult) > maxBodyBytes {
+		bodyForResult = bodyForResult[:maxBodyBytes]
+	}
+	if publishIPSourceResponseBody && len(bodyForResult) > 0 {
+		result["body"] = string(bodyForResult)
 	}
 	if boolOptionDefault(options, "extract_public_ips", false) {
 		if publicIPs := extractPublicIPsFromHTTPBody(readBody); len(publicIPs) > 0 {

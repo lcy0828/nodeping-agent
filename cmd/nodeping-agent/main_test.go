@@ -1104,6 +1104,25 @@ func TestRunHTTPRequestExtractsPublicIPsWithoutReturningBody(t *testing.T) {
 	}
 }
 
+func TestRunHTTPRequestPublishesBoundedBodyForInternalSourceProbe(t *testing.T) {
+	body := strings.Repeat("x", maxPublishedIPSourceResponseBodyBytes+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	_, _, result, err := runHTTPRequestForTask(context.Background(), http.MethodGet, server.URL, nil, "", trustedPrivateTaskOptions(map[string]any{
+		"max_body_bytes": 1 << 20,
+	}), true)
+	if err != nil {
+		t.Fatalf("runHTTPRequest: %v", err)
+	}
+	publishedBody, _ := result["body"].(string)
+	if len(publishedBody) != maxPublishedIPSourceResponseBodyBytes || result["body_truncated"] != true || result["body_bytes"] != maxPublishedIPSourceResponseBodyBytes {
+		t.Fatalf("unexpected published body result: %+v", result)
+	}
+}
+
 func TestExtractPublicIPsFromHTTPBodySupportsCommonEchoFormats(t *testing.T) {
 	body := []byte("当前 IP：220.196.237.31 来自中国\n{\"ip\":\"2606:4700:4700::1111\"}\n")
 	got := extractPublicIPsFromHTTPBody(body)
@@ -1225,6 +1244,52 @@ func TestExecuteTaskHTTPRequestFailureKeepsResponseIP(t *testing.T) {
 	}
 	if result.ResponseIP != serverIP || result.Result["response_ip"] != serverIP {
 		t.Fatalf("response IP = %q result=%+v, want %q", result.ResponseIP, result.Result, serverIP)
+	}
+}
+
+func TestExecuteTaskHTTPRequestPublishesBodyOnlyFromInternalPayloadPolicy(t *testing.T) {
+	const responseBody = `{"code":200,"data":{"address":{"country":"中国","city":"上海"}}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(responseBody))
+	}))
+	defer server.Close()
+
+	makePayload := func(publish bool) json.RawMessage {
+		request := map[string]any{
+			"url":    server.URL,
+			"method": http.MethodGet,
+		}
+		if publish {
+			request["publish_ip_source_response_body"] = true
+		}
+		payload, _ := json.Marshal(map[string]any{"http_request": request})
+		return payload
+	}
+	options := trustedPrivateTaskOptions(map[string]any{
+		"max_body_bytes":                  65536,
+		"publish_ip_source_response_body": true,
+	})
+	genericResult := executeTask(context.Background(), config{}, taskRequest{
+		ID:       "http-request-generic-body-policy",
+		TaskType: "http_request",
+		Payload:  makePayload(false),
+		Options:  options,
+	})
+	if !genericResult.Success {
+		t.Fatalf("generic executeTask failed: %+v", genericResult)
+	}
+	if _, exists := genericResult.Result["body"]; exists {
+		t.Fatalf("generic task option published response body: %+v", genericResult.Result)
+	}
+
+	internalResult := executeTask(context.Background(), config{}, taskRequest{
+		ID:       "http-request-internal-body-policy",
+		TaskType: "http_request",
+		Payload:  makePayload(true),
+		Options:  options,
+	})
+	if !internalResult.Success || internalResult.Result["body"] != responseBody {
+		t.Fatalf("internal source response body was not published: %+v", internalResult)
 	}
 }
 
