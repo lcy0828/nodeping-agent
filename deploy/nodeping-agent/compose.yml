@@ -5,14 +5,13 @@ services:
     container_name: nodeping-agent
     image: ${NODEPING_AGENT_IMAGE:-hub.ilatency.com/ghcr.io/lcy0828/nodeping-agent}:${NODEPING_AGENT_IMAGE_VERSION:-latest}
     restart: unless-stopped
+    init: true
     # Root keeps NET_RAW effective even when the host restricts ping_group_range.
-    # Every other capability is dropped and privilege escalation remains disabled.
     user: "0:0"
+    # Only the image filesystem is read-only; /tmp and the state/control mounts stay writable.
     read_only: true
-    pids_limit: 128
-    mem_limit: ${NODEPING_AGENT_MEMORY_LIMIT:-256m}
-    cpus: ${NODEPING_AGENT_CPU_LIMIT:-1.0}
     stop_grace_period: ${NODEPING_AGENT_STOP_GRACE_PERIOD:-35s}
+    # Child tools cannot gain privileges beyond root with the explicitly retained NET_RAW.
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -38,6 +37,16 @@ services:
     volumes:
       - ${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-./data}:/var/lib/nodeping-agent
       - ${NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY:-./control}:/run/nodeping-agent
+    # This also works with older Agent images whose built-in liveness check
+    # expected nodeping-agent itself to be PID 1.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'for pid in 1 $$(cat /proc/1/task/1/children 2>/dev/null); do target=$$(readlink "/proc/$$pid/exe" 2>/dev/null || true); [ "$${target##*/}" = "nodeping-agent" ] && exit 0; done; exit 1'
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     logging:
       driver: json-file
       options:

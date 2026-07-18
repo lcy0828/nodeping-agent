@@ -1672,8 +1672,57 @@ exit 1
 	if check.Status != "fail" || !strings.Contains(check.Message, "runtime check failed") || strings.Contains(check.Message, "does not support") {
 		t.Fatalf("checkMTRCommand = %+v, want runtime failure", check)
 	}
+	if check.IssueCode != doctorIssueRawSocketPermission {
+		t.Fatalf("issue code = %q, want %q", check.IssueCode, doctorIssueRawSocketPermission)
+	}
 	if !strings.Contains(check.Remediation, "user 0:0") || !strings.Contains(check.Remediation, "NET_RAW") {
 		t.Fatalf("remediation = %q, want packet permission guidance", check.Remediation)
+	}
+}
+
+func TestMTRRuntimeFailureMetadataDistinguishesResourceExhaustion(t *testing.T) {
+	t.Setenv("NODEPING_INSTALL_MODE", "docker")
+	tests := []struct {
+		name            string
+		probe           mtrJSONProbeResult
+		wantCode        string
+		wantRemediation string
+	}{
+		{
+			name:            "process resources",
+			probe:           mtrJSONProbeResult{Output: []byte("mtr: Unable to start net module"), Err: errors.New("exit status 1")},
+			wantCode:        doctorIssueProcessResourceExhausted,
+			wantRemediation: "init enabled",
+		},
+		{
+			name:            "runtime timeout",
+			probe:           mtrJSONProbeResult{TimedOut: true, Err: context.DeadlineExceeded},
+			wantCode:        doctorIssueRuntimeTimeout,
+			wantRemediation: "runtime timeout",
+		},
+		{
+			name:            "generic runtime failure",
+			probe:           mtrJSONProbeResult{Output: []byte("mtr: unexpected runtime error"), Err: errors.New("exit status 1")},
+			wantCode:        doctorIssueRuntimeFailure,
+			wantRemediation: "mtr-packet runtime error",
+		},
+		{
+			name:            "unsupported socket protocol",
+			probe:           mtrJSONProbeResult{Output: []byte("mtr-packet: Failure to open IPv4 sockets: Protocol not supported"), Err: errors.New("exit status 1")},
+			wantCode:        doctorIssueRuntimeFailure,
+			wantRemediation: "mtr-packet runtime error",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			code, remediation := mtrRuntimeFailureMetadata(test.probe)
+			if code != test.wantCode || !strings.Contains(remediation, test.wantRemediation) {
+				t.Fatalf("metadata = (%q, %q), want code %q containing %q", code, remediation, test.wantCode, test.wantRemediation)
+			}
+			if strings.Contains(remediation, "NET_RAW") {
+				t.Fatalf("non-permission remediation must not mention NET_RAW: %q", remediation)
+			}
+		})
 	}
 }
 

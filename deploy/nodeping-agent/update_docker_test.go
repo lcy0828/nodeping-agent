@@ -163,11 +163,15 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 	for _, required := range []string{
 		"name: nodeping-agent",
 		"container_name: nodeping-agent",
+		"init: true",
 		"user: \"0:0\"",
 		"no-new-privileges:true",
 		"cap_drop:\n      - ALL",
 		"cap_add:\n      - NET_RAW",
 		"read_only: true",
+		"healthcheck:",
+		"for pid in 1 $$(cat /proc/1/task/1/children",
+		"[ \"$${target##*/}\" = \"nodeping-agent\" ]",
 		"NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}",
 		"NODEPING_AGENT_UPGRADE_REQUEST_FILE: ${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/run/nodeping-agent/update-request.json}",
 		"NODEPING_AGENT_ID_FILE: /var/lib/nodeping-agent/agent-id",
@@ -176,6 +180,11 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("compose.yml missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"pids_limit:", "mem_limit:", "cpus:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("compose.yml still contains runtime limit %q", forbidden)
 		}
 	}
 }

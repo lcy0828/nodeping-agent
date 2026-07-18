@@ -137,7 +137,7 @@ func runMTRRaw(ctx context.Context, cfg *mtrRunConfig, emit func(map[string]any)
 	}
 	args = append(args, cfg.Target)
 
-	cmd := exec.CommandContext(ctx, cfg.Path, args...)
+	cmd := mtrCommandContext(ctx, cfg.Path, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, nil, fmt.Errorf("open mtr raw output: %w", err)
@@ -341,12 +341,12 @@ func runMTRReport(ctx context.Context, cfg *mtrRunConfig, cycles int) (map[strin
 		baseArgs = append(baseArgs, "-T")
 	}
 	args := append(append([]string{}, baseArgs...), "-j", cfg.Target)
-	out, cmdErr := exec.CommandContext(ctx, cfg.Path, args...).CombinedOutput()
+	out, cmdErr := mtrCommandContext(ctx, cfg.Path, args...).CombinedOutput()
 	result, parseErr := parseMTRJSON(out)
 	if parseErr != nil {
 		if mtrShouldFallbackToText(out, cmdErr) {
 			textArgs := append(append([]string{}, baseArgs...), cfg.Target)
-			out, cmdErr = exec.CommandContext(ctx, cfg.Path, textArgs...).CombinedOutput()
+			out, cmdErr = mtrCommandContext(ctx, cfg.Path, textArgs...).CombinedOutput()
 			result = parseMTRText(out)
 			parseErr = nil
 			if len(mtrHops(result)) == 0 {

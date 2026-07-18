@@ -138,6 +138,7 @@ func runAgentDoctor(ctx context.Context, cfg config) (map[string]any, error) {
 			"key":          check.Key,
 			"name":         check.Name,
 			"status":       check.Status,
+			"issue_code":   check.IssueCode,
 			"severity":     check.Severity,
 			"message":      check.Message,
 			"remediation":  check.Remediation,

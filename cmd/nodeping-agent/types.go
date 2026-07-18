@@ -107,6 +107,7 @@ type doctorCheck struct {
 	Key          string   `json:"key,omitempty"`
 	Name         string   `json:"name"`
 	Status       string   `json:"status"`
+	IssueCode    string   `json:"issue_code,omitempty"`
 	Severity     string   `json:"severity,omitempty"`
 	Message      string   `json:"message,omitempty"`
 	Remediation  string   `json:"remediation,omitempty"`

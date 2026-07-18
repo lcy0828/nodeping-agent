@@ -116,7 +116,7 @@ func probeMTRJSON(ctx context.Context, path string) mtrJSONProbeResult {
 
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(probeCtx, path, args...).CombinedOutput()
+	out, err := mtrCommandContext(probeCtx, path, args...).CombinedOutput()
 	trimmed := []byte(strings.TrimSpace(string(out)))
 	if err == nil && len(trimmed) > 0 && json.Valid(trimmed) {
 		return mtrJSONProbeResult{Supported: true, Output: out}

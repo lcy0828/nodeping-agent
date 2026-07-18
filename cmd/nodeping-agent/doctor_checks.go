@@ -129,9 +129,71 @@ func checkMTRCommand(ctx context.Context) doctorCheck {
 		if diagnostic := mtrProbeDiagnostic(probe); diagnostic != "" {
 			check.Message += ": " + diagnostic
 		}
-		check.Remediation = rawSocketPermissionRemediation()
+		check.IssueCode, check.Remediation = mtrRuntimeFailureMetadata(probe)
 	}
 	return check
+}
+
+const (
+	doctorIssueRawSocketPermission      = "raw_socket_permission"
+	doctorIssueProcessResourceExhausted = "process_resource_exhausted"
+	doctorIssueRuntimeTimeout           = "runtime_timeout"
+	doctorIssueRuntimeFailure           = "runtime_failure"
+)
+
+func mtrRuntimeFailureMetadata(probe mtrJSONProbeResult) (string, string) {
+	diagnostic := strings.ToLower(mtrProbeDiagnostic(probe))
+	if isRawSocketPermissionDiagnostic(diagnostic) {
+		return doctorIssueRawSocketPermission, rawSocketPermissionRemediation()
+	}
+	if isProcessResourceDiagnostic(diagnostic) {
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("NODEPING_INSTALL_MODE")), "docker") {
+			return doctorIssueProcessResourceExhausted, "recreate the Docker Agent with init enabled and check container PID, file descriptor, and memory limits"
+		}
+		return doctorIssueProcessResourceExhausted, "check Agent process, PID, file descriptor, and memory limits"
+	}
+	if probe.TimedOut {
+		return doctorIssueRuntimeTimeout, "run mtr manually as the Agent service user and check whether it completes within the runtime timeout"
+	}
+	return doctorIssueRuntimeFailure, "run mtr manually as the Agent service user and inspect the mtr-packet runtime error"
+}
+
+func isRawSocketPermissionDiagnostic(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	if message == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"cap_net_raw",
+		"net_raw",
+		"sock_raw",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	permissionFailure := strings.Contains(message, "operation not permitted") || strings.Contains(message, "permission denied")
+	socketFailure := strings.Contains(message, "raw socket") || strings.Contains(message, "failure to open ipv4 sockets") || strings.Contains(message, "failure to open ipv6 sockets")
+	return permissionFailure && socketFailure
+}
+
+func isProcessResourceDiagnostic(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	for _, marker := range []string{
+		"unable to start net module",
+		"resource temporarily unavailable",
+		"can't fork",
+		"cannot fork",
+		"fork failed",
+		"too many open files",
+		"cannot allocate memory",
+		"out of memory",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func rawSocketPermissionRemediation() string {

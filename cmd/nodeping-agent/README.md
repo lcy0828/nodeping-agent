@@ -180,7 +180,7 @@ cp docker.env.example .env
 docker compose --env-file .env up -d
 ```
 
-容器需要 `NET_RAW` 能力来执行 ICMP ping 和 MTR。Compose 以 root 启动 Agent，但会丢弃除 `NET_RAW` 外的全部 capability，并保留只读根文件系统和 `no-new-privileges`。
+容器需要 `NET_RAW` 能力来执行 ICMP ping 和 MTR。Compose 以 root 启动 Agent，但会丢弃除 `NET_RAW` 外的全部 capability，并保留只读根文件系统和 `no-new-privileges`。Docker init 负责回收 MTR 超时或取消后退出的辅助进程；任务并发由 Agent 自身控制，不再叠加容易阻断探测的容器 PID、CPU 或内存硬限制。
 
 发布镜像：
 
