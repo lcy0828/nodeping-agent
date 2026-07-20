@@ -20,7 +20,7 @@ func postAgentJSON(ctx context.Context, cfg config, path string, payload any, ou
 }
 
 func getJSONWithToken(ctx context.Context, cfg config, token string, path string, out any) error {
-	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, path)
+	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, path, cfg.AllowInsecureHTTP)
 	if err != nil {
 		return err
 	}
@@ -31,7 +31,7 @@ func getJSONWithToken(ctx context.Context, cfg config, token string, path string
 	req.Header.Set("Authorization", "Bearer "+token)
 	client := cfg.HTTPClient
 	if client == nil {
-		client = newControlPlaneHTTPClient(30 * time.Second)
+		client = newControlPlaneHTTPClient(30*time.Second, cfg.AllowInsecureHTTP)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -53,7 +53,7 @@ func postJSONWithToken(ctx context.Context, cfg config, token string, path strin
 	if err != nil {
 		return err
 	}
-	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, path)
+	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, path, cfg.AllowInsecureHTTP)
 	if err != nil {
 		return err
 	}
@@ -65,7 +65,7 @@ func postJSONWithToken(ctx context.Context, cfg config, token string, path strin
 	req.Header.Set("Content-Type", "application/json")
 	client := cfg.HTTPClient
 	if client == nil {
-		client = newControlPlaneHTTPClient(30 * time.Second)
+		client = newControlPlaneHTTPClient(30*time.Second, cfg.AllowInsecureHTTP)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

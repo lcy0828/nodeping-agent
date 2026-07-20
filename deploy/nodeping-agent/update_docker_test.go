@@ -172,6 +172,7 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 		"healthcheck:",
 		"for pid in 1 $$(cat /proc/1/task/1/children",
 		"[ \"$${target##*/}\" = \"nodeping-agent\" ]",
+		"NODEPING_AGENT_ALLOW_INSECURE_HTTP: ${NODEPING_AGENT_ALLOW_INSECURE_HTTP:-false}",
 		"NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}",
 		"NODEPING_AGENT_UPGRADE_REQUEST_FILE: ${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/run/nodeping-agent/update-request.json}",
 		"NODEPING_AGENT_ID_FILE: /var/lib/nodeping-agent/agent-id",
@@ -205,6 +206,35 @@ func TestInstallDockerConfiguresHostUpgradeWatcher(t *testing.T) {
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("install-docker.sh missing %q", required)
+		}
+	}
+}
+
+func TestDevelopmentHTTPOptInIsWiredAcrossDeploymentScripts(t *testing.T) {
+	for _, name := range []string{"install-release.sh", "install-docker.sh", "update-nodeping-agent.sh", "update-docker.sh"} {
+		content, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(content)
+		for _, required := range []string{
+			"NODEPING_AGENT_ALLOW_INSECURE_HTTP",
+			"normalize_allow_insecure_http",
+			"validate_secure_url \"$SERVER_URL\" \"NODEPING_SERVER_URL\" \"$ALLOW_INSECURE_HTTP\"",
+		} {
+			if !strings.Contains(text, required) {
+				t.Fatalf("%s missing %q", name, required)
+			}
+		}
+	}
+
+	for _, name := range []string{"install-release.sh", "install-docker.sh"} {
+		content, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(content), "printf 'NODEPING_AGENT_ALLOW_INSECURE_HTTP=\"%s\"\\n'") {
+			t.Fatalf("%s does not persist the development HTTP opt-in", name)
 		}
 	}
 }

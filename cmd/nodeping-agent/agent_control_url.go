@@ -13,6 +13,10 @@ import (
 )
 
 func validateSecureBaseURL(raw string, field string) (*url.URL, error) {
+	return validateControlPlaneBaseURL(raw, field, false)
+}
+
+func validateControlPlaneBaseURL(raw string, field string, allowInsecureHTTP bool) (*url.URL, error) {
 	value := strings.TrimSpace(raw)
 	if value == "" {
 		return nil, fmt.Errorf("%s is required", field)
@@ -27,7 +31,9 @@ func validateSecureBaseURL(raw string, field string) (*url.URL, error) {
 	scheme := strings.ToLower(parsed.Scheme)
 	if scheme != "https" {
 		if scheme != "http" || !isLoopbackDevelopmentHost(parsed.Hostname()) {
-			return nil, fmt.Errorf("%s must use HTTPS (HTTP is allowed only for localhost development)", field)
+			if scheme != "http" || !allowInsecureHTTP {
+				return nil, fmt.Errorf("%s must use HTTPS (HTTP requires NODEPING_AGENT_ALLOW_INSECURE_HTTP=true outside localhost development)", field)
+			}
 		}
 	}
 	if parsed.Port() != "" {
@@ -47,8 +53,8 @@ func isLoopbackDevelopmentHost(host string) bool {
 	return err == nil && addr.IsLoopback()
 }
 
-func controlPlaneEndpoint(baseURL string, path string) (string, error) {
-	if _, err := validateSecureBaseURL(baseURL, "NODEPING_SERVER_URL"); err != nil {
+func controlPlaneEndpoint(baseURL string, path string, allowInsecureHTTP bool) (string, error) {
+	if _, err := validateControlPlaneBaseURL(baseURL, "NODEPING_SERVER_URL", allowInsecureHTTP); err != nil {
 		return "", err
 	}
 	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") || strings.ContainsAny(path, "\r\n") {
@@ -57,7 +63,7 @@ func controlPlaneEndpoint(baseURL string, path string) (string, error) {
 	return strings.TrimRight(baseURL, "/") + path, nil
 }
 
-func newControlPlaneHTTPClient(timeout time.Duration) *http.Client {
+func newControlPlaneHTTPClient(timeout time.Duration, allowInsecureHTTP bool) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
@@ -68,20 +74,26 @@ func newControlPlaneHTTPClient(timeout time.Duration) *http.Client {
 		}
 	}
 	return &http.Client{
-		Timeout:       timeout,
-		Transport:     transport,
-		CheckRedirect: secureControlPlaneRedirect,
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return controlPlaneRedirect(req, via, allowInsecureHTTP)
+		},
 	}
 }
 
 func secureControlPlaneRedirect(req *http.Request, via []*http.Request) error {
+	return controlPlaneRedirect(req, via, false)
+}
+
+func controlPlaneRedirect(req *http.Request, via []*http.Request, allowInsecureHTTP bool) error {
 	if len(via) >= 5 {
 		return errors.New("stopped after 5 redirects")
 	}
 	if req == nil || req.URL == nil {
 		return errors.New("invalid control-plane redirect")
 	}
-	if _, err := validateSecureBaseURL(req.URL.Scheme+"://"+req.URL.Host, "control-plane redirect"); err != nil {
+	if _, err := validateControlPlaneBaseURL(req.URL.Scheme+"://"+req.URL.Host, "control-plane redirect", allowInsecureHTTP); err != nil {
 		return err
 	}
 	if len(via) == 0 || via[len(via)-1] == nil || via[len(via)-1].URL == nil {

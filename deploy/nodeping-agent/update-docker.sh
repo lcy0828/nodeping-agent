@@ -8,6 +8,7 @@ PROJECT_DIRECTORY="${PROJECT_DIRECTORY:-$SCRIPT_DIR}"
 COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_DIRECTORY/compose.yml}"
 DATA_DIRECTORY="${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-}"
 SERVER_URL="${NODEPING_SERVER_URL:-}"
+ALLOW_INSECURE_HTTP="${NODEPING_AGENT_ALLOW_INSECURE_HTTP:-}"
 AGENT_ID="${NODEPING_AGENT_ID:-}"
 UPDATE_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_UPDATE_TIMEOUT_SECONDS:-90}"
 PULL_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS:-300}"
@@ -33,11 +34,25 @@ is_loopback_http_url() {
 }
 
 validate_secure_url() {
-	local url="$1" name="${2:-NODEPING_SERVER_URL}"
-	if [[ "$url" =~ [[:space:]@] ]] || { [[ "$url" != https://* ]] && ! is_loopback_http_url "$url"; }; then
-		say_err "$name 必须使用 HTTPS（仅 localhost/回环地址允许 HTTP）" "$name must use HTTPS (HTTP is allowed only for localhost/loopback development)"
+	local url="$1" name="${2:-NODEPING_SERVER_URL}" allow_insecure_http="${3:-false}"
+	if [[ "$url" =~ [[:space:]@] ]]; then
+		say_err "$name 不是安全的 URL" "$name is not a safe URL"
 		return 1
 	fi
+	if [[ "$url" == https://* ]] || is_loopback_http_url "$url"; then return 0; fi
+	if [ "$allow_insecure_http" = "true" ] && [[ "$url" == http://* ]]; then return 0; fi
+	say_err "$name 必须使用 HTTPS（开发环境 HTTP 需显式设置 NODEPING_AGENT_ALLOW_INSECURE_HTTP=true）" "$name must use HTTPS (development HTTP requires NODEPING_AGENT_ALLOW_INSECURE_HTTP=true)"
+	return 1
+}
+
+normalize_allow_insecure_http() {
+	local value
+	value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	case "$value" in
+		1|true) printf 'true' ;;
+		0|false|'') printf 'false' ;;
+		*) say_err "NODEPING_AGENT_ALLOW_INSECURE_HTTP 必须为 true/false 或 1/0" "NODEPING_AGENT_ALLOW_INSECURE_HTTP must be true/false or 1/0"; return 1 ;;
+	esac
 }
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -136,6 +151,10 @@ validate_image() {
 if [ -z "$SERVER_URL" ]; then
 	SERVER_URL="$(dotenv_value NODEPING_SERVER_URL)"
 fi
+if [ -z "$ALLOW_INSECURE_HTTP" ]; then
+	ALLOW_INSECURE_HTTP="$(dotenv_value NODEPING_AGENT_ALLOW_INSECURE_HTTP)"
+fi
+ALLOW_INSECURE_HTTP="$(normalize_allow_insecure_http "${ALLOW_INSECURE_HTTP:-false}")"
 if [ -z "$AGENT_ID" ]; then
 	env_agent_id="$(dotenv_value NODEPING_AGENT_ID)"
 	if [ -n "$env_agent_id" ]; then
@@ -181,7 +200,7 @@ validate_image "NODEPING_AGENT_DOCKER_IMAGE_GLOBAL" "$DOCKER_IMAGE_GLOBAL"
 case "$SYNC_DEPLOYMENT" in 0|1) ;; *) say_err "NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT 必须为 0 或 1" "NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT must be 0 or 1"; exit 2 ;; esac
 
 if [ -n "$SERVER_URL" ]; then
-	validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL"
+	validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL" "$ALLOW_INSECURE_HTTP"
 fi
 if [ "$SYNC_DEPLOYMENT" = "1" ]; then
 	validate_secure_url "$DEPLOY_BASE_URL" "NODEPING_AGENT_DEPLOY_BASE_URL"

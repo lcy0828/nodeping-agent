@@ -29,6 +29,7 @@ type config struct {
 	ShutdownDrain      time.Duration
 	Concurrency        int
 	HTTPClient         *http.Client
+	AllowInsecureHTTP  bool
 	PrintVersion       bool
 	Doctor             bool
 	DoctorJSON         bool

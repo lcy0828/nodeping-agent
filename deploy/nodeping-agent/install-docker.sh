@@ -26,6 +26,7 @@ fi
 
 SERVER_URL="${NODEPING_SERVER_URL:-}"
 BINDING_TOKEN="${NODEPING_TOKEN:-}"
+ALLOW_INSECURE_HTTP="${NODEPING_AGENT_ALLOW_INSECURE_HTTP:-false}"
 DISTRIBUTION_MODE="${NODEPING_AGENT_DISTRIBUTION_MODE:-cn}"
 DEPLOY_BASE_URL="${NODEPING_AGENT_DEPLOY_BASE_URL:-https://hub.ilatency.com/https://raw.githubusercontent.com/lcy0828/nodeping-agent/main/deploy/nodeping-agent}"
 DOCKER_IMAGE_CN="${NODEPING_AGENT_DOCKER_IMAGE_CN:-hub.ilatency.com/ghcr.io/lcy0828/nodeping-agent}"
@@ -42,11 +43,25 @@ is_loopback_http_url() {
 }
 
 validate_secure_url() {
-	local value="$1" name="$2"
-	if [[ "$value" =~ [[:space:]@] ]] || { [[ "$value" != https://* ]] && ! is_loopback_http_url "$value"; }; then
-		say_err "$name 必须使用 HTTPS（仅 localhost/回环地址允许 HTTP）" "$name must use HTTPS (HTTP is allowed only for localhost/loopback development)"
+	local value="$1" name="$2" allow_insecure_http="${3:-false}"
+	if [[ "$value" =~ [[:space:]@] ]]; then
+		say_err "$name 不是安全的 URL" "$name is not a safe URL"
 		return 1
 	fi
+	if [[ "$value" == https://* ]] || is_loopback_http_url "$value"; then return 0; fi
+	if [ "$allow_insecure_http" = "true" ] && [[ "$value" == http://* ]]; then return 0; fi
+	say_err "$name 必须使用 HTTPS（开发环境 HTTP 需显式设置 NODEPING_AGENT_ALLOW_INSECURE_HTTP=true）" "$name must use HTTPS (development HTTP requires NODEPING_AGENT_ALLOW_INSECURE_HTTP=true)"
+	return 1
+}
+
+normalize_allow_insecure_http() {
+	local value
+	value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	case "$value" in
+		1|true) printf 'true' ;;
+		0|false|'') printf 'false' ;;
+		*) say_err "NODEPING_AGENT_ALLOW_INSECURE_HTTP 必须为 true/false 或 1/0" "NODEPING_AGENT_ALLOW_INSECURE_HTTP must be true/false or 1/0"; return 1 ;;
+	esac
 }
 
 validate_env_value() {
@@ -101,6 +116,7 @@ if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
 fi
 
 DISTRIBUTION_MODE="$(printf '%s' "$DISTRIBUTION_MODE" | tr '[:upper:]' '[:lower:]')"
+ALLOW_INSECURE_HTTP="$(normalize_allow_insecure_http "$ALLOW_INSECURE_HTTP")"
 case "$DISTRIBUTION_MODE" in
 	cn) selected_image="$DOCKER_IMAGE_CN" ;;
 	global) selected_image="$DOCKER_IMAGE_GLOBAL" ;;
@@ -127,7 +143,7 @@ for directory_item in "project:$PROJECT_DIRECTORY" "data:$DATA_DIRECTORY"; do
 	fi
 done
 
-validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL"
+validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL" "$ALLOW_INSECURE_HTTP"
 validate_secure_url "$DEPLOY_BASE_URL" "NODEPING_AGENT_DEPLOY_BASE_URL"
 validate_image "NODEPING_AGENT_DOCKER_IMAGE_CN" "$DOCKER_IMAGE_CN"
 validate_image "NODEPING_AGENT_DOCKER_IMAGE_GLOBAL" "$DOCKER_IMAGE_GLOBAL"
@@ -196,6 +212,7 @@ fi
 install -m 0600 /dev/null "$PROJECT_DIRECTORY/.env"
 {
 	printf 'NODEPING_SERVER_URL="%s"\n' "$(env_quote "$SERVER_URL")"
+	printf 'NODEPING_AGENT_ALLOW_INSECURE_HTTP="%s"\n' "$(env_quote "$ALLOW_INSECURE_HTTP")"
 	printf 'NODEPING_TOKEN="%s"\n' "$(env_quote "$BINDING_TOKEN")"
 	printf 'NODEPING_AGENT_ID="%s"\n' "$(env_quote "$AGENT_ID")"
 	printf 'NODEPING_AGENT_NAME="%s"\n' "$(env_quote "$AGENT_NAME")"

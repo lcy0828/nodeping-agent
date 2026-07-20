@@ -303,6 +303,9 @@ func upgradeEnv(cfg config, versionValue string, releaseBaseURL string) []string
 	set("NODEPING_AGENT_VERSION", versionValue)
 	set("NODEPING_AGENT_RELEASE_BASE_URL", releaseBaseURL)
 	set("NODEPING_SERVER_URL", cfg.ServerURL)
+	if cfg.AllowInsecureHTTP {
+		set("NODEPING_AGENT_ALLOW_INSECURE_HTTP", "true")
+	}
 	set("NODEPING_AGENT_ID", cfg.AgentID)
 	set("NODEPING_AGENT_TOKEN", cfg.AgentToken)
 	set("NODEPING_AGENT_TOKEN_FILE", cfg.AgentTokenFile)

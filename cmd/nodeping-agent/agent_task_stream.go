@@ -61,7 +61,7 @@ func taskStreamReconnectDelay(base time.Duration) time.Duration {
 func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrencyLimiter, executor *agentTaskExecutor) (bool, error) {
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
-	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, "/api/agent/v1/tasks/stream?agent_id="+url.QueryEscape(cfg.AgentID))
+	endpoint, err := controlPlaneEndpoint(cfg.ServerURL, "/api/agent/v1/tasks/stream?agent_id="+url.QueryEscape(cfg.AgentID), cfg.AllowInsecureHTTP)
 	if err != nil {
 		return false, err
 	}
@@ -108,7 +108,7 @@ func consumeTaskStream(ctx context.Context, cfg config, limiter *taskConcurrency
 
 func taskStreamHTTPClient(cfg config) *http.Client {
 	if cfg.HTTPClient == nil {
-		client := newControlPlaneHTTPClient(0)
+		client := newControlPlaneHTTPClient(0, cfg.AllowInsecureHTTP)
 		client.Timeout = 0
 		return client
 	}

@@ -41,6 +41,7 @@ func loadConfig() config {
 	flag.DurationVar(&cfg.StreamRetryMax, "stream-retry-max", envDuration("NODEPING_STREAM_RETRY_MAX", defaultStreamRetryMax), "maximum task stream reconnect delay")
 	flag.DurationVar(&cfg.ShutdownDrain, "shutdown-drain-timeout", envDuration("NODEPING_SHUTDOWN_DRAIN_TIMEOUT", 15*time.Second), "maximum time to drain running tasks before cancellation")
 	flag.IntVar(&cfg.Concurrency, "concurrency", envInt("NODEPING_CONCURRENCY", defaultAgentTaskConcurrency), "fallback concurrency for older backends; current backends control concurrency per task")
+	flag.BoolVar(&cfg.AllowInsecureHTTP, "allow-insecure-http", envBool("NODEPING_AGENT_ALLOW_INSECURE_HTTP", false), "allow HTTP control-plane URLs for development")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.Doctor, "doctor", false, "run diagnostics and exit")
 	flag.BoolVar(&cfg.DoctorJSON, "json", false, "print doctor result as JSON")
@@ -75,12 +76,12 @@ func loadConfig() config {
 	}
 	if cfg.ServerURL == "" || (cfg.Token == "" && cfg.AgentToken == "" && strings.TrimSpace(readAgentTokenFile(cfg.AgentTokenFile)) == "") {
 		if cfg.Doctor {
-			cfg.HTTPClient = newControlPlaneHTTPClient(30 * time.Second)
+			cfg.HTTPClient = newControlPlaneHTTPClient(30*time.Second, cfg.AllowInsecureHTTP)
 			return cfg
 		}
 		log.Fatal("NODEPING_SERVER_URL and either NODEPING_AGENT_TOKEN or NODEPING_TOKEN are required")
 	}
-	if _, err := validateSecureBaseURL(cfg.ServerURL, "NODEPING_SERVER_URL"); err != nil {
+	if _, err := validateControlPlaneBaseURL(cfg.ServerURL, "NODEPING_SERVER_URL", cfg.AllowInsecureHTTP); err != nil {
 		log.Fatal(err)
 	}
 	if cfg.AgentToken == "" {
@@ -106,7 +107,7 @@ func loadConfig() config {
 	if cfg.ShutdownDrain > 2*time.Minute {
 		cfg.ShutdownDrain = 2 * time.Minute
 	}
-	cfg.HTTPClient = newControlPlaneHTTPClient(30 * time.Second)
+	cfg.HTTPClient = newControlPlaneHTTPClient(30*time.Second, cfg.AllowInsecureHTTP)
 	return cfg
 }
 
@@ -135,6 +136,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return fallback
 	}

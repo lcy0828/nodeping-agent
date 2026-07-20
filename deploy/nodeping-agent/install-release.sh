@@ -16,6 +16,7 @@ fi
 
 SERVER_URL="${NODEPING_SERVER_URL:-}"
 BINDING_TOKEN="${NODEPING_TOKEN:-}"
+ALLOW_INSECURE_HTTP="${NODEPING_AGENT_ALLOW_INSECURE_HTTP:-false}"
 CUSTOM_RELEASE_BASE_URL="${NODEPING_AGENT_RELEASE_BASE_URL:-}"
 RELEASE_BASE_URL="$CUSTOM_RELEASE_BASE_URL"
 REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
@@ -111,10 +112,25 @@ is_loopback_http_url() {
 validate_secure_url() {
 	local value="$1"
 	local name="$2"
-	if [[ "$value" =~ [[:space:]@] ]] || { [[ "$value" != https://* ]] && ! is_loopback_http_url "$value"; }; then
-		say_err "$name 必须使用 HTTPS（仅 localhost/回环地址允许 HTTP）" "$name must use HTTPS (HTTP is allowed only for localhost/loopback development)"
+	local allow_insecure_http="${3:-false}"
+	if [[ "$value" =~ [[:space:]@] ]]; then
+		say_err "$name 不是安全的 URL" "$name is not a safe URL"
 		return 1
 	fi
+	if [[ "$value" == https://* ]] || is_loopback_http_url "$value"; then return 0; fi
+	if [ "$allow_insecure_http" = "true" ] && [[ "$value" == http://* ]]; then return 0; fi
+	say_err "$name 必须使用 HTTPS（开发环境 HTTP 需显式设置 NODEPING_AGENT_ALLOW_INSECURE_HTTP=true）" "$name must use HTTPS (development HTTP requires NODEPING_AGENT_ALLOW_INSECURE_HTTP=true)"
+	return 1
+}
+
+normalize_allow_insecure_http() {
+	local value
+	value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	case "$value" in
+		1|true) printf 'true' ;;
+		0|false|'') printf 'false' ;;
+		*) say_err "NODEPING_AGENT_ALLOW_INSECURE_HTTP 必须为 true/false 或 1/0" "NODEPING_AGENT_ALLOW_INSECURE_HTTP must be true/false or 1/0"; return 1 ;;
+	esac
 }
 
 download_with_curl() {
@@ -695,12 +711,13 @@ if [ -z "$SERVER_URL" ] || [ -z "$BINDING_TOKEN" ]; then
 fi
 
 preflight
+ALLOW_INSECURE_HTTP="$(normalize_allow_insecure_http "$ALLOW_INSECURE_HTTP")"
 DISTRIBUTION_MODE="$(printf '%s' "$DISTRIBUTION_MODE" | tr '[:upper:]' '[:lower:]')"
 case "$DISTRIBUTION_MODE" in
 	cn|global) ;;
 	*) say_err "NODEPING_AGENT_DISTRIBUTION_MODE 必须为 cn 或 global" "NODEPING_AGENT_DISTRIBUTION_MODE must be cn or global"; exit 2 ;;
 esac
-validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL"
+validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL" "$ALLOW_INSECURE_HTTP"
 validate_secure_url "$GITHUB_API_BASE_URL" "NODEPING_AGENT_GITHUB_API_BASE_URL"
 if [ -n "$RELEASE_BASE_URL" ]; then validate_secure_url "$RELEASE_BASE_URL" "NODEPING_AGENT_RELEASE_BASE_URL"; fi
 if ! validate_repository; then say_err "NODEPING_AGENT_GITHUB_REPOSITORY 格式无效" "invalid NODEPING_AGENT_GITHUB_REPOSITORY"; exit 2; fi
@@ -798,6 +815,7 @@ install -d -m 0755 "$ETC_DIR"
 install -m 0600 /dev/null "$ETC_DIR/nodeping-agent.env"
 {
 	printf 'NODEPING_SERVER_URL="%s"\n' "$(env_quote "$SERVER_URL")"
+	printf 'NODEPING_AGENT_ALLOW_INSECURE_HTTP="%s"\n' "$(env_quote "$ALLOW_INSECURE_HTTP")"
 	printf 'NODEPING_TOKEN="%s"\n' "$(env_quote "$BINDING_TOKEN")"
 	printf 'NODEPING_AGENT_ID="%s"\n' "$(env_quote "$AGENT_ID")"
 	printf 'NODEPING_AGENT_NAME="%s"\n' "$(env_quote "$AGENT_NAME")"
