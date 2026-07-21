@@ -59,6 +59,9 @@ jobs:
       - name: Exercise native dnstap listener and self-check
         run: go test -count=20 -timeout=5m ./internal/dnstapcollector
 
+      - name: Exercise native DNS engine transports
+        run: go test -count=1 -timeout=3m ./internal/dnsengine
+
       - name: Exercise native system DNS over UDP and TCP
         run: go test -count=1 -timeout=3m -tags=dns_native_e2e -run '^TestNativeSystemDNSObservationUDPAndTCP$' ./cmd/nodeping-agent
 

@@ -34,7 +34,7 @@ func findLocalAgentPID(procRoot string, selfPID int) (int, error) {
 			continue
 		}
 		target, readErr := os.Readlink(filepath.Join(procRoot, entry.Name(), "exe"))
-		if readErr != nil || !strings.HasPrefix(filepath.Base(target), "nodeping-agent") {
+		if readErr != nil || !isLocalAgentExecutable(target) {
 			continue
 		}
 		if pid == 1 || processDescendsFromInit(procRoot, pid) {
@@ -42,6 +42,11 @@ func findLocalAgentPID(procRoot string, selfPID int) (int, error) {
 		}
 	}
 	return 0, errors.New("nodeping-agent process is not running under the local init process")
+}
+
+func isLocalAgentExecutable(target string) bool {
+	name := filepath.Base(target)
+	return name == "nodeping-agent" || name == "nodeping-agent (deleted)"
 }
 
 func processDescendsFromInit(procRoot string, pid int) bool {

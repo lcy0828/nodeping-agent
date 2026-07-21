@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"net/netip"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,9 @@ func TestNativeSystemDNSObservationUDPAndTCP(t *testing.T) {
 			request := testSystemDNSRequest("round-native-system-" + string(protocol))
 			request.Operations[0].Endpoint.Protocol = protocol
 			request.Limits.AttemptTimeoutMS = 5_000
+			if protocol == dnsobs.ProtocolTCP {
+				request.Limits.MaxAttempts = 1
+			}
 			batch, err := executeDNSObservationRequest(ctx, request, defaultDNSWireEngineFactory, newDNSOperationGate(1), nil)
 			if err != nil {
 				t.Fatalf("native system DNS %s observation: %v", protocol, err)
@@ -36,6 +40,9 @@ func TestNativeSystemDNSObservationUDPAndTCP(t *testing.T) {
 			observation := batch.Observations[0]
 			if observation.Endpoint.Kind != dnsobs.EndpointSystem || observation.Endpoint.Port != 53 {
 				t.Fatalf("native system DNS %s endpoint = %+v", protocol, observation.Endpoint)
+			}
+			if assertDarwinSystemDNSTCPUnavailable(t, protocol, observation) {
+				return
 			}
 			if observation.TransportStatus != dnsobs.TransportSuccess || observation.ResponseAttempt < 1 || observation.PeerIP == "" {
 				t.Fatalf("native system DNS %s observation = %+v", protocol, observation)
@@ -51,6 +58,27 @@ func TestNativeSystemDNSObservationUDPAndTCP(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertDarwinSystemDNSTCPUnavailable(t testing.TB, protocol dnsobs.Protocol, observation dnsobs.Observation) bool {
+	t.Helper()
+	if runtime.GOOS != "darwin" || protocol != dnsobs.ProtocolTCP || observation.TransportStatus == dnsobs.TransportSuccess {
+		return false
+	}
+	if observation.TransportStatus != dnsobs.TransportTimeout || observation.Outcome != dnsobs.DNSOutcomeNotObserved ||
+		observation.ResponseAttempt != 0 || observation.PeerIP != "" || observation.Error == nil ||
+		observation.Error.Code != "TIMEOUT" || !observation.Error.Retryable ||
+		observation.AttemptCount < 1 || observation.AttemptCount != len(observation.Attempts) {
+		t.Fatalf("macOS system DNS TCP failure is not a bounded timeout observation: %+v", observation)
+	}
+	for index, attempt := range observation.Attempts {
+		if attempt.Protocol != dnsobs.ProtocolTCP || attempt.TransportStatus != dnsobs.TransportTimeout ||
+			attempt.PeerIP != "" || attempt.Error == nil || attempt.Error.Code != "TIMEOUT" || !attempt.Error.Retryable {
+			t.Fatalf("macOS system DNS TCP timeout attempt %d = %+v", index, attempt)
+		}
+	}
+	t.Log("macOS native resolver does not expose DNS over TCP; Agent reported a bounded timeout observation")
+	return true
 }
 
 func assertBareNativeDNSPeer(t testing.TB, field, value string) {

@@ -52,6 +52,20 @@ func TestFindLocalAgentPIDSupportsContainerSupervisor(t *testing.T) {
 	}
 }
 
+func TestFindLocalAgentPIDSupportsReplacedBinary(t *testing.T) {
+	procRoot := t.TempDir()
+	writeFakeProcProcess(t, procRoot, "1", "/sbin/docker-init", "PPid:\t0\n")
+	writeFakeProcProcess(t, procRoot, "7", "/opt/nodeping-agent/nodeping-agent (deleted)", "PPid:\t1\n")
+
+	pid, err := findLocalAgentPID(procRoot, 22)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 7 {
+		t.Fatalf("agent pid = %d, want 7", pid)
+	}
+}
+
 func writeFakeProcProcess(t *testing.T, procRoot, pid, executable, status string) {
 	t.Helper()
 	dir := filepath.Join(procRoot, pid)

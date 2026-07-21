@@ -128,11 +128,11 @@ func repositoryRoot() (string, error) {
 }
 
 func loadModule(root, path string) (moduleInfo, error) {
-	command := exec.Command("go", "list", "-m", "-json", path)
+	command := exec.Command("go", "mod", "download", "-json", path)
 	command.Dir = root
-	output, err := command.Output()
+	output, err := command.CombinedOutput()
 	if err != nil {
-		return moduleInfo{}, fmt.Errorf("load module %s: %w", path, err)
+		return moduleInfo{}, fmt.Errorf("download module %s: %w: %s", path, err, bytes.TrimSpace(output))
 	}
 	var info moduleInfo
 	if err := json.Unmarshal(output, &info); err != nil {
