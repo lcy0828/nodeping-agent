@@ -15,13 +15,15 @@ import (
 )
 
 var (
-	version   = "dev"
-	commit    = "unknown"
-	buildDate = "unknown"
+	version                  = "dev"
+	commit                   = "unknown"
+	buildDate                = "unknown"
+	errAgentRestartRequested = errors.New("agent restart requested")
 )
 
 func main() {
 	cfg := loadConfig()
+	cfg.RestartRequested = make(chan struct{}, 1)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if cfg.PrintVersion {
@@ -41,6 +43,10 @@ func main() {
 		return
 	}
 	if err := run(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+		if errors.Is(err, errAgentRestartRequested) {
+			log.Printf("container upgrade staged; stopping for supervisor restart")
+			return
+		}
 		log.Fatal(err)
 	}
 }
@@ -92,7 +98,11 @@ func run(ctx context.Context, cfg config) error {
 	defer cancelLoops()
 	taskExecutor := newAgentTaskExecutor(context.WithoutCancel(ctx), cfg)
 	defer taskExecutor.Cancel()
-	wg.Add(3)
+	loopCount := 3
+	if dnsRootMaterialConfigComplete(cfg) {
+		loopCount++
+	}
+	wg.Add(loopCount)
 	go func() {
 		defer wg.Done()
 		heartbeatLoop(loopCtx, cfg)
@@ -105,7 +115,20 @@ func run(ctx context.Context, cfg config) error {
 		defer wg.Done()
 		taskStreamLoop(loopCtx, cfg, taskExecutor)
 	}()
-	<-ctx.Done()
+	if dnsRootMaterialConfigComplete(cfg) {
+		go func() {
+			defer wg.Done()
+			initializeDNSRootMaterial(loopCtx, cfg)
+			dnsRootMaterialLoop(loopCtx, cfg)
+		}()
+	}
+	stopErr := error(nil)
+	select {
+	case <-ctx.Done():
+		stopErr = ctx.Err()
+	case <-cfg.RestartRequested:
+		stopErr = errAgentRestartRequested
+	}
 	taskExecutor.StopAccepting()
 	cancelLoops()
 	wg.Wait()
@@ -116,7 +139,7 @@ func run(ctx context.Context, cfg config) error {
 			log.Printf("running tasks did not stop within final reporting window")
 		}
 	}
-	return ctx.Err()
+	return stopErr
 }
 
 func prepareAgentState(cfg config) error {

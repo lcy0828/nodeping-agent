@@ -110,12 +110,25 @@ func publicIPLoop(ctx context.Context, cfg config) {
 }
 
 func reportPublicIP(ctx context.Context, cfg config) {
-	ip := discoverPublicIP(ctx)
-	payload := map[string]any{"agent_id": cfg.AgentID, "source": "nodeping_agent"}
-	if ip != "" {
-		payload["public_ip"] = ip
-	}
-	if err := postAgentJSON(ctx, cfg, "/api/agent/v1/public-ip", payload, nil); err != nil {
+	discovery := discoverPublicIPs(ctx)
+	if err := postPublicIPReport(ctx, cfg, discovery); err != nil {
 		log.Printf("public IP report failed: %v", err)
 	}
+}
+
+func postPublicIPReport(ctx context.Context, cfg config, discovery publicIPDiscovery) error {
+	payload := map[string]any{"agent_id": cfg.AgentID, "source": "nodeping_agent"}
+	if primary := discovery.primary(); primary != "" {
+		payload["public_ip"] = primary
+	}
+	if discovery.IPv4 != "" {
+		payload["public_ipv4"] = discovery.IPv4
+	}
+	if discovery.IPv6 != "" {
+		payload["public_ipv6"] = discovery.IPv6
+	}
+	if families := discovery.families(); len(families) > 0 {
+		payload["public_ip_families"] = families
+	}
+	return postAgentJSON(ctx, cfg, "/api/agent/v1/public-ip", payload, nil)
 }

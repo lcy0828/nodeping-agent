@@ -8,7 +8,7 @@ services:
     init: true
     # Root keeps NET_RAW effective even when the host restricts ping_group_range.
     user: "0:0"
-    # Only the image filesystem is read-only; /tmp and the state/control mounts stay writable.
+    # Only the image filesystem is read-only; /tmp, runtime, and state stay writable.
     read_only: true
     stop_grace_period: ${NODEPING_AGENT_STOP_GRACE_PERIOD:-35s}
     # Child tools cannot gain privileges beyond root with the explicitly retained NET_RAW.
@@ -20,6 +20,7 @@ services:
       - NET_RAW
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
+      - /run/nodeping-agent:rw,noexec,nosuid,nodev,size=1m,mode=0700
     environment:
       NODEPING_SERVER_URL: ${NODEPING_SERVER_URL:?set NODEPING_SERVER_URL}
       NODEPING_AGENT_ALLOW_INSECURE_HTTP: ${NODEPING_AGENT_ALLOW_INSECURE_HTTP:-false}
@@ -33,17 +34,20 @@ services:
       NODEPING_PUBLIC_IP_INTERVAL: ${NODEPING_PUBLIC_IP_INTERVAL:-10m}
       NODEPING_CONCURRENCY: ${NODEPING_CONCURRENCY:-10}
       NODEPING_SHUTDOWN_DRAIN_TIMEOUT: ${NODEPING_SHUTDOWN_DRAIN_TIMEOUT:-15s}
-      NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-disabled}
-      NODEPING_AGENT_UPGRADE_REQUEST_FILE: ${NODEPING_AGENT_UPGRADE_REQUEST_FILE:-/run/nodeping-agent/update-request.json}
+      NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-container}
+      NODEPING_AGENT_UPGRADE_SCRIPT: /usr/local/bin/nodeping-agent-update
+      NODEPING_AGENT_INSTALL_PATH: /opt/nodeping-agent/nodeping-agent
+      NODEPING_AGENT_BACKUP_PATH: /opt/nodeping-agent/nodeping-agent.previous
+      NODEPING_AGENT_ACTIVATION_FILE: /var/lib/nodeping-agent/updates/activation.pending
+      NODEPING_AGENT_ACTIVATION_STABLE_SECONDS: ${NODEPING_AGENT_ACTIVATION_STABLE_SECONDS:-20}
+      NODEPING_AGENT_MINISIGN_PUBLIC_KEY: ${NODEPING_AGENT_MINISIGN_PUBLIC_KEY:-}
+      NODEPING_AGENT_REQUIRE_SIGNATURE: ${NODEPING_AGENT_REQUIRE_SIGNATURE:-auto}
+      NODEPING_AGENT_SIGNATURE_REQUIRED_FROM: ${NODEPING_AGENT_SIGNATURE_REQUIRED_FROM:-}
     volumes:
+      - ${NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY:-./runtime}:/opt/nodeping-agent
       - ${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-./data}:/var/lib/nodeping-agent
-      - ${NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY:-./control}:/run/nodeping-agent
-    # This also works with older Agent images whose built-in liveness check
-    # expected nodeping-agent itself to be PID 1.
     healthcheck:
-      test:
-        - CMD-SHELL
-        - 'for pid in 1 $$(cat /proc/1/task/1/children 2>/dev/null); do target=$$(readlink "/proc/$$pid/exe" 2>/dev/null || true); [ "$${target##*/}" = "nodeping-agent" ] && exit 0; done; exit 1'
+      test: [CMD, /usr/local/lib/nodeping-agent/nodeping-agent, liveness]
       interval: 30s
       timeout: 5s
       start_period: 15s

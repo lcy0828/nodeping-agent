@@ -87,9 +87,15 @@ require_command() {
 }
 
 preflight() {
+	detect_os >/dev/null
+	detect_arch >/dev/null
 	for command in tar awk grep sed install mktemp systemctl; do
 		require_command "$command"
 	done
+	if [ "$(uname -s | tr '[:upper:]' '[:lower:]')" != "linux" ] || [ ! -d /run/systemd/system ] || ! systemctl list-unit-files >/dev/null 2>&1; then
+		say_err "systemd 安装脚本仅支持正在运行 systemd 的 Linux；当前系统不会进行下载或安装，请返回页面选择 Docker Compose 指引" "the systemd installer requires Linux with systemd running; nothing was downloaded or installed; return to the Docker Compose guide"
+		exit 1
+	fi
 	if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
 		say_err "需要安装 curl 或 wget" "curl or wget is required"
 		exit 1

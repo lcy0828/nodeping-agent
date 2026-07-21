@@ -5,11 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
+
+type tracerouteCommandSpec struct {
+	Name     string
+	Args     []string
+	Protocol string
+}
 
 func runTraceroute(ctx context.Context, target string, options map[string]any) (map[string]any, error) {
 	target = strings.TrimSpace(target)
@@ -21,11 +29,6 @@ func runTraceroute(ctx context.Context, target string, options map[string]any) (
 	if err != nil {
 		return nil, err
 	}
-	targetIP := resolved.String()
-	path, err := exec.LookPath("traceroute")
-	if err != nil {
-		return nil, errors.New("traceroute command not found")
-	}
 	maxHops := intOption(options, "max_hops", 30)
 	if maxHops < 1 {
 		maxHops = 1
@@ -34,20 +37,17 @@ func runTraceroute(ctx context.Context, target string, options map[string]any) (
 		maxHops = 64
 	}
 	protocol := strings.ToLower(strings.TrimSpace(stringOptionAny(options, "protocol")))
-	args := []string{"-n", "-m", strconv.Itoa(maxHops), "-q", "1", "-w", "2"}
-	switch protocol {
-	case "icmp":
-		args = append(args, "-I")
-	case "tcp":
-		args = append(args, "-T")
-	case "", "udp":
-		protocol = "udp"
-	default:
-		return nil, fmt.Errorf("unsupported traceroute protocol: %s", protocol)
+	command, err := tracerouteCommandForAddr(runtime.GOOS, resolved, maxHops, protocol)
+	if err != nil {
+		return nil, err
 	}
-	args = append(args, targetIP)
+	path, err := exec.LookPath(command.Name)
+	if err != nil {
+		return nil, fmt.Errorf("%s command not found", command.Name)
+	}
+	targetIP := resolved.String()
 	started := time.Now()
-	out, cmdErr := exec.CommandContext(ctx, path, args...).CombinedOutput()
+	out, cmdErr := exec.CommandContext(ctx, path, command.Args...).CombinedOutput()
 	hops := parseTraceHops(string(out))
 	reached := traceReachedTarget(hops, targetIP)
 	if cmdErr != nil && len(hops) == 0 {
@@ -58,7 +58,7 @@ func runTraceroute(ctx context.Context, target string, options map[string]any) (
 		"hops":       hops,
 		"hop_count":  len(hops),
 		"max_hops":   maxHops,
-		"protocol":   protocol,
+		"protocol":   command.Protocol,
 		"reached":    reached,
 		"raw_output": strings.TrimSpace(string(out)),
 	}
@@ -69,6 +69,71 @@ func runTraceroute(ctx context.Context, target string, options map[string]any) (
 		result["command_error"] = cmdErr.Error()
 	}
 	return result, nil
+}
+
+func tracerouteCommandForAddr(goos string, addr netip.Addr, maxHops int, protocol string) (tracerouteCommandSpec, error) {
+	if !addr.IsValid() {
+		return tracerouteCommandSpec{}, errors.New("traceroute target IP address is invalid")
+	}
+	addr = addr.Unmap()
+	target := addr.String()
+	familyFlag := "-6"
+	if addr.Is4() {
+		familyFlag = "-4"
+	}
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+
+	if goos == "windows" {
+		if protocol == "" {
+			protocol = "icmp"
+		}
+		if protocol != "icmp" {
+			if protocol != "udp" && protocol != "tcp" {
+				return tracerouteCommandSpec{}, fmt.Errorf("unsupported traceroute protocol: %s", protocol)
+			}
+			return tracerouteCommandSpec{}, fmt.Errorf("traceroute protocol %s is not supported on windows", protocol)
+		}
+		return tracerouteCommandSpec{
+			Name:     "tracert",
+			Args:     []string{familyFlag, "-d", "-h", strconv.Itoa(maxHops), "-w", "2000", target},
+			Protocol: protocol,
+		}, nil
+	}
+
+	if protocol == "" {
+		protocol = "udp"
+	}
+	if protocol != "udp" && protocol != "icmp" && protocol != "tcp" {
+		return tracerouteCommandSpec{}, fmt.Errorf("unsupported traceroute protocol: %s", protocol)
+	}
+
+	command := tracerouteCommandSpec{
+		Name:     "traceroute",
+		Args:     []string{familyFlag, "-n", "-m", strconv.Itoa(maxHops), "-q", "1", "-w", "2"},
+		Protocol: protocol,
+	}
+	switch goos {
+	case "linux":
+	case "darwin":
+		command.Args = command.Args[1:]
+		if addr.Is6() {
+			command.Name = "traceroute6"
+		}
+	default:
+		return tracerouteCommandSpec{}, fmt.Errorf("traceroute is not supported on %s", goos)
+	}
+	switch protocol {
+	case "icmp":
+		command.Args = append(command.Args, "-I")
+	case "tcp":
+		if goos == "darwin" && addr.Is4() {
+			command.Args = append(command.Args, "-P", "tcp")
+		} else {
+			command.Args = append(command.Args, "-T")
+		}
+	}
+	command.Args = append(command.Args, target)
+	return command, nil
 }
 
 func parseTraceHops(output string) []map[string]any {

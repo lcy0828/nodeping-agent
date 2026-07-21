@@ -28,12 +28,18 @@ func loadConfig() config {
 	flag.StringVar(&cfg.AgentIDFile, "agent-id-file", env("NODEPING_AGENT_ID_FILE", defaultAgentIDFile()), "NodePing agent identity file")
 	flag.StringVar(&cfg.AgentID, "agent-id", env("NODEPING_AGENT_ID", ""), "stable agent id")
 	flag.StringVar(&cfg.Name, "name", env("NODEPING_AGENT_NAME", hostname()), "agent display name")
-	flag.StringVar(&cfg.UpgradeMode, "upgrade-mode", env("NODEPING_AGENT_UPGRADE_MODE", "auto"), "remote upgrade mode: auto, request_file, systemd, script, or disabled")
+	flag.StringVar(&cfg.UpgradeMode, "upgrade-mode", env("NODEPING_AGENT_UPGRADE_MODE", "auto"), "remote upgrade mode: auto, container, request_file, systemd, script, or disabled")
 	flag.StringVar(&cfg.UpgradeUnit, "upgrade-unit", env("NODEPING_AGENT_UPGRADE_UNIT", "nodeping-agent-update.service"), "fixed systemd unit used for remote upgrades")
 	flag.StringVar(&cfg.UpgradeScript, "upgrade-script", env("NODEPING_AGENT_UPGRADE_SCRIPT", "/opt/nodeping-agent/nodeping-agent-update"), "fixed script used for remote upgrades")
 	flag.StringVar(&cfg.UpgradeRequestFile, "upgrade-request-file", env("NODEPING_AGENT_UPGRADE_REQUEST_FILE", defaultUpgradeRequestFile()), "fixed request file watched by the systemd upgrade path")
 	flag.StringVar(&cfg.ReleaseProxyFile, "release-proxy-file", env("NODEPING_AGENT_RELEASE_PROXY_FILE", defaultReleaseProxyFile()), "backend-managed release proxy catalog")
 	flag.StringVar(&cfg.LatestVersionFile, "latest-version-file", env("NODEPING_AGENT_LATEST_VERSION_FILE", defaultLatestVersionFile()), "backend-managed latest release version cache")
+	flag.StringVar(&cfg.DNSRootStateDir, "dns-root-state-dir", env("NODEPING_DNS_ROOT_STATE_DIR", defaultDNSRootStateDir()), "persistent DNS root material state directory")
+	flag.StringVar(&cfg.DNSRootHintsFile, "dns-root-hints-file", env("NODEPING_DNS_ROOT_HINTS_FILE", ""), "NodePing-signed root hints candidate")
+	flag.StringVar(&cfg.DNSRootManifest, "dns-root-manifest-file", env("NODEPING_DNS_ROOT_MANIFEST_FILE", ""), "NodePing root hints manifest")
+	flag.StringVar(&cfg.DNSRootPublicKeys, "dns-root-public-keys", env("NODEPING_DNS_ROOT_PUBLIC_KEYS", ""), "comma-separated base64 Ed25519 root manifest public keys")
+	flag.StringVar(&cfg.DNSAnchorBinary, "dns-unbound-anchor", env("NODEPING_DNS_UNBOUND_ANCHOR", ""), "fixed unbound-anchor helper path")
+	flag.StringVar(&cfg.DNSCheckconfBinary, "dns-unbound-checkconf", env("NODEPING_DNS_UNBOUND_CHECKCONF", ""), "fixed unbound-checkconf helper path")
 	flag.DurationVar(&cfg.HeartbeatInterval, "heartbeat", envDuration("NODEPING_HEARTBEAT_INTERVAL", 20*time.Second), "heartbeat interval")
 	flag.DurationVar(&cfg.PublicIPInterval, "public-ip-interval", envDuration("NODEPING_PUBLIC_IP_INTERVAL", 10*time.Minute), "public IP report interval")
 	flag.DurationVar(&cfg.StreamIdleTimeout, "stream-idle-timeout", envDuration("NODEPING_STREAM_IDLE_TIMEOUT", 90*time.Second), "task stream idle timeout before reconnect")
@@ -70,6 +76,12 @@ func loadConfig() config {
 	cfg.UpgradeRequestFile = strings.TrimSpace(cfg.UpgradeRequestFile)
 	cfg.ReleaseProxyFile = strings.TrimSpace(cfg.ReleaseProxyFile)
 	cfg.LatestVersionFile = strings.TrimSpace(cfg.LatestVersionFile)
+	cfg.DNSRootStateDir = strings.TrimSpace(cfg.DNSRootStateDir)
+	cfg.DNSRootHintsFile = strings.TrimSpace(cfg.DNSRootHintsFile)
+	cfg.DNSRootManifest = strings.TrimSpace(cfg.DNSRootManifest)
+	cfg.DNSRootPublicKeys = strings.TrimSpace(cfg.DNSRootPublicKeys)
+	cfg.DNSAnchorBinary = strings.TrimSpace(cfg.DNSAnchorBinary)
+	cfg.DNSCheckconfBinary = strings.TrimSpace(cfg.DNSCheckconfBinary)
 	cfg.Version = "nodeping-agent/" + version
 	if cfg.PrintVersion || cfg.Liveness {
 		return cfg
@@ -312,6 +324,17 @@ func defaultLatestVersionFile() string {
 		return ""
 	}
 	return filepath.Join(dir, "nodeping", "latest-version")
+}
+
+func defaultDNSRootStateDir() string {
+	if runtime.GOOS == "linux" {
+		return "/var/lib/nodeping-agent"
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, "nodeping")
 }
 
 func readAgentIDFile(path string) string {

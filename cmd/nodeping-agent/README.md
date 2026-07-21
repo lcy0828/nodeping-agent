@@ -198,7 +198,9 @@ docker compose --env-file .env up -d
 IMAGE=ghcr.io/lcy0828/nodeping-agent VERSION=0.1.0 PUSH=1 PLATFORMS=linux/amd64,linux/arm64 ./scripts/build-nodeping-agent-image.sh
 ```
 
-Docker 安装脚本会在 systemd 主机上安装 `nodeping-agent-docker-update.path/service`。控制台下发升级任务后，容器只向专用控制目录写入请求文件，由宿主机 updater 拉取镜像并重建容器；容器不会获得 Docker Socket。updater 会先同步并校验默认 Compose，再按照 `.env` 中的分发模式选择主镜像，并在拉取失败时切换备用镜像；更新失败时会恢复原 Compose、镜像和版本配置。非 systemd 主机保持远程升级禁用，可手动运行 `/opt/nodeping-agent/update-docker.sh`。自定义 Compose 不会被覆盖。如果要在宿主机从源码重建，需要让 `COMPOSE_FILE` 指向带 `build:` 的自定义 Compose 文件，再设置 `NODEPING_AGENT_DOCKER_BUILD=1`。
+Docker 日常升级在容器内部完成，不依赖宿主机的 systemd、procd 或其他 init 系统，也不会挂载 Docker Socket。Agent 下载并校验发布包后，把新二进制原子写入容器 `/opt/nodeping-agent/nodeping-agent`；该目录默认映射到宿主机 `/opt/nodeping-agent/runtime`。升级任务结果成功上报后 Agent 优雅退出，镜像内 supervisor 启动候选版本；候选版本未通过稳定窗口时自动恢复 `nodeping-agent.previous`，两者都不可用时回退到镜像内基础版本。
+
+身份、长期 token 和 DNS 状态继续保存在宿主机 `/opt/nodeping-agent/data`，只在容器内映射为 `/var/lib/nodeping-agent`；安装器不会把宿主机数据迁回 `/var/lib/nodeping-agent`。宿主机 `/opt/nodeping-agent/update-docker.sh` 仅用于刷新基础镜像和默认 Compose，例如更新 Alpine、CA、ping、traceroute 或 MTR；它不再是控制台日常 Agent 升级链路。自定义 Compose 不会被覆盖。如果要在宿主机从源码重建，需要让 `COMPOSE_FILE` 指向带 `build:` 的自定义 Compose 文件，再设置 `NODEPING_AGENT_DOCKER_BUILD=1`。
 
 远端部署只拉镜像时，使用 `compose.yml`：
 

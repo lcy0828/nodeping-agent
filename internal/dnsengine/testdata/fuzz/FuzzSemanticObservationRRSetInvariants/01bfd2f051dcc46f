@@ -1,0 +1,5 @@
+go test fuzz v1
+int(3)
+int(65610)
+byte('æ')
+string("TXT")

@@ -9,16 +9,6 @@ say_err() {
 	printf '%s / %s\n' "$1" "$2" >&2
 }
 
-systemctl_quiet() {
-	local output
-	if ! output="$(systemctl "$@" 2>&1)"; then
-		if [ -n "$output" ]; then
-			printf '%s\n' "$output" >&2
-		fi
-		return 1
-	fi
-}
-
 if [ "$(id -u)" -ne 0 ]; then
 	say_err "请以 root 运行 Docker 安装器" "run the Docker installer as root"
 	exit 1
@@ -34,8 +24,14 @@ DOCKER_IMAGE_GLOBAL="${NODEPING_AGENT_DOCKER_IMAGE_GLOBAL:-ghcr.io/lcy0828/nodep
 IMAGE_VERSION="${NODEPING_AGENT_IMAGE_VERSION:-latest}"
 PROJECT_DIRECTORY="${NODEPING_AGENT_DOCKER_PROJECT_DIRECTORY:-/opt/nodeping-agent}"
 DATA_DIRECTORY="${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-$PROJECT_DIRECTORY/data}"
+RUNTIME_DIRECTORY="${NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY:-$PROJECT_DIRECTORY/runtime}"
 AGENT_ID="${NODEPING_AGENT_ID:-}"
 AGENT_NAME="${NODEPING_AGENT_NAME:-NodePing Docker Agent}"
+SIGNING_PUBLIC_KEY="${NODEPING_AGENT_MINISIGN_PUBLIC_KEY:-}"
+REQUIRE_SIGNATURE="${NODEPING_AGENT_REQUIRE_SIGNATURE:-auto}"
+SIGNATURE_REQUIRED_FROM="${NODEPING_AGENT_SIGNATURE_REQUIRED_FROM:-}"
+LEGACY_CONTROL_DIRECTORY="$PROJECT_DIRECTORY/control"
+MANAGED_MARKER="Managed by NodePing Docker installer"
 
 is_loopback_http_url() {
 	local value="$1"
@@ -64,6 +60,47 @@ normalize_allow_insecure_http() {
 	esac
 }
 
+normalize_signature_mode() {
+	case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+		1|true|yes|on|required) printf 'required' ;;
+		auto|'') printf 'auto' ;;
+		0|false|no|off|disabled) printf 'disabled' ;;
+		*) return 1 ;;
+	esac
+}
+
+normalize_release_version() {
+	local value="${1#nodeping-agent/}"
+	case "$value" in
+		v*) printf '%s' "$value" ;;
+		[0-9]*) printf 'v%s' "$value" ;;
+		*) printf '%s' "$value" ;;
+	esac
+}
+
+valid_release_version() {
+	local value="${1#v}"
+	local without_build prerelease="" build="" identifier
+	local -a identifiers
+	[[ "$value" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || return 1
+	without_build="$value"
+	if [[ "$without_build" == *+* ]]; then
+		build="${without_build#*+}"
+		without_build="${without_build%%+*}"
+		case "$build" in ''|.*|*.|*..*) return 1 ;; esac
+	fi
+	if [[ "$without_build" == *-* ]]; then
+		prerelease="${without_build#*-}"
+		case "$prerelease" in ''|.*|*.|*..*) return 1 ;; esac
+		IFS=. read -r -a identifiers <<< "$prerelease"
+		for identifier in "${identifiers[@]}"; do
+			if [[ "$identifier" =~ ^[0-9]+$ ]] && [[ "$identifier" == 0* ]] && [ "$identifier" != "0" ]; then
+				return 1
+			fi
+		done
+	fi
+}
+
 validate_env_value() {
 	local name="$1" value="$2"
 	if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then
@@ -80,12 +117,167 @@ validate_image() {
 	fi
 }
 
+validate_minisign_public_key() {
+	local value="$1"
+	[ -z "$value" ] && return 0
+	if [[ ! "$value" =~ ^RW[A-Za-z0-9+/]{54}$ ]]; then
+		say_err "NODEPING_AGENT_MINISIGN_PUBLIC_KEY 不是有效的 minisign 公钥" "NODEPING_AGENT_MINISIGN_PUBLIC_KEY is not a valid minisign public key"
+		return 1
+	fi
+}
+
 require_command() {
 	local name="$1"
 	if ! command -v "$name" >/dev/null 2>&1; then
 		say_err "缺少必需命令：$name" "required command not found: $name"
 		return 1
 	fi
+}
+
+ensure_private_directory() {
+	local path="$1"
+	mkdir -p "$path"
+	chmod 0700 "$path"
+}
+
+copy_file_with_mode() {
+	local source="$1" target="$2" mode="$3" target_directory temporary
+	target_directory="${target%/*}"
+	temporary="$(mktemp "$target_directory/.nodeping-install.XXXXXX")"
+	if ! cp "$source" "$temporary"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	if ! chmod "$mode" "$temporary" || ! mv -f "$temporary" "$target"; then
+		rm -f "$temporary"
+		return 1
+	fi
+}
+
+validate_data_directory_ownership() {
+	local marker="$DATA_DIRECTORY/.nodeping-agent-docker-data" existing
+	if [ ! -e "$DATA_DIRECTORY" ]; then
+		return 0
+	fi
+	if [ ! -d "$DATA_DIRECTORY" ] || [ -L "$DATA_DIRECTORY" ]; then
+		say_err "Agent 数据目录必须是普通目录：$DATA_DIRECTORY" "Agent data directory must be a regular directory: $DATA_DIRECTORY"
+		return 1
+	fi
+	if [ -f "$marker" ] && [ ! -L "$marker" ] && grep -Fqx "$MANAGED_MARKER" "$marker"; then
+		return 0
+	fi
+	for existing in "$DATA_DIRECTORY"/* "$DATA_DIRECTORY"/.[!.]* "$DATA_DIRECTORY"/..?*; do
+		if [ -e "$existing" ] || [ -L "$existing" ]; then
+			say_err "拒绝接管未标记的非空数据目录：$DATA_DIRECTORY；当前系统不会进行任何安装" "refusing to take over an unmarked non-empty data directory: $DATA_DIRECTORY; nothing was installed"
+			return 1
+		fi
+	done
+}
+
+validate_runtime_directory_ownership() {
+	local marker="$RUNTIME_DIRECTORY/.nodeping-agent-docker-runtime" existing
+	if [ ! -e "$RUNTIME_DIRECTORY" ]; then
+		return 0
+	fi
+	if [ ! -d "$RUNTIME_DIRECTORY" ] || [ -L "$RUNTIME_DIRECTORY" ]; then
+		say_err "Agent 运行目录必须是普通目录：$RUNTIME_DIRECTORY" "Agent runtime directory must be a regular directory: $RUNTIME_DIRECTORY"
+		return 1
+	fi
+	if [ -f "$marker" ] && [ ! -L "$marker" ] && grep -Fqx "$MANAGED_MARKER" "$marker"; then
+		return 0
+	fi
+	for existing in "$RUNTIME_DIRECTORY"/* "$RUNTIME_DIRECTORY"/.[!.]* "$RUNTIME_DIRECTORY"/..?*; do
+		if [ -e "$existing" ] || [ -L "$existing" ]; then
+			say_err "拒绝接管未标记的非空运行目录：$RUNTIME_DIRECTORY；当前系统不会进行任何安装" "refusing to take over an unmarked non-empty runtime directory: $RUNTIME_DIRECTORY; nothing was installed"
+			return 1
+		fi
+	done
+}
+
+remove_legacy_host_upgrade_watcher() {
+	if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+		for unit in nodeping-agent-docker-update.path nodeping-agent-docker-update.timer nodeping-agent-docker-update.service; do
+			systemctl disable --now "$unit" >/dev/null 2>&1 || true
+		done
+		for unit_file in \
+			/etc/systemd/system/nodeping-agent-docker-update.path \
+			/etc/systemd/system/nodeping-agent-docker-update.timer \
+			/etc/systemd/system/nodeping-agent-docker-update.service; do
+			if [ -f "$unit_file" ] && grep -Fq "$MANAGED_MARKER" "$unit_file"; then
+				rm -f "$unit_file"
+			fi
+		done
+		systemctl daemon-reload >/dev/null 2>&1 || true
+	fi
+	if [ -f /etc/init.d/nodeping-agent-docker-update ] && grep -Fq "$MANAGED_MARKER" /etc/init.d/nodeping-agent-docker-update; then
+		/etc/init.d/nodeping-agent-docker-update stop >/dev/null 2>&1 || true
+		/etc/init.d/nodeping-agent-docker-update disable >/dev/null 2>&1 || true
+		rm -f /etc/init.d/nodeping-agent-docker-update
+	fi
+}
+
+validate_managed_directory() {
+	local name="$1" value="$2"
+	case "$value" in
+		/*) ;;
+		*) say_err "$name 必须是绝对路径" "$name must be an absolute path"; return 1 ;;
+	esac
+	if [[ ! "$value" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+		say_err "$name 只能包含字母、数字、点、下划线、横线和斜线" "$name contains unsupported characters"
+		return 1
+	fi
+	case "$value" in
+		*/../*|*/..|*/./*|*/.|*//*)
+			say_err "$name 不能包含点路径或重复斜线" "$name must not contain dot components or repeated slashes"
+			return 1
+			;;
+		/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+			say_err "$name 不能指向系统顶层目录" "$name must not point to a top-level system directory"
+			return 1
+			;;
+	esac
+	if [ -L "$value" ]; then
+		say_err "$name 不能是符号链接" "$name must not be a symbolic link"
+		return 1
+	fi
+}
+
+validate_directory_layout() {
+	case "$PROJECT_DIRECTORY" in
+		"$DATA_DIRECTORY"|"$DATA_DIRECTORY"/*)
+			say_err "Agent 数据目录不能等于或包含安装目录" "the Agent data directory must not equal or contain the project directory"
+			return 1
+			;;
+		"$RUNTIME_DIRECTORY"|"$RUNTIME_DIRECTORY"/*)
+			say_err "Agent 运行目录不能等于或包含安装目录" "the Agent runtime directory must not equal or contain the project directory"
+			return 1
+			;;
+	esac
+	case "$DATA_DIRECTORY" in
+		"$RUNTIME_DIRECTORY"|"$RUNTIME_DIRECTORY"/*)
+			say_err "Agent 数据目录与运行目录不能重叠" "the Agent data and runtime directories must not overlap"
+			return 1
+			;;
+	esac
+	case "$RUNTIME_DIRECTORY" in
+		"$DATA_DIRECTORY"/*)
+			say_err "Agent 数据目录与运行目录不能重叠" "the Agent data and runtime directories must not overlap"
+			return 1
+			;;
+	esac
+}
+
+detect_supported_architecture() {
+	local machine
+	machine="$(uname -m)"
+	case "$machine" in
+		x86_64|amd64) printf 'amd64\n' ;;
+		aarch64|arm64) printf 'arm64\n' ;;
+		*)
+			say_err "NodePing Docker 镜像仅支持 amd64 和 arm64，当前架构为 ${machine}；手动 Compose 同样不可用，请返回页面查看原生 Agent 兼容性说明" "NodePing Docker images support only amd64 and arm64; manual Compose is unavailable on this architecture too; return to the page for native Agent compatibility guidance"
+			return 1
+			;;
+	esac
 }
 
 download_file() {
@@ -126,90 +318,76 @@ esac
 case "$IMAGE_VERSION" in
 	''|*[!A-Za-z0-9._-]*) say_err "NODEPING_AGENT_IMAGE_VERSION 无效" "invalid NODEPING_AGENT_IMAGE_VERSION"; exit 2 ;;
 esac
-case "$PROJECT_DIRECTORY" in
-	/*) ;;
-	*) say_err "安装目录必须是绝对路径" "project directory must be absolute"; exit 2 ;;
-esac
-for directory_item in "project:$PROJECT_DIRECTORY" "data:$DATA_DIRECTORY"; do
-	directory_name="${directory_item%%:*}"
-	directory_value="${directory_item#*:}"
-	case "$directory_value" in
-		/*) ;;
-		*) say_err "$directory_name 目录必须是绝对路径" "$directory_name directory must be absolute"; exit 2 ;;
-	esac
-	if [[ ! "$directory_value" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
-		say_err "$directory_name 目录只能包含字母、数字、点、下划线、横线和斜线" "$directory_name directory contains unsupported characters"
-		exit 2
-	fi
-done
+validate_managed_directory "安装目录" "$PROJECT_DIRECTORY"
+validate_managed_directory "Agent 数据目录" "$DATA_DIRECTORY"
+validate_managed_directory "Agent 运行目录" "$RUNTIME_DIRECTORY"
+validate_directory_layout
 
 validate_secure_url "$SERVER_URL" "NODEPING_SERVER_URL" "$ALLOW_INSECURE_HTTP"
 validate_secure_url "$DEPLOY_BASE_URL" "NODEPING_AGENT_DEPLOY_BASE_URL"
 validate_image "NODEPING_AGENT_DOCKER_IMAGE_CN" "$DOCKER_IMAGE_CN"
 validate_image "NODEPING_AGENT_DOCKER_IMAGE_GLOBAL" "$DOCKER_IMAGE_GLOBAL"
-for item in "NODEPING_TOKEN:$BINDING_TOKEN" "NODEPING_AGENT_ID:$AGENT_ID" "NODEPING_AGENT_NAME:$AGENT_NAME"; do
+for item in \
+	"NODEPING_TOKEN:$BINDING_TOKEN" \
+	"NODEPING_AGENT_ID:$AGENT_ID" \
+	"NODEPING_AGENT_NAME:$AGENT_NAME" \
+	"NODEPING_AGENT_MINISIGN_PUBLIC_KEY:$SIGNING_PUBLIC_KEY" \
+	"NODEPING_AGENT_REQUIRE_SIGNATURE:$REQUIRE_SIGNATURE" \
+	"NODEPING_AGENT_SIGNATURE_REQUIRED_FROM:$SIGNATURE_REQUIRED_FROM"; do
 	validate_env_value "${item%%:*}" "${item#*:}"
 done
+if ! REQUIRE_SIGNATURE="$(normalize_signature_mode "$REQUIRE_SIGNATURE")"; then
+	say_err "NODEPING_AGENT_REQUIRE_SIGNATURE 配置无效" "invalid NODEPING_AGENT_REQUIRE_SIGNATURE; use required, auto, or disabled"
+	exit 2
+fi
+validate_minisign_public_key "$SIGNING_PUBLIC_KEY"
+if [ -n "$SIGNATURE_REQUIRED_FROM" ]; then
+	SIGNATURE_REQUIRED_FROM="$(normalize_release_version "$SIGNATURE_REQUIRED_FROM")"
+	if ! valid_release_version "$SIGNATURE_REQUIRED_FROM"; then
+		say_err "NODEPING_AGENT_SIGNATURE_REQUIRED_FROM 不是有效 SemVer" "NODEPING_AGENT_SIGNATURE_REQUIRED_FROM is not valid SemVer"
+		exit 2
+	fi
+fi
+if { [ "$REQUIRE_SIGNATURE" = "required" ] || [ -n "$SIGNATURE_REQUIRED_FROM" ]; } && [ -z "$SIGNING_PUBLIC_KEY" ]; then
+	say_err "签名策略需要 NODEPING_AGENT_MINISIGN_PUBLIC_KEY" "the signature policy requires NODEPING_AGENT_MINISIGN_PUBLIC_KEY"
+	exit 2
+fi
+detect_supported_architecture >/dev/null
 require_command docker
 if ! docker compose version >/dev/null 2>&1; then
-	say_err "需要 Docker Compose v2 插件" "Docker Compose v2 plugin is required"
+	say_err "需要 Docker Compose v2 插件；OpenWrt 请确认已安装兼容当前架构的 Compose v2" "Docker Compose v2 is required; on OpenWrt, install a Compose v2 plugin compatible with this architecture"
 	exit 1
 fi
+for command_name in mkdir cp chmod mv rm mktemp sed grep head tr; do
+	require_command "$command_name"
+done
+validate_data_directory_ownership
+validate_runtime_directory_ownership
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
 	say_err "需要安装 curl 或 wget" "curl or wget is required"
 	exit 1
 fi
-
-REMOTE_UPGRADE_MODE=disabled
-if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files >/dev/null 2>&1; then
-	REMOTE_UPGRADE_MODE=request_file
-fi
-
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 download_file "${DEPLOY_BASE_URL%/}/compose.yml" "$tmp_dir/compose.yml"
 download_file "${DEPLOY_BASE_URL%/}/update-docker.sh" "$tmp_dir/update-docker.sh"
+download_file "${DEPLOY_BASE_URL%/}/uninstall-docker.sh" "$tmp_dir/uninstall-docker.sh"
 bash -n "$tmp_dir/update-docker.sh"
+bash -n "$tmp_dir/uninstall-docker.sh"
 
-install -d -m 0700 "$PROJECT_DIRECTORY"
-install -d -m 0700 "$DATA_DIRECTORY"
-install -m 0644 "$tmp_dir/compose.yml" "$PROJECT_DIRECTORY/compose.yml"
-install -m 0755 "$tmp_dir/update-docker.sh" "$PROJECT_DIRECTORY/update-docker.sh"
-CONTROL_DIRECTORY="$PROJECT_DIRECTORY/control"
-install -d -m 0700 "$CONTROL_DIRECTORY"
+ensure_private_directory "$PROJECT_DIRECTORY"
+ensure_private_directory "$DATA_DIRECTORY"
+ensure_private_directory "$RUNTIME_DIRECTORY"
+copy_file_with_mode "$tmp_dir/compose.yml" "$PROJECT_DIRECTORY/compose.yml" 0644
+copy_file_with_mode "$tmp_dir/update-docker.sh" "$PROJECT_DIRECTORY/update-docker.sh" 0755
+copy_file_with_mode "$tmp_dir/uninstall-docker.sh" "$PROJECT_DIRECTORY/uninstall-docker.sh" 0755
+printf '%s\n' "$MANAGED_MARKER" > "$tmp_dir/data-marker"
+copy_file_with_mode "$tmp_dir/data-marker" "$DATA_DIRECTORY/.nodeping-agent-docker-data" 0600
+copy_file_with_mode "$tmp_dir/data-marker" "$RUNTIME_DIRECTORY/.nodeping-agent-docker-runtime" 0600
+remove_legacy_host_upgrade_watcher
+rm -f "$PROJECT_DIRECTORY/watch-docker-update.sh"
+rm -f "$LEGACY_CONTROL_DIRECTORY/update-request.json" "$LEGACY_CONTROL_DIRECTORY/update-request.json.processing" "$LEGACY_CONTROL_DIRECTORY/update-request.json.failed"
 
-if [ "$REMOTE_UPGRADE_MODE" = "request_file" ]; then
-	cat > "$tmp_dir/nodeping-agent-docker-update.service" <<UNIT
-[Unit]
-Description=Update NodePing Agent Docker deployment
-Wants=network-online.target docker.service
-After=network-online.target docker.service
-
-[Service]
-Type=oneshot
-Environment="ENV_FILE=$PROJECT_DIRECTORY/.env"
-Environment="PROJECT_DIRECTORY=$PROJECT_DIRECTORY"
-Environment="NODEPING_AGENT_DOCKER_REQUEST_FILE=$CONTROL_DIRECTORY/update-request.json"
-ExecStart=$PROJECT_DIRECTORY/update-docker.sh
-UNIT
-	cat > "$tmp_dir/nodeping-agent-docker-update.path" <<UNIT
-[Unit]
-Description=Watch NodePing Agent Docker update requests
-
-[Path]
-PathExists=$CONTROL_DIRECTORY/update-request.json
-PathChanged=$CONTROL_DIRECTORY/update-request.json
-Unit=nodeping-agent-docker-update.service
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-	install -m 0644 "$tmp_dir/nodeping-agent-docker-update.service" /etc/systemd/system/nodeping-agent-docker-update.service
-	install -m 0644 "$tmp_dir/nodeping-agent-docker-update.path" /etc/systemd/system/nodeping-agent-docker-update.path
-	rm -f "$CONTROL_DIRECTORY/update-request.json"
-fi
-
-install -m 0600 /dev/null "$PROJECT_DIRECTORY/.env"
 {
 	printf 'NODEPING_SERVER_URL="%s"\n' "$(env_quote "$SERVER_URL")"
 	printf 'NODEPING_AGENT_ALLOW_INSECURE_HTTP="%s"\n' "$(env_quote "$ALLOW_INSECURE_HTTP")"
@@ -223,21 +401,15 @@ install -m 0600 /dev/null "$PROJECT_DIRECTORY/.env"
 	printf 'NODEPING_AGENT_IMAGE_VERSION="%s"\n' "$(env_quote "$IMAGE_VERSION")"
 	printf 'NODEPING_AGENT_DEPLOY_BASE_URL="%s"\n' "$(env_quote "$DEPLOY_BASE_URL")"
 	printf 'NODEPING_AGENT_DOCKER_DATA_DIRECTORY="%s"\n' "$(env_quote "$DATA_DIRECTORY")"
-	printf 'NODEPING_AGENT_UPGRADE_MODE="%s"\n' "$(env_quote "$REMOTE_UPGRADE_MODE")"
-	printf 'NODEPING_AGENT_UPGRADE_REQUEST_FILE="/run/nodeping-agent/update-request.json"\n'
-	printf 'NODEPING_AGENT_DOCKER_CONTROL_DIRECTORY="%s"\n' "$(env_quote "$CONTROL_DIRECTORY")"
-} > "$PROJECT_DIRECTORY/.env"
-chmod 0600 "$PROJECT_DIRECTORY/.env"
-
-if [ "$REMOTE_UPGRADE_MODE" = "request_file" ]; then
-	systemctl_quiet daemon-reload
-	systemctl_quiet enable --now nodeping-agent-docker-update.path
-fi
+	printf 'NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY="%s"\n' "$(env_quote "$RUNTIME_DIRECTORY")"
+	printf 'NODEPING_AGENT_UPGRADE_MODE="container"\n'
+	printf 'NODEPING_AGENT_ACTIVATION_STABLE_SECONDS="20"\n'
+	printf 'NODEPING_AGENT_MINISIGN_PUBLIC_KEY="%s"\n' "$(env_quote "$SIGNING_PUBLIC_KEY")"
+	printf 'NODEPING_AGENT_REQUIRE_SIGNATURE="%s"\n' "$(env_quote "$REQUIRE_SIGNATURE")"
+	printf 'NODEPING_AGENT_SIGNATURE_REQUIRED_FROM="%s"\n' "$(env_quote "$SIGNATURE_REQUIRED_FROM")"
+} > "$tmp_dir/nodeping-agent.env"
+copy_file_with_mode "$tmp_dir/nodeping-agent.env" "$PROJECT_DIRECTORY/.env" 0600
 
 ENV_FILE="$PROJECT_DIRECTORY/.env" PROJECT_DIRECTORY="$PROJECT_DIRECTORY" "$PROJECT_DIRECTORY/update-docker.sh"
-if [ "$REMOTE_UPGRADE_MODE" = "request_file" ]; then
-	say "控制台远程升级已启用：nodeping-agent-docker-update.path" "control-panel upgrades enabled: nodeping-agent-docker-update.path"
-else
-	say "当前主机未运行 systemd，控制台远程升级保持禁用；可手动运行 $PROJECT_DIRECTORY/update-docker.sh" "systemd is not running; control-panel upgrades remain disabled; run $PROJECT_DIRECTORY/update-docker.sh manually"
-fi
-say "nodeping-agent Docker 部署已安装（$DISTRIBUTION_MODE）" "nodeping-agent Docker deployment installed ($DISTRIBUTION_MODE)"
+say "控制台远程升级已启用：容器内 Agent 更新器" "control-panel upgrades enabled: in-container Agent updater"
+say "nodeping-agent Docker 部署已安装（${DISTRIBUTION_MODE}）" "nodeping-agent Docker deployment installed ($DISTRIBUTION_MODE)"

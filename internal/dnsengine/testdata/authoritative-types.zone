@@ -1,0 +1,29 @@
+$ORIGIN types.test.
+$TTL 300
+
+@ IN SOA ns.types.test. hostmaster.types.test. 2026071901 3600 600 86400 300
+@ IN NS ns.types.test.
+ns IN A 192.0.2.53
+
+A.Types.Test. IN A 192.0.2.10
+A.Types.Test. IN A 192.0.2.11
+aaaa IN AAAA 2001:db8::10
+alias IN CNAME a.types.test.
+@ IN MX 10 mail.types.test.
+text IN TXT "authoritative fixture"
+@ IN CAA 0 issue "ca.example"
+_sip._tcp IN SRV 10 20 5060 sip.types.test.
+10.2.0.192.in-addr.arpa. IN PTR ptr.types.test.
+child IN DS 12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+@ IN DNSKEY 257 3 13 AQID
+_443._tcp.tlsa IN TLSA 3 1 1 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+service IN SVCB 1 target.types.test. alpn="h2,h3" port=8443 ipv4hint=192.0.2.80
+service IN HTTPS 1 target.types.test. alpn="h2,h3" port=8443 ipv4hint=192.0.2.80
+
+branch IN DNAME destination.test.
+signed IN A 192.0.2.40
+signed IN RRSIG A 13 3 300 20300101000000 20250101000000 12345 types.test. AQID
+nodata IN A 192.0.2.50
+nodata IN NSEC next.types.test. A RRSIG NSEC
+hash IN NSEC3 1 0 5 A1B2 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A AAAA RRSIG
+@ IN NSEC3PARAM 1 0 5 A1B2

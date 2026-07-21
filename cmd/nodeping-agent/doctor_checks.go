@@ -57,7 +57,7 @@ func checkUpgradeControl(cfg config) doctorCheck {
 			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: "systemctl not found"}
 		}
 		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "systemd unit " + cfg.UpgradeUnit}
-	case "script":
+	case "container", "script":
 		path, err := fixedUpgradeScriptPath(cfg.UpgradeScript)
 		if err != nil {
 			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: err.Error()}
@@ -66,6 +66,9 @@ func checkUpgradeControl(cfg config) doctorCheck {
 			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: err.Error()}
 		} else if info.IsDir() || info.Mode()&0o111 == 0 {
 			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "fail", Message: "upgrade script is not executable"}
+		}
+		if mode == "container" {
+			return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: "container updater " + path}
 		}
 		return doctorCheck{Key: "upgrade_control", Name: "upgrade control", Status: "ok", Message: path}
 	default:

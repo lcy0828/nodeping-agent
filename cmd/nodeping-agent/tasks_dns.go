@@ -20,6 +20,10 @@ import (
 )
 
 func runDNSLookup(ctx context.Context, payload map[string]any) (map[string]any, error) {
+	return runDNSLookupWithOptions(ctx, payload, nil)
+}
+
+func runDNSLookupWithOptions(ctx context.Context, payload map[string]any, options map[string]any) (map[string]any, error) {
 	domain := strings.TrimSuffix(strings.TrimSpace(fmt.Sprint(payload["domain"])), ".")
 	if domain == "" {
 		return nil, errors.New("dns domain is required")
@@ -29,7 +33,7 @@ func runDNSLookup(ctx context.Context, payload map[string]any) (map[string]any, 
 		recordType = strings.ToUpper(strings.TrimSpace(fmt.Sprint(records[0])))
 	}
 	started := time.Now()
-	answers, err := lookupDNSRecord(ctx, domain, recordType, payload)
+	answers, err := lookupDNSRecordWithOptions(ctx, domain, recordType, payload, options)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +60,11 @@ func runDNSCompare(ctx context.Context, payload map[string]any, options map[stri
 		resolvers = compareResolvers(options["compare_resolvers"])
 	}
 	if len(resolvers) == 0 {
-		resolvers = []string{"system", "223.5.5.5", "119.29.29.29"}
+		var err error
+		resolvers, err = defaultDNSCompareResolvers(options)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(resolvers) > 6 {
 		resolvers = resolvers[:6]
@@ -75,7 +83,7 @@ func runDNSCompare(ctx context.Context, payload map[string]any, options map[stri
 			rowPayload["dns_protocol"] = dnsProtocolFromResolverText(resolver)
 		}
 		rowStarted := time.Now()
-		result, err := runDNSLookup(ctx, rowPayload)
+		result, err := runDNSLookupWithOptions(ctx, rowPayload, options)
 		row := map[string]any{
 			"resolver":   resolver,
 			"latency_ms": elapsedMS(rowStarted),
@@ -94,7 +102,7 @@ func runDNSCompare(ctx context.Context, payload map[string]any, options map[stri
 		rows = append(rows, row)
 	}
 	consistent := len(sets) <= 1 && successes == len(resolvers)
-	return map[string]any{
+	result := map[string]any{
 		"dns_compare":    elapsedMS(started),
 		"domain":         domain,
 		"record_type":    recordType,
@@ -103,16 +111,31 @@ func runDNSCompare(ctx context.Context, payload map[string]any, options map[stri
 		"success_count":  successes,
 		"mismatch_count": maxInt(0, len(sets)-1),
 		"consistent":     consistent,
-	}, nil
+	}
+	if successes == 0 {
+		return result, errors.New("all DNS resolvers failed")
+	}
+	return result, nil
 }
 
 func lookupDNSRecord(ctx context.Context, domain string, recordType string, payload map[string]any) ([]map[string]any, error) {
+	return lookupDNSRecordWithOptions(ctx, domain, recordType, payload, nil)
+}
+
+func lookupDNSRecordWithOptions(ctx context.Context, domain string, recordType string, payload map[string]any, options map[string]any) ([]map[string]any, error) {
 	recordType = strings.ToUpper(strings.TrimSpace(recordType))
 	if recordType == "" {
 		recordType = "A"
 	}
 	server := strings.TrimSpace(fmt.Sprint(payload["dns_server"]))
 	if server == "" || server == "<nil>" || strings.EqualFold(server, "system") {
+		family, err := requestedProbeIPFamily(options)
+		if err != nil {
+			return nil, err
+		}
+		if family != probeIPFamilyAny {
+			return nil, fmt.Errorf("system DNS transport cannot guarantee requested %s; configure an explicit DNS resolver", family.displayName())
+		}
 		return lookupDNSSystem(ctx, domain, recordType)
 	}
 	protocol := strings.ToLower(strings.TrimSpace(fmt.Sprint(payload["dns_protocol"])))
@@ -122,14 +145,11 @@ func lookupDNSRecord(ctx context.Context, domain string, recordType string, payl
 	if protocol == "" {
 		protocol = "udp"
 	}
-	if err := requirePublicResolverHost(ctx, server); err != nil {
-		return nil, err
-	}
 	query, err := buildDNSQueryMessage(domain, recordType, protocol)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := exchangeDNSQuery(ctx, server, protocol, query)
+	resp, err := exchangeDNSQueryWithOptions(ctx, server, protocol, query, options)
 	if err != nil {
 		return nil, err
 	}
@@ -226,23 +246,105 @@ func dnsMessageType(recordType string) dnsmessage.Type {
 }
 
 func exchangeDNSQuery(ctx context.Context, server string, protocol string, query []byte) ([]byte, error) {
-	switch strings.ToLower(strings.TrimSpace(protocol)) {
-	case "tcp":
-		return exchangeDNSTCP(ctx, dnsServerAddressForProtocol(server, "tcp"), query)
-	case "dot":
-		return exchangeDNSDoT(ctx, server, dnsServerAddressForProtocol(server, "dot"), query)
-	case "doh":
-		return exchangeDNSDoH(ctx, server, query)
-	case "doq":
-		return exchangeDNSDoQ(ctx, server, dnsServerAddressForProtocol(server, "doq"), query)
-	default:
-		return exchangeDNSUDP(ctx, dnsServerAddressForProtocol(server, "udp"), query)
+	return exchangeDNSQueryWithOptions(ctx, server, protocol, query, nil)
+}
+
+type dnsExchangeTarget struct {
+	server        string
+	protocol      string
+	address       string
+	dohEndpoint   string
+	tlsServerName string
+	resolver      *probeTargetResolver
+}
+
+func prepareDNSExchangeTarget(ctx context.Context, server string, protocol string, options map[string]any) (dnsExchangeTarget, error) {
+	server = strings.TrimSpace(server)
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	if server == "" {
+		return dnsExchangeTarget{}, errors.New("dns server is required")
 	}
+	if protocol == "" {
+		protocol = "udp"
+	}
+	switch protocol {
+	case "udp", "tcp", "dot", "doh", "doq":
+	default:
+		return dnsExchangeTarget{}, fmt.Errorf("unsupported dns protocol: %s", protocol)
+	}
+
+	resolver := newProbeTargetResolver(options)
+	target := dnsExchangeTarget{server: server, protocol: protocol, resolver: resolver}
+	if protocol == "doh" {
+		endpoint, err := dohEndpointAgent(server)
+		if err != nil {
+			return dnsExchangeTarget{}, err
+		}
+		parsed, err := url.Parse(endpoint)
+		if err != nil || parsed.Hostname() == "" {
+			return dnsExchangeTarget{}, errors.New("doh server is invalid")
+		}
+		port := parsed.Port()
+		if port == "" {
+			port = "443"
+		}
+		resolved, err := resolver.resolveHostPort(ctx, net.JoinHostPort(parsed.Hostname(), port))
+		if err != nil {
+			return dnsExchangeTarget{}, err
+		}
+		target.address = net.JoinHostPort(resolved.IP.String(), resolved.Port)
+		target.dohEndpoint = endpoint
+		target.tlsServerName = parsed.Hostname()
+		return target, nil
+	}
+
+	serverAddr := dnsServerAddressForProtocol(server, protocol)
+	resolved, err := resolver.resolveHostPort(ctx, serverAddr)
+	if err != nil {
+		return dnsExchangeTarget{}, err
+	}
+	target.address = net.JoinHostPort(resolved.IP.String(), resolved.Port)
+	target.tlsServerName = dnsTLSServerName(server, serverAddr)
+	return target, nil
+}
+
+func exchangeDNSQueryWithOptions(ctx context.Context, server string, protocol string, query []byte, options map[string]any) ([]byte, error) {
+	target, err := prepareDNSExchangeTarget(ctx, server, protocol, options)
+	if err != nil {
+		return nil, err
+	}
+	switch target.protocol {
+	case "tcp":
+		return exchangeDNSTCP(ctx, target.address, query)
+	case "dot":
+		return exchangeDNSDoT(ctx, target.server, target.address, query)
+	case "doh":
+		return exchangeDNSDoHPrepared(ctx, target, query)
+	case "doq":
+		return exchangeDNSDoQ(ctx, target.server, target.address, query)
+	default:
+		return exchangeDNSUDP(ctx, target.address, query)
+	}
+}
+
+func dnsNetworkForAddress(base string, serverAddr string) string {
+	host, _, err := net.SplitHostPort(serverAddr)
+	if err != nil {
+		return base
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return base
+	}
+	if ip.To4() != nil {
+		return base + "4"
+	}
+	return base + "6"
 }
 
 func exchangeDNSUDP(ctx context.Context, serverAddr string, query []byte) ([]byte, error) {
 	dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 3*time.Second)}
-	conn, err := dialer.DialContext(ctx, "udp", serverAddr)
+	conn, err := dialer.DialContext(ctx, dnsNetworkForAddress("udp", serverAddr), serverAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +363,7 @@ func exchangeDNSUDP(ctx context.Context, serverAddr string, query []byte) ([]byt
 
 func exchangeDNSTCP(ctx context.Context, serverAddr string, query []byte) ([]byte, error) {
 	dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 3*time.Second)}
-	conn, err := dialer.DialContext(ctx, "tcp", serverAddr)
+	conn, err := dialer.DialContext(ctx, dnsNetworkForAddress("tcp", serverAddr), serverAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -271,7 +373,7 @@ func exchangeDNSTCP(ctx context.Context, serverAddr string, query []byte) ([]byt
 
 func exchangeDNSDoT(ctx context.Context, server string, serverAddr string, query []byte) ([]byte, error) {
 	dialer := net.Dialer{Timeout: deadlineTimeout(ctx, 3*time.Second)}
-	conn, err := tls.DialWithDialer(&dialer, "tcp", serverAddr, &tls.Config{
+	conn, err := tls.DialWithDialer(&dialer, dnsNetworkForAddress("tcp", serverAddr), serverAddr, &tls.Config{
 		ServerName: dnsTLSServerName(server, serverAddr),
 		MinVersion: tls.VersionTLS12,
 	})
@@ -303,17 +405,23 @@ func exchangeDNSDoQ(ctx context.Context, server string, serverAddr string, query
 }
 
 func exchangeDNSDoH(ctx context.Context, server string, query []byte) ([]byte, error) {
-	endpoint, err := dohEndpointAgent(server)
+	target, err := prepareDNSExchangeTarget(ctx, server, "doh", nil)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(query))
+	return exchangeDNSDoHPrepared(ctx, target, query)
+}
+
+func exchangeDNSDoHPrepared(ctx context.Context, target dnsExchangeTarget, query []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.dohEndpoint, bytes.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("content-type", "application/dns-message")
 	req.Header.Set("accept", "application/dns-message")
-	client := &http.Client{Timeout: deadlineTimeout(ctx, 5*time.Second), Transport: safeHTTPTransport(ctx, "", false), CheckRedirect: safeHTTPRedirectPolicy(false)}
+	transport := safeHTTPTransportWithResolver(target.tlsServerName, target.resolver)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Timeout: deadlineTimeout(ctx, 5*time.Second), Transport: transport, CheckRedirect: rejectDNSRedirect}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -323,6 +431,10 @@ func exchangeDNSDoH(ctx context.Context, server string, query []byte) ([]byte, e
 		return nil, fmt.Errorf("doh http status %d", resp.StatusCode)
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, 65535))
+}
+
+func rejectDNSRedirect(_ *http.Request, _ []*http.Request) error {
+	return errors.New("doh redirects are not allowed")
 }
 
 func exchangeDNSFramedAgent(conn io.ReadWriter, query []byte) ([]byte, error) {
@@ -490,6 +602,21 @@ func dnsProtocolFromResolverText(resolver string) string {
 		return "doh"
 	}
 	return "udp"
+}
+
+func defaultDNSCompareResolvers(options map[string]any) ([]string, error) {
+	family, err := requestedProbeIPFamily(options)
+	if err != nil {
+		return nil, err
+	}
+	switch family {
+	case probeIPFamilyIPv4:
+		return []string{"223.5.5.5", "119.29.29.29"}, nil
+	case probeIPFamilyIPv6:
+		return []string{"2400:3200::1", "2402:4e00::"}, nil
+	default:
+		return []string{"system", "223.5.5.5", "119.29.29.29"}, nil
+	}
 }
 
 func compareResolvers(raw any) []string {

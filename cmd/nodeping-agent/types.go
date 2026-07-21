@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"nodeping/internal/dnsobs"
 )
 
 type config struct {
@@ -21,6 +23,12 @@ type config struct {
 	UpgradeRequestFile string
 	ReleaseProxyFile   string
 	LatestVersionFile  string
+	DNSRootStateDir    string
+	DNSRootHintsFile   string
+	DNSRootManifest    string
+	DNSRootPublicKeys  string
+	DNSAnchorBinary    string
+	DNSCheckconfBinary string
 	HeartbeatInterval  time.Duration
 	PublicIPInterval   time.Duration
 	StreamIdleTimeout  time.Duration
@@ -30,6 +38,7 @@ type config struct {
 	Concurrency        int
 	HTTPClient         *http.Client
 	AllowInsecureHTTP  bool
+	RestartRequested   chan struct{}
 	PrintVersion       bool
 	Doctor             bool
 	DoctorJSON         bool
@@ -51,25 +60,28 @@ type taskRequest struct {
 }
 
 type taskResult struct {
-	TaskID       string         `json:"task_id"`
-	Status       string         `json:"status"`
-	Success      bool           `json:"success"`
-	LatencyMS    float64        `json:"latency_ms,omitempty"`
-	ResponseIP   string         `json:"response_ip,omitempty"`
-	Result       map[string]any `json:"result,omitempty"`
-	Extra        map[string]any `json:"extra,omitempty"`
-	ErrorCode    string         `json:"error_code,omitempty"`
-	ErrorMessage string         `json:"error_message,omitempty"`
-	FinishedAt   time.Time      `json:"finished_at"`
+	TaskID       string              `json:"task_id"`
+	Status       string              `json:"status"`
+	Success      bool                `json:"success"`
+	LatencyMS    float64             `json:"latency_ms,omitempty"`
+	ResponseIP   string              `json:"response_ip,omitempty"`
+	Result       map[string]any      `json:"result,omitempty"`
+	DNSResult    *dnsobs.BatchResult `json:"dns_result,omitempty"`
+	Extra        map[string]any      `json:"extra,omitempty"`
+	ErrorCode    string              `json:"error_code,omitempty"`
+	ErrorMessage string              `json:"error_message,omitempty"`
+	FinishedAt   time.Time           `json:"finished_at"`
 }
 
 type taskEvent struct {
-	TaskID    string         `json:"task_id"`
-	Status    string         `json:"status"`
-	Message   string         `json:"message,omitempty"`
-	Progress  int            `json:"progress,omitempty"`
-	Extra     map[string]any `json:"extra,omitempty"`
-	CreatedAt time.Time      `json:"created_at"`
+	TaskID         string              `json:"task_id"`
+	Status         string              `json:"status"`
+	Message        string              `json:"message,omitempty"`
+	Progress       int                 `json:"progress,omitempty"`
+	EventKind      string              `json:"event_kind,omitempty"`
+	DNSObservation *dnsobs.Observation `json:"dns_observation,omitempty"`
+	Extra          map[string]any      `json:"extra,omitempty"`
+	CreatedAt      time.Time           `json:"created_at"`
 }
 
 type registerResponse struct {
@@ -118,17 +130,44 @@ type doctorCheck struct {
 	Required     bool     `json:"required,omitempty"`
 }
 
-type doctorSnapshot struct {
-	Status       string        `json:"status"`
-	InstallMode  string        `json:"install_mode"`
-	Version      string        `json:"version"`
-	AgentID      string        `json:"agent_id,omitempty"`
-	Capabilities []string      `json:"capabilities"`
-	Checks       []doctorCheck `json:"checks"`
-	CheckCount   int           `json:"check_count"`
-	FailedCount  int           `json:"failed_count"`
-	WarningCount int           `json:"warning_count"`
-	GeneratedAt  time.Time     `json:"generated_at"`
+type doctorComponentReadiness struct {
+	Ready      bool   `json:"ready"`
+	ReasonCode string `json:"reason_code"`
+	Version    string `json:"version,omitempty"`
+	SHA256     string `json:"sha256,omitempty"`
 }
 
-var capabilities = []string{"ping", "tcp_ping", "long_ping", "long_tcp_ping", "udp_probe", "http_ping", "http_request", "http3_check", "dns_lookup", "dns_compare", "tls_check", "traceroute", "mtr", "node_status", "ip"}
+type doctorDNSWireCodeAvailability struct {
+	AllAvailable bool `json:"all_available"`
+	UDP          bool `json:"udp"`
+	TCP          bool `json:"tcp"`
+	DoT          bool `json:"dot"`
+	DoH          bool `json:"doh"`
+	DoQ          bool `json:"doq"`
+}
+
+type doctorDNSObservationReadiness struct {
+	Ready              bool                          `json:"ready"`
+	ReasonCode         string                        `json:"reason_code"`
+	SystemDNSDiscovery doctorComponentReadiness      `json:"system_dns_discovery"`
+	WireTransports     doctorDNSWireCodeAvailability `json:"wire_transports"`
+	UnboundWorker      doctorComponentReadiness      `json:"unbound_worker"`
+	DNSTapCollector    doctorComponentReadiness      `json:"dnstap_collector"`
+	RootHints          doctorComponentReadiness      `json:"root_hints"`
+	TrustAnchor        doctorComponentReadiness      `json:"trust_anchor"`
+	Fixtures           doctorComponentReadiness      `json:"fixtures"`
+}
+
+type doctorSnapshot struct {
+	Status                  string                        `json:"status"`
+	InstallMode             string                        `json:"install_mode"`
+	Version                 string                        `json:"version"`
+	AgentID                 string                        `json:"agent_id,omitempty"`
+	Capabilities            []string                      `json:"capabilities"`
+	DNSObservationReadiness doctorDNSObservationReadiness `json:"dns_observation_readiness"`
+	Checks                  []doctorCheck                 `json:"checks"`
+	CheckCount              int                           `json:"check_count"`
+	FailedCount             int                           `json:"failed_count"`
+	WarningCount            int                           `json:"warning_count"`
+	GeneratedAt             time.Time                     `json:"generated_at"`
+}

@@ -162,15 +162,6 @@ if [ -f "$SCRIPT_DIR/uninstall-systemd.sh" ]; then
 	install -m 0755 "$SCRIPT_DIR/uninstall-systemd.sh" "$ETC_DIR/uninstall-systemd.sh"
 fi
 
-if [ -f "$SCRIPT_DIR/update-docker.sh" ]; then
-	install -m 0755 "$SCRIPT_DIR/update-docker.sh" "$INSTALL_DIR/nodeping-agent-docker-update"
-fi
-
-if [ -f "$SCRIPT_DIR/nodeping-agent-docker-update.service" ]; then
-	install -m 0644 "$SCRIPT_DIR/nodeping-agent-docker-update.service" /etc/systemd/system/nodeping-agent-docker-update.service
-	install -m 0644 "$SCRIPT_DIR/nodeping-agent-docker-update.timer" /etc/systemd/system/nodeping-agent-docker-update.timer
-fi
-
 if [ -f "$SCRIPT_DIR/README.md" ]; then
 	install -m 0644 "$SCRIPT_DIR/README.md" "$ETC_DIR/README.md"
 fi
@@ -183,10 +174,6 @@ fi
 if [ ! -f "$ETC_DIR/nodeping-agent-update.env" ]; then
 	install -m 0600 "$SCRIPT_DIR/nodeping-agent-update.env.example" "$ETC_DIR/nodeping-agent-update.env"
 	say "已创建 $ETC_DIR/nodeping-agent-update.env；仅在使用自定义发布源时需要编辑" "created $ETC_DIR/nodeping-agent-update.env; edit only if using a custom release source"
-fi
-
-if [ -f "$SCRIPT_DIR/nodeping-agent-docker-update.env.example" ] && [ ! -f "$ETC_DIR/nodeping-agent-docker-update.env" ]; then
-	install -m 0600 "$SCRIPT_DIR/nodeping-agent-docker-update.env.example" "$ETC_DIR/nodeping-agent-docker-update.env"
 fi
 
 systemctl_quiet daemon-reload

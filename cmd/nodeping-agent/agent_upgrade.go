@@ -37,6 +37,10 @@ func runAgentUpgrade(ctx context.Context, cfg config, payload map[string]any, op
 	switch mode {
 	case "disabled":
 		return nil, errors.New("remote upgrade is disabled on this agent")
+	case "container":
+		result, err := containerUpgrade(ctx, cfg, versionValue, releaseBaseURL)
+		result["agent_upgrade"] = elapsedMS(started)
+		return result, err
 	case "request_file":
 		result, err := requestFileUpgrade(cfg, versionValue, releaseBaseURL)
 		result["agent_upgrade"] = elapsedMS(started)
@@ -100,6 +104,8 @@ func normalizeUpgradeMode(value string) string {
 		return "request_file"
 	case "systemd":
 		return "systemd"
+	case "container", "docker":
+		return "container"
 	case "script":
 		return "script"
 	case "disabled", "off", "false", "0":
@@ -107,6 +113,18 @@ func normalizeUpgradeMode(value string) string {
 	default:
 		return "auto"
 	}
+}
+
+func containerUpgrade(ctx context.Context, cfg config, versionValue string, releaseBaseURL string) (map[string]any, error) {
+	result, err := scriptUpgrade(ctx, cfg, versionValue, releaseBaseURL)
+	if result == nil {
+		result = map[string]any{}
+	}
+	result["mode"] = "container"
+	if err == nil {
+		result["restart_required"] = true
+	}
+	return result, err
 }
 
 func normalizeRequestedUpgradeVersion(value string) string {
@@ -309,6 +327,13 @@ func upgradeEnv(cfg config, versionValue string, releaseBaseURL string) []string
 	set("NODEPING_AGENT_ID", cfg.AgentID)
 	set("NODEPING_AGENT_TOKEN", cfg.AgentToken)
 	set("NODEPING_AGENT_TOKEN_FILE", cfg.AgentTokenFile)
+	if normalizeUpgradeMode(cfg.UpgradeMode) == "container" {
+		set("NODEPING_AGENT_INSTALL_PATH", "/opt/nodeping-agent/nodeping-agent")
+		set("NODEPING_AGENT_BACKUP_PATH", "/opt/nodeping-agent/nodeping-agent.previous")
+		set("NODEPING_AGENT_ACTIVATION_FILE", "/var/lib/nodeping-agent/updates/activation.pending")
+		set("NODEPING_AGENT_UPDATE_LOCK_DIRECTORY", "/var/lib/nodeping-agent/updates/update.lock")
+		set("NODEPING_AGENT_RESTART", "0")
+	}
 	return envs
 }
 

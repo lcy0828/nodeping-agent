@@ -759,6 +759,47 @@ func TestRunAgentUpgradeScriptUsesFixedPathAndEnv(t *testing.T) {
 	}
 }
 
+func TestRunAgentUpgradeContainerStagesRestartAfterScript(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "nodeping-agent-update")
+	outputFile := filepath.Join(dir, "container-env.out")
+	content := fmt.Sprintf("#!/usr/bin/env sh\nprintf '%%s|%%s|%%s|%%s' \"$NODEPING_AGENT_INSTALL_PATH\" \"$NODEPING_AGENT_BACKUP_PATH\" \"$NODEPING_AGENT_ACTIVATION_FILE\" \"$NODEPING_AGENT_RESTART\" > %q\n", outputFile)
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+	result, err := runAgentUpgrade(context.Background(), config{
+		UpgradeMode:   "container",
+		UpgradeScript: script,
+	}, map[string]any{"version": "2.1.0"}, nil)
+	if err != nil {
+		t.Fatalf("container upgrade: %v result=%+v", err, result)
+	}
+	if result["mode"] != "container" || result["restart_required"] != true {
+		t.Fatalf("unexpected container result: %+v", result)
+	}
+	raw, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "/opt/nodeping-agent/nodeping-agent|/opt/nodeping-agent/nodeping-agent.previous|/var/lib/nodeping-agent/updates/activation.pending|0"
+	if string(raw) != want {
+		t.Fatalf("container updater env = %q, want %q", raw, want)
+	}
+}
+
+func TestTaskResultRequestsRestartOnlyForSuccessfulUpgrade(t *testing.T) {
+	upgrade := taskRequest{TaskType: "agent_upgrade"}
+	if !taskResultRequestsRestart(upgrade, taskResult{Success: true, Result: map[string]any{"restart_required": true}}) {
+		t.Fatal("successful container upgrade did not request restart")
+	}
+	if taskResultRequestsRestart(upgrade, taskResult{Success: false, Result: map[string]any{"restart_required": true}}) {
+		t.Fatal("failed upgrade requested restart")
+	}
+	if taskResultRequestsRestart(taskRequest{TaskType: "ping"}, taskResult{Success: true, Result: map[string]any{"restart_required": true}}) {
+		t.Fatal("non-upgrade task requested restart")
+	}
+}
+
 func TestRunTLSCheck(t *testing.T) {
 	server := httptest.NewTLSServer(nil)
 	defer server.Close()

@@ -1,0 +1,19 @@
+{
+  "schema": "nodeping.dnstap.fixture.v1",
+  "producer": "Unbound 1.25.1",
+  "producer_source_sha256": "0fe8b6277b0959cfd17562debac0aa5f71e0b02dc4ffa9c60271c583edab586f",
+  "protobuf_c": "1.5.2",
+  "protobuf": "3.21.12",
+  "capture_platform": "darwin/arm64",
+  "capture_direction": "producer_to_collector",
+  "capture_bytes": 446,
+  "capture_sha256": "1d5808f68adac8b66c2c0d51fc2bfbb29b40b62fbd5e47df1afd07db67da9dc2",
+  "dnstap_identity": "nodeping-unbound-fixture",
+  "dnstap_version": "unbound-1.25.1",
+  "question": "fixture.nodeping.test. IN A",
+  "answer": "192.0.2.123",
+  "control_flow": ["READY", "START", "DATA", "DATA", "STOP"],
+  "recorded_at": "2026-07-19T21:08:58+08:00",
+  "patch": "third_party/unbound/patches/0001-dnstap-deterministic-evidence.patch",
+  "shutdown_note": "The audited helper patch makes resolver query timestamps deterministic and waits for the collector's FINISH acknowledgement after STOP."
+}

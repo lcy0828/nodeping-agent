@@ -10,6 +10,123 @@ permissions:
   contents: read
 
 jobs:
+  static-analysis:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint workflows and shell scripts
+        run: ./scripts/ci/lint-agent-workflows.sh
+
+  native-dns:
+    name: Native DNS (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux/amd64
+          - runner: ubuntu-24.04-arm
+            target: linux/arm64
+          - runner: macos-15-intel
+            target: darwin/amd64
+          - runner: macos-15
+            target: darwin/arm64
+          - runner: windows-2025
+            target: windows/amd64
+          - runner: windows-11-arm
+            target: windows/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify native target
+        shell: bash
+        run: |
+          actual="$(go env GOOS)/$(go env GOARCH)"
+          test "$actual" = "${{ matrix.target }}"
+
+      - name: Exercise native dnstap listener and self-check
+        run: go test -count=20 -timeout=5m ./internal/dnstapcollector
+
+      - name: Exercise native system DNS over UDP and TCP
+        run: go test -count=1 -timeout=3m -tags=dns_native_e2e -run '^TestNativeSystemDNSObservationUDPAndTCP$' ./cmd/nodeping-agent
+
+  unbound-dnstap-patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            binutils \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            gnupg \
+            openssl \
+            patch \
+            perl \
+            pkg-config \
+            xz-utils
+
+      - name: Verify pinned dnstap supply chain
+        run: go run ./scripts/verify-dnstap-supply-chain.go
+
+      - name: Verify upstream source signatures
+        run: ./scripts/ci/verify-unbound-source-provenance.sh
+
+      - name: Verify IANA root material
+        env:
+          NODEPING_ROOT_MATERIAL_OUTPUT_DIR: ${{ runner.temp }}/nodeping-root-material
+        run: ./scripts/ci/verify-root-material-supply-chain.sh
+
+      - name: Clean-apply and build patched Unbound
+        env:
+          NODEPING_UNBOUND_OUTPUT_DIR: ${{ runner.temp }}/nodeping-unbound-helper
+        run: ./scripts/ci/verify-unbound-dnstap-patch.sh
+
+      - name: Verify helper manifest, licenses, and SBOMs
+        run: ./scripts/ci/verify-unbound-helper-metadata.sh "${RUNNER_TEMP}/nodeping-unbound-helper"
+
+      - name: Exercise RFC 5011 state lifecycle
+        env:
+          NODEPING_UNBOUND_ANCHOR_BINARY: ${{ runner.temp }}/nodeping-unbound-helper/unbound-anchor
+          NODEPING_UNBOUND_CHECKCONF_BINARY: ${{ runner.temp }}/nodeping-unbound-helper/unbound-checkconf
+          NODEPING_ROOT_HINTS_FILE: ${{ runner.temp }}/nodeping-root-material/named.root
+        run: go test -count=1 -timeout=1m -tags=dnsroots_native_e2e -run '^TestUnboundAnchorNativeLifecycle$' ./internal/dnsroots
+
+      - name: Exercise patched Unbound native dnstap shutdown
+        shell: bash
+        run: |
+          test_binary="${RUNNER_TEMP}/dnstapcollector-native-e2e"
+          CGO_ENABLED=0 go test -c -tags=unbound_native_e2e -o "${test_binary}" ./internal/dnstapcollector
+          sudo env \
+            NODEPING_UNBOUND_BINARY="${RUNNER_TEMP}/nodeping-unbound-helper/unbound" \
+            NODEPING_UNBOUND_CHECKCONF_BINARY="${RUNNER_TEMP}/nodeping-unbound-helper/unbound-checkconf" \
+            "${test_binary}" -test.run '^TestPatchedUnboundNativeDNSTapE2E$' -test.count=20 -test.timeout=5m
+
   test:
     runs-on: ubuntu-latest
     steps:

@@ -1,0 +1,273 @@
+From: NodePing maintainers <security@nodeping.invalid>
+Subject: [PATCH] dnstap: make resolver evidence deterministic and drain shutdown
+
+Unbound 1.25.1 timestamps RESOLVER_QUERY when the dnstap event is built,
+while RESOLVER_RESPONSE carries the earlier network send timestamp. Use the
+same send timestamp for both events so a collector can pair them without a
+timing heuristic.
+
+At shutdown, drain the current frame and every worker message queue before
+STOP, within the existing two-second stop-flush deadline. This prevents a
+low-volume event from being discarded when its one-second wakeup timer races
+the stop command. A timeout or closed output still exits without a valid
+STOP/FINISH proof, so the collector fails closed rather than accepting a
+partial trace.
+
+In bidirectional Frame Streams mode, wait for and validate FINISH after STOP.
+The upstream shutdown path otherwise closes immediately after writing STOP,
+which races the collector's mandatory FINISH acknowledgement.
+
+---
+ dnstap/dnstap.c            |   7 +--
+ dnstap/dnstap.h            |   4 +-
+ dnstap/dtstream.c          | 117 ++++++++++++++++++++++++++++++++-----
+ services/outside_network.c |   7 +--
+ 4 files changed, 112 insertions(+), 23 deletions(-)
+
+diff --git a/dnstap/dnstap.h b/dnstap/dnstap.h
+--- a/dnstap/dnstap.h
++++ b/dnstap/dnstap.h
+@@ -179,6 +179,7 @@ dt_msg_send_client_response(struct dt_env *env,
+  * @param zone: query zone.
+  * @param zone_len: length of zone.
+  * @param qmsg: query message.
++ * @param qtime: time the query message was sent.
+  */
+ void
+ dt_msg_send_outside_query(struct dt_env *env,
+@@ -187,7 +188,8 @@ dt_msg_send_outside_query(struct dt_env *env,
+ 			  enum comm_point_type cptype,
+ 			  void *cpssl,
+ 			  uint8_t *zone, size_t zone_len,
+-			  struct sldns_buffer *qmsg);
++			  struct sldns_buffer *qmsg,
++			  const struct timeval *qtime);
+ 
+ /**
+  * Create and send a new dnstap "Message" event of type RESOLVER_RESPONSE or
+diff --git a/dnstap/dnstap.c b/dnstap/dnstap.c
+--- a/dnstap/dnstap.c
++++ b/dnstap/dnstap.c
+@@ -529,16 +529,15 @@ dt_msg_send_outside_query(struct dt_env *env,
+ 			  enum comm_point_type cptype,
+ 			  void *cpssl,
+ 			  uint8_t *zone, size_t zone_len,
+-			  sldns_buffer *qmsg)
++			  sldns_buffer *qmsg,
++			  const struct timeval *qtime)
+ {
+ 	struct dt_msg dm;
+-	struct timeval qtime;
+ 	uint16_t qflags;
+ 
+ 	if(dt_sample_rate_limited(env))
+ 		return;
+ 
+-	gettimeofday(&qtime, NULL);
+ 	qflags = sldns_buffer_read_u16_at(qmsg, 2);
+ 
+ 	/* type */
+@@ -558,7 +557,7 @@ dt_msg_send_outside_query(struct dt_env *env,
+ 	dm.m.has_query_zone = 1;
+ 
+ 	/* query_time_sec, query_time_nsec */
+-	dt_fill_timeval(&qtime,
++	dt_fill_timeval(qtime,
+ 			&dm.m.query_time_sec, &dm.m.has_query_time_sec,
+ 			&dm.m.query_time_nsec, &dm.m.has_query_time_nsec);
+ 
+diff --git a/dnstap/dtstream.c b/dnstap/dtstream.c
+--- a/dnstap/dtstream.c
++++ b/dnstap/dtstream.c
+@@ -1684,6 +1684,14 @@ struct stop_flush_info {
+ 	size_t stop_frame_len;
+ 	/** how much we have done of the stop frame */
+ 	size_t stop_frame_done;
++	/** whether the current frame and all worker queues are drained */
++	int data_frames_done;
++	/** whether STOP is sent and a bidirectional FINISH is expected */
++	int waiting_for_finish;
++	/** the fixed FINISH control frame */
++	uint32_t finish_frame[3];
++	/** how much of the FINISH control frame has been read */
++	size_t finish_frame_done;
+ };
+ 
+ /** exit the stop flush base */
+@@ -1723,13 +1731,85 @@ static int dtio_control_stop_send(struct stop_flush_info* info)
+ 	return 1;
+ }
+ 
++/** Read and validate the FINISH acknowledgement after STOP. */
++static void dtio_control_finish_read(struct stop_flush_info* info)
++{
++	struct dt_io_thread* dtio = info->dtio;
++	int r;
++	while(info->finish_frame_done < sizeof(info->finish_frame)) {
++#ifdef HAVE_SSL
++		if(dtio->ssl) {
++			r = ssl_read_bytes(dtio, ((uint8_t*)info->finish_frame) +
++				info->finish_frame_done,
++				sizeof(info->finish_frame) - info->finish_frame_done);
++		} else {
++#endif
++			r = receive_bytes(dtio, ((uint8_t*)info->finish_frame) +
++				info->finish_frame_done,
++				sizeof(info->finish_frame) - info->finish_frame_done);
++#ifdef HAVE_SSL
++		}
++#endif
++		if(r == -1)
++			return; /* continue on the next read event */
++		if(r == 0) {
++			verbose(VERB_OPS, "dnstap io: stop flush: output closed "
++				"before FINISH");
++			dtio_stop_flush_exit(info);
++			return;
++		}
++		info->finish_frame_done += r;
++	}
++	if(info->finish_frame[0] != 0 ||
++		ntohl(info->finish_frame[1]) != 4 ||
++		ntohl(info->finish_frame[2]) != FSTRM_CONTROL_FRAME_FINISH) {
++		verbose(VERB_OPS, "dnstap io: stop flush: invalid FINISH frame");
++		dtio_stop_flush_exit(info);
++		return;
++	}
++	verbose(VERB_ALGO, "dnstap io: stop flush received FINISH "
++		"control frame");
++	dtio_stop_flush_exit(info);
++}
++
++/** Send the current frame and all frames queued by workers.
++ * Return true only after every queue is empty. */
++static int dtio_pending_frames_send(struct stop_flush_info* info)
++{
++	struct dt_io_thread* dtio = info->dtio;
++	int i;
++
++	/* Keep the stop timer responsive when a worker queue is large. */
++	for(i=0; i<DTIO_MESSAGES_PER_CALLBACK; i++) {
++		if(!dtio->cur_msg && !dtio_find_msg(dtio))
++			return 1;
++		if(dtio->cur_msg_done < dtio->cur_msg_len) {
++			if(!dtio_write_more(dtio)) {
++				if(dtio->fd == -1) {
++					verbose(VERB_ALGO, "dnstap io: stop flush: "
++						"output closed while draining data");
++					dtio_stop_flush_exit(info);
++				}
++				return 0;
++			}
++		}
++		dtio_cur_msg_free(dtio);
++	}
++	return 0;
++}
++
+ void dtio_stop_timer_cb(int ATTR_UNUSED(fd), short ATTR_UNUSED(bits),
+ 	void* arg)
+ {
+ 	struct stop_flush_info* info = (struct stop_flush_info*)arg;
+ 	if(info->want_to_exit_flush)
+ 		return;
+-	verbose(VERB_ALGO, "dnstap io: stop flush timer expired, stop flush");
++	if(!info->data_frames_done)
++		log_err("dnstap io: stop flush timed out while draining data");
++	else if(info->waiting_for_finish)
++		log_err("dnstap io: stop flush timed out waiting for FINISH");
++	else
++		log_err("dnstap io: stop flush timed out while sending STOP");
+ 	info->timer_done = 1;
+ 	dtio_stop_flush_exit(info);
+ }
+@@ -1765,6 +1845,10 @@ void dtio_stop_ev_cb(int ATTR_UNUSED(fd), short bits, void* arg)
+ #endif
+ 
+ 	if((bits&UB_EV_READ)) {
++		if(info->waiting_for_finish) {
++			dtio_control_finish_read(info);
++			return;
++		}
+ 		if(!dtio_check_close(dtio)) {
+ 			if(dtio->fd == -1) {
+ 				verbose(VERB_ALGO, "dnstap io: "
+@@ -1774,21 +1858,13 @@ void dtio_stop_ev_cb(int ATTR_UNUSED(fd), short bits, void* arg)
+ 			return;
+ 		}
+ 	}
+-	/* write remainder of last frame */
+-	if(dtio->cur_msg) {
+-		if(dtio->cur_msg_done < dtio->cur_msg_len) {
+-			if(!dtio_write_more(dtio)) {
+-				if(dtio->fd == -1) {
+-					verbose(VERB_ALGO, "dnstap io: "
+-						"stop flush: output closed");
+-					dtio_stop_flush_exit(info);
+-				}
+-				return;
+-			}
+-		}
++	/* STOP must follow every data frame accepted before shutdown. */
++	if(!info->data_frames_done) {
++		if(!dtio_pending_frames_send(info))
++			return;
++		info->data_frames_done = 1;
+ 		verbose(VERB_ALGO, "dnstap io: stop flush completed "
+-			"last frame");
+-		dtio_cur_msg_free(dtio);
++			"all queued frames");
+ 	}
+ 	/* write stop frame */
+ 	if(info->stop_frame_done < info->stop_frame_len) {
+@@ -1797,6 +1873,17 @@ void dtio_stop_ev_cb(int ATTR_UNUSED(fd), short bits, void* arg)
+ 		verbose(VERB_ALGO, "dnstap io: stop flush completed "
+ 			"stop control frame");
+ 	}
++	/* In bidirectional mode, STOP is only complete after FINISH. */
++	if(dtio->is_bidirectional) {
++		info->waiting_for_finish = 1;
++		ub_event_del(dtio->stop_flush_event);
++		ub_event_del_bits(dtio->stop_flush_event, UB_EV_WRITE);
++		if(ub_event_add(dtio->stop_flush_event, NULL) != 0) {
++			log_err("dnstap io: cannot wait for FINISH frame");
++			dtio_stop_flush_exit(info);
++		}
++		return;
++	}
+ 	/* when last frame and stop frame are sent, exit */
+ 	dtio_stop_flush_exit(info);
+ }
+diff --git a/services/outside_network.c b/services/outside_network.c
+--- a/services/outside_network.c
++++ b/services/outside_network.c
+@@ -1068,7 +1068,7 @@ static void outnet_waiting_tcp_list_add(struct outside_network* outnet,
+ 			sldns_buffer_init_frm_data(&tmp, w->pkt, w->pkt_len);
+ 			dt_msg_send_outside_query(outnet->dtenv, &w->sq->addr,
+ 				&pend_tcp->pi->addr, comm_tcp, NULL, w->sq->zone,
+-				w->sq->zonelen, &tmp);
++				w->sq->zonelen, &tmp, &w->sq->last_sent_time);
+ 		}
+ #endif
+ 	}
+@@ -2315,7 +2315,8 @@ static int pending_udp_send(struct pending* pend, sldns_buffer* packet,
+ 			log_addr(VERB_ALGO, "from local addr", &pend->pc->pif->addr, pend->pc->pif->addrlen);
+ 			log_addr(VERB_ALGO, "request to upstream", &pend->addr, pend->addrlen);
+ 			dt_msg_send_outside_query(outnet->dtenv, &pend->addr, &pend->pc->pif->addr, comm_udp, NULL,
+-				pend->sq->zone, pend->sq->zonelen, packet);
++				pend->sq->zone, pend->sq->zonelen, packet,
++				&pend->sq->last_sent_time);
+ 	}
+ #endif
+ 	return 1;
+@@ -2595,7 +2596,7 @@ struct waiting_tcp* pending_tcp_query(struct serviced_query* sq,
+ 			sldns_buffer_init_frm_data(&tmp, w->pkt, w->pkt_len);
+ 			dt_msg_send_outside_query(sq->outnet->dtenv, &sq->addr,
+ 				&pend->pi->addr, comm_tcp, NULL, sq->zone,
+-				sq->zonelen, &tmp);
++				sq->zonelen, &tmp, &sq->last_sent_time);
+ 		}
+ #endif
+ 	} else {
+-- 
+2.50.1

@@ -29,6 +29,9 @@ func runDoctor(ctx context.Context, cfg config) error {
 		for _, check := range snapshot.Checks {
 			fmt.Println(formatDoctorCheck(check))
 		}
+		for _, check := range dnsObservationDoctorChecks(snapshot.DNSObservationReadiness) {
+			fmt.Println(formatDoctorCheck(check))
+		}
 		fmt.Printf("%-32s %-12s %s\n", "能力 / capabilities", doctorCheckStatus(snapshot.Status), strings.Join(snapshot.Capabilities, ", "))
 	}
 	if snapshot.FailedCount > 0 {
@@ -54,7 +57,12 @@ func collectDoctorChecks(ctx context.Context, cfg config) []doctorCheck {
 
 func collectDoctorSnapshot(ctx context.Context, cfg config) doctorSnapshot {
 	checks := collectDoctorChecks(ctx, cfg)
-	return doctorSnapshotFromChecks(checks, cfg)
+	readiness := collectDNSObservationReadiness(ctx, cfg)
+	checks = append(checks, dnsSystemDiscoveryDoctorCheck(readiness))
+	snapshot := doctorSnapshotFromChecks(checks, cfg)
+	snapshot.DNSObservationReadiness = readiness
+	appendDNSObservationCapability(&snapshot)
+	return snapshot
 }
 
 func collectDependencySnapshot(ctx context.Context, cfg config) doctorSnapshot {
@@ -67,7 +75,19 @@ func collectDependencySnapshot(ctx context.Context, cfg config) doctorSnapshot {
 		checkAgentTokenFile(cfg),
 		checkUpgradeControl(cfg),
 	}
-	return doctorSnapshotFromChecks(checks, cfg)
+	readiness := collectDNSObservationReadiness(ctx, cfg)
+	checks = append(checks, dnsSystemDiscoveryDoctorCheck(readiness))
+	snapshot := doctorSnapshotFromChecks(checks, cfg)
+	snapshot.DNSObservationReadiness = readiness
+	appendDNSObservationCapability(&snapshot)
+	return snapshot
+}
+
+func appendDNSObservationCapability(snapshot *doctorSnapshot) {
+	if snapshot == nil || !snapshot.DNSObservationReadiness.Ready {
+		return
+	}
+	snapshot.Capabilities = normalizeStringCapabilities(append(snapshot.Capabilities, dnsObserveCapability))
 }
 
 func cachedDependencySnapshot(ctx context.Context, cfg config) doctorSnapshot {
@@ -150,17 +170,18 @@ func runAgentDoctor(ctx context.Context, cfg config) (map[string]any, error) {
 		})
 	}
 	result := map[string]any{
-		"agent_doctor":  snapshot.Status,
-		"status":        snapshot.Status,
-		"install_mode":  snapshot.InstallMode,
-		"capabilities":  snapshot.Capabilities,
-		"checks":        rows,
-		"check_count":   snapshot.CheckCount,
-		"failed_count":  snapshot.FailedCount,
-		"warning_count": snapshot.WarningCount,
-		"version":       cfg.Version,
-		"agent_id":      cfg.AgentID,
-		"generated_at":  snapshot.GeneratedAt,
+		"agent_doctor":              snapshot.Status,
+		"status":                    snapshot.Status,
+		"install_mode":              snapshot.InstallMode,
+		"capabilities":              snapshot.Capabilities,
+		"dns_observation_readiness": snapshot.DNSObservationReadiness,
+		"checks":                    rows,
+		"check_count":               snapshot.CheckCount,
+		"failed_count":              snapshot.FailedCount,
+		"warning_count":             snapshot.WarningCount,
+		"version":                   cfg.Version,
+		"agent_id":                  cfg.AgentID,
+		"generated_at":              snapshot.GeneratedAt,
 	}
 	if snapshot.FailedCount > 0 {
 		return result, fmt.Errorf("doctor found %d failed checks", snapshot.FailedCount)

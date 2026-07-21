@@ -37,11 +37,21 @@ func findLocalAgentPID(procRoot string, selfPID int) (int, error) {
 		if readErr != nil || !strings.HasPrefix(filepath.Base(target), "nodeping-agent") {
 			continue
 		}
-		if pid == 1 || processParentPID(filepath.Join(procRoot, entry.Name(), "status")) == 1 {
+		if pid == 1 || processDescendsFromInit(procRoot, pid) {
 			return pid, nil
 		}
 	}
 	return 0, errors.New("nodeping-agent process is not running under the local init process")
+}
+
+func processDescendsFromInit(procRoot string, pid int) bool {
+	for depth := 0; depth < 8 && pid > 1; depth++ {
+		pid = processParentPID(filepath.Join(procRoot, strconv.Itoa(pid), "status"))
+		if pid == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func processParentPID(statusPath string) int {

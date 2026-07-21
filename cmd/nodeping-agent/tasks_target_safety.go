@@ -14,11 +14,80 @@ import (
 
 var (
 	errUnsafeProbeDestination = errors.New("probe target resolved to a private or reserved IP")
+	errInvalidProbeIPFamily   = errors.New("ip_family must be ipv4 or ipv6")
+	errProbeIPFamilyMismatch  = errors.New("probe target does not have an address in the requested IP family")
 	lookupProbeNetIP          = net.DefaultResolver.LookupNetIP
 )
 
+type probeIPFamily uint8
+
+const (
+	probeIPFamilyAny probeIPFamily = iota
+	probeIPFamilyIPv4
+	probeIPFamilyIPv6
+)
+
+func (f probeIPFamily) String() string {
+	switch f {
+	case probeIPFamilyIPv4:
+		return "ipv4"
+	case probeIPFamilyIPv6:
+		return "ipv6"
+	default:
+		return ""
+	}
+}
+
+func (f probeIPFamily) lookupNetwork() string {
+	switch f {
+	case probeIPFamilyIPv4:
+		return "ip4"
+	case probeIPFamilyIPv6:
+		return "ip6"
+	default:
+		return "ip"
+	}
+}
+
+func (f probeIPFamily) displayName() string {
+	switch f {
+	case probeIPFamilyIPv4:
+		return "IPv4"
+	case probeIPFamilyIPv6:
+		return "IPv6"
+	default:
+		return "IP"
+	}
+}
+
+func probeIPFamilyForAddr(addr netip.Addr) probeIPFamily {
+	if !addr.IsValid() {
+		return probeIPFamilyAny
+	}
+	if addr.Unmap().Is4() {
+		return probeIPFamilyIPv4
+	}
+	return probeIPFamilyIPv6
+}
+
+func requestedProbeIPFamily(options map[string]any) (probeIPFamily, error) {
+	value := strings.ToLower(strings.TrimSpace(stringOptionAny(options, "ip_family")))
+	switch value {
+	case "", "auto":
+		return probeIPFamilyAny, nil
+	case "ipv4", "4":
+		return probeIPFamilyIPv4, nil
+	case "ipv6", "6":
+		return probeIPFamilyIPv6, nil
+	default:
+		return probeIPFamilyAny, fmt.Errorf("%w: got %q", errInvalidProbeIPFamily, value)
+	}
+}
+
 type probeTargetResolver struct {
 	allowPrivate bool
+	family       probeIPFamily
+	familyErr    error
 
 	mu    sync.Mutex
 	cache map[string]netip.Addr
@@ -31,8 +100,11 @@ type resolvedProbeAddress struct {
 }
 
 func newProbeTargetResolver(options map[string]any) *probeTargetResolver {
+	family, familyErr := requestedProbeIPFamily(options)
 	return &probeTargetResolver{
 		allowPrivate: trustedPrivateTargetTask(options),
+		family:       family,
+		familyErr:    familyErr,
 		cache:        make(map[string]netip.Addr),
 	}
 }
@@ -46,12 +118,16 @@ func trustedPrivateTargetTask(options map[string]any) bool {
 }
 
 func (r *probeTargetResolver) resolveHost(ctx context.Context, host string) (netip.Addr, error) {
+	if r.familyErr != nil {
+		return netip.Addr{}, r.familyErr
+	}
 	host, err := validateProbeHost(host)
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	cacheKey := strings.ToLower(strings.TrimSuffix(host, "."))
-	if !r.allowPrivate && strings.EqualFold(cacheKey, "localhost") {
+	normalizedHost := strings.ToLower(strings.TrimSuffix(host, "."))
+	cacheKey := r.family.String() + "\x00" + normalizedHost
+	if !r.allowPrivate && strings.EqualFold(normalizedHost, "localhost") {
 		return netip.Addr{}, errUnsafeProbeDestination
 	}
 
@@ -63,6 +139,9 @@ func (r *probeTargetResolver) resolveHost(ctx context.Context, host string) (net
 
 	if addr, parseErr := netip.ParseAddr(strings.Trim(host, "[]")); parseErr == nil {
 		addr = addr.Unmap()
+		if r.family != probeIPFamilyAny && probeIPFamilyForAddr(addr) != r.family {
+			return netip.Addr{}, fmt.Errorf("%w: target %q is %s but the task requires %s", errProbeIPFamilyMismatch, host, probeIPFamilyForAddr(addr).displayName(), r.family.displayName())
+		}
 		if !r.allowPrivate && !isPublicProbeAddr(addr) {
 			return netip.Addr{}, errUnsafeProbeDestination
 		}
@@ -70,11 +149,14 @@ func (r *probeTargetResolver) resolveHost(ctx context.Context, host string) (net
 		return addr, nil
 	}
 
-	addrs, err := lookupProbeNetIP(ctx, "ip", host)
+	addrs, err := lookupProbeNetIP(ctx, r.family.lookupNetwork(), host)
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("resolve probe target %q: %w", host, err)
 	}
 	if len(addrs) == 0 {
+		if r.family != probeIPFamilyAny {
+			return netip.Addr{}, fmt.Errorf("%w: probe target %q has no %s address", errProbeIPFamilyMismatch, host, r.family.displayName())
+		}
 		return netip.Addr{}, fmt.Errorf("probe target %q did not resolve to an IP", host)
 	}
 	var selected netip.Addr
@@ -83,6 +165,9 @@ func (r *probeTargetResolver) resolveHost(ctx context.Context, host string) (net
 			continue
 		}
 		addr = addr.Unmap()
+		if r.family != probeIPFamilyAny && probeIPFamilyForAddr(addr) != r.family {
+			continue
+		}
 		if !r.allowPrivate && !isPublicProbeAddr(addr) {
 			return netip.Addr{}, errUnsafeProbeDestination
 		}
@@ -91,6 +176,9 @@ func (r *probeTargetResolver) resolveHost(ctx context.Context, host string) (net
 		}
 	}
 	if !selected.IsValid() {
+		if r.family != probeIPFamilyAny {
+			return netip.Addr{}, fmt.Errorf("%w: probe target %q has no %s address", errProbeIPFamilyMismatch, host, r.family.displayName())
+		}
 		return netip.Addr{}, fmt.Errorf("probe target %q did not resolve to a usable IP", host)
 	}
 	r.cache[cacheKey] = selected

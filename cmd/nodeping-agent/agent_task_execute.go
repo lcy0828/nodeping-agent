@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"nodeping/internal/dnsobs"
 )
 
 func executeAndReport(ctx context.Context, cfg config, task taskRequest) {
@@ -31,7 +33,20 @@ func executeAndReport(ctx context.Context, cfg config, task taskRequest) {
 	defer reportCancel()
 	if err := postAgentResultWithRetry(reportCtx, cfg, task.ID, result); err != nil {
 		log.Printf("report task result failed task_id=%s: %v", task.ID, err)
+	} else if taskResultRequestsRestart(task, result) && cfg.RestartRequested != nil {
+		select {
+		case cfg.RestartRequested <- struct{}{}:
+		default:
+		}
 	}
+}
+
+func taskResultRequestsRestart(task taskRequest, result taskResult) bool {
+	if task.TaskType != "agent_upgrade" || !result.Success || result.Result == nil {
+		return false
+	}
+	restart, _ := result.Result["restart_required"].(bool)
+	return restart
 }
 
 func minDuration(left time.Duration, right time.Duration) time.Duration {
@@ -42,6 +57,11 @@ func minDuration(left time.Duration, right time.Duration) time.Duration {
 }
 
 func postAgentResultWithRetry(ctx context.Context, cfg config, taskID string, result taskResult) error {
+	if result.DNSResult != nil {
+		if err := ensureAgentJSONEnvelopeSize("DNS task result", result, dnsobs.MaxTaskResultBytes); err != nil {
+			return err
+		}
+	}
 	endpoint := "/api/agent/v1/tasks/" + url.PathEscape(taskID) + "/result"
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
@@ -65,6 +85,12 @@ func postAgentResultWithRetry(ctx context.Context, cfg config, taskID string, re
 
 func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	started := time.Now()
+	if task.TaskType == dnsPropagationTaskType {
+		return executeDNSPropagationTask(ctx, cfg, task, started)
+	}
+	if dnsTaskTypeIsCapability(task.TaskType) {
+		return failTask(task.ID, "UNSUPPORTED_TASK", dnsObserveCapability+" is an Agent capability, not a task type")
+	}
 	result := taskResult{TaskID: task.ID, Status: "running", FinishedAt: time.Now().UTC()}
 	payload, err := payloadMap(task.Payload)
 	if err != nil {
@@ -133,7 +159,7 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 			dnsPayload, _ = payload["dns_lookup"].(map[string]any)
 		}
 		targetSummary = dnsTargetSummary(dnsPayload)
-		response, err = runDNSLookup(ctx, dnsPayload)
+		response, err = runDNSLookupWithOptions(ctx, dnsPayload, task.Options)
 	case "dns_compare":
 		dnsPayload, _ := payload["dns_compare"].(map[string]any)
 		if dnsPayload == nil {
@@ -159,10 +185,8 @@ func executeTask(ctx context.Context, cfg config, task taskRequest) taskResult {
 	case "node_status":
 		response, err = runNodeStatus()
 	case "ip":
-		ip := discoverPublicIP(ctx)
-		if ip == "" {
-			err = errors.New("public IP discovery failed")
-		}
+		ip, discoverErr := discoverPublicIPForOptions(ctx, task.Options)
+		err = discoverErr
 		responseIP = ip
 		response = map[string]any{"ip": ip}
 	case "agent_doctor":

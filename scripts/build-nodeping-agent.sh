@@ -58,6 +58,9 @@ rm -f "$DIST_DIR"/install-docker.sh
 rm -f "$DIST_DIR"/compose.yml
 rm -f "$DIST_DIR"/docker.env.example
 rm -f "$DIST_DIR"/update-docker.sh
+rm -f "$DIST_DIR"/container-entrypoint.sh
+rm -f "$DIST_DIR"/watch-docker-update.sh
+rm -f "$DIST_DIR"/uninstall-docker.sh
 rm -f "$DIST_DIR"/VERSION
 rm -f "$DIST_DIR"/PLATFORMS.md
 rm -f "$DIST_DIR"/RELEASE_NOTES.md
@@ -120,26 +123,27 @@ EOF
 	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-update.service" "$package_dir/nodeping-agent/nodeping-agent-update.service"
 	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-update.path" "$package_dir/nodeping-agent/nodeping-agent-update.path"
 	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-update.timer" "$package_dir/nodeping-agent/nodeping-agent-update.timer"
-	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-docker-update.env.example" "$package_dir/nodeping-agent/nodeping-agent-docker-update.env.example"
-	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-docker-update.service" "$package_dir/nodeping-agent/nodeping-agent-docker-update.service"
-	cp "$ROOT_DIR/deploy/nodeping-agent/nodeping-agent-docker-update.timer" "$package_dir/nodeping-agent/nodeping-agent-docker-update.timer"
 	cp "$ROOT_DIR/deploy/nodeping-agent/compose.yml" "$package_dir/nodeping-agent/compose.yml"
 	cp "$ROOT_DIR/deploy/nodeping-agent/docker.env.example" "$package_dir/nodeping-agent/docker.env.example"
 	cp "$ROOT_DIR/deploy/nodeping-agent/install-release.sh" "$package_dir/nodeping-agent/install-release.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/install-docker.sh" "$package_dir/nodeping-agent/install-docker.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/install-systemd.sh" "$package_dir/nodeping-agent/install-systemd.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/uninstall-systemd.sh" "$package_dir/nodeping-agent/uninstall-systemd.sh"
+	cp "$ROOT_DIR/deploy/nodeping-agent/uninstall-docker.sh" "$package_dir/nodeping-agent/uninstall-docker.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/update-nodeping-agent.sh" "$package_dir/nodeping-agent/update-nodeping-agent.sh"
 	cp "$ROOT_DIR/deploy/nodeping-agent/update-docker.sh" "$package_dir/nodeping-agent/update-docker.sh"
+	cp "$ROOT_DIR/deploy/nodeping-agent/container-entrypoint.sh" "$package_dir/nodeping-agent/container-entrypoint.sh"
 	chmod 0755 "$package_dir/nodeping-agent/$binary_name" \
 		"$package_dir/nodeping-agent/install-release.sh" \
 		"$package_dir/nodeping-agent/install-docker.sh" \
 		"$package_dir/nodeping-agent/install-systemd.sh" \
 		"$package_dir/nodeping-agent/uninstall-systemd.sh" \
+		"$package_dir/nodeping-agent/uninstall-docker.sh" \
 		"$package_dir/nodeping-agent/update-nodeping-agent.sh" \
-		"$package_dir/nodeping-agent/update-docker.sh"
+		"$package_dir/nodeping-agent/update-docker.sh" \
+		"$package_dir/nodeping-agent/container-entrypoint.sh"
 
-	tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
+	COPYFILE_DISABLE=1 COPY_EXTENDED_ATTRIBUTES_DISABLE=1 tar -C "$package_dir" -czf "$DIST_DIR/$artifact" nodeping-agent
 	checksum_line="$(
 		cd "$DIST_DIR"
 		sha256_file "$artifact"

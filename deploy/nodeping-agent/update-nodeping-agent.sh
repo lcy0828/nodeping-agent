@@ -6,9 +6,12 @@ REQUESTED_VERSION="${NODEPING_AGENT_VERSION:-latest}"
 GITHUB_REPOSITORY="${NODEPING_AGENT_GITHUB_REPOSITORY:-lcy0828/nodeping-agent}"
 GITHUB_API_BASE_URL="${NODEPING_AGENT_GITHUB_API_BASE_URL:-https://api.github.com}"
 INSTALL_PATH="${NODEPING_AGENT_INSTALL_PATH:-/opt/nodeping-agent/nodeping-agent}"
+ACTIVE_BINARY="${NODEPING_AGENT_ACTIVE_BINARY:-$INSTALL_PATH}"
 SERVICE_NAME="${NODEPING_AGENT_SERVICE:-nodeping-agent.service}"
 RESTART_SERVICE="${NODEPING_AGENT_RESTART:-1}"
 BACKUP_PATH="${NODEPING_AGENT_BACKUP_PATH:-$INSTALL_PATH.previous}"
+ACTIVATION_FILE="${NODEPING_AGENT_ACTIVATION_FILE:-}"
+UPDATE_LOCK_DIRECTORY="${NODEPING_AGENT_UPDATE_LOCK_DIRECTORY:-$(dirname "$INSTALL_PATH")/.nodeping-agent-update.lock}"
 SIGNING_PUBLIC_KEY="${NODEPING_AGENT_MINISIGN_PUBLIC_KEY:-}"
 REQUIRE_SIGNATURE="${NODEPING_AGENT_REQUIRE_SIGNATURE:-auto}"
 SIGNATURE_REQUIRED_FROM="${NODEPING_AGENT_SIGNATURE_REQUIRED_FROM:-}"
@@ -28,6 +31,7 @@ CURRENT_VERSION=""
 TARGET_VERSION=""
 UPGRADE_STEP="starting updater"
 UPGRADE_EVENT_FINALIZED=0
+UPDATE_LOCK_OWNED=0
 tmp_dir=""
 
 say() {
@@ -62,6 +66,49 @@ preflight() {
 		say_err "需要安装 sha256sum 或 shasum" "sha256sum or shasum is required"
 		return 1
 	fi
+}
+
+acquire_update_lock() {
+	local owner=""
+	mkdir -p "$(dirname "$INSTALL_PATH")" "$(dirname "$UPDATE_LOCK_DIRECTORY")"
+	if mkdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null; then
+		UPDATE_LOCK_OWNED=1
+		printf '%s\n' "$$" > "$UPDATE_LOCK_DIRECTORY/pid"
+		return 0
+	fi
+	if [ -f "$UPDATE_LOCK_DIRECTORY/pid" ] && [ ! -L "$UPDATE_LOCK_DIRECTORY/pid" ]; then
+		IFS= read -r owner < "$UPDATE_LOCK_DIRECTORY/pid" || true
+	fi
+	case "$owner" in
+		''|*[!0-9]*) ;;
+		*)
+			if kill -0 "$owner" 2>/dev/null; then
+				say_err "已有 Agent 更新正在执行" "another Agent update is already running"
+				return 1
+			fi
+			;;
+	esac
+	rm -f "$UPDATE_LOCK_DIRECTORY/pid"
+	rmdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null || true
+	if ! mkdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null; then
+		say_err "无法获取 Agent 更新锁" "could not acquire the Agent update lock"
+		return 1
+	fi
+	UPDATE_LOCK_OWNED=1
+	printf '%s\n' "$$" > "$UPDATE_LOCK_DIRECTORY/pid"
+}
+
+release_update_lock() {
+	[ "$UPDATE_LOCK_OWNED" = "1" ] || return 0
+	local owner=""
+	if [ -f "$UPDATE_LOCK_DIRECTORY/pid" ] && [ ! -L "$UPDATE_LOCK_DIRECTORY/pid" ]; then
+		IFS= read -r owner < "$UPDATE_LOCK_DIRECTORY/pid" || true
+	fi
+	if [ "$owner" = "$$" ]; then
+		rm -f "$UPDATE_LOCK_DIRECTORY/pid"
+		rmdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null || true
+	fi
+	UPDATE_LOCK_OWNED=0
 }
 
 is_loopback_http_url() {
@@ -377,8 +424,12 @@ download_verified_release_set() {
 }
 
 current_agent_version() {
-	if [ -x "$INSTALL_PATH" ]; then
-		"$INSTALL_PATH" -version 2>/dev/null | sed -n 's/.*version=\([^ ]*\).*/nodeping-agent\/\1/p' | head -n 1
+	local path="$ACTIVE_BINARY"
+	if [ ! -x "$path" ]; then
+		path="$INSTALL_PATH"
+	fi
+	if [ -x "$path" ]; then
+		"$path" -version 2>/dev/null | sed -n 's/.*version=\([^ ]*\).*/nodeping-agent\/\1/p' | head -n 1
 	fi
 }
 
@@ -459,6 +510,7 @@ cleanup_and_report_failure() {
 	if [ "$code" -ne 0 ] && [ "${UPGRADE_EVENT_FINALIZED:-0}" != "1" ]; then
 		emit_terminal_upgrade_event "update_failed" "${CURRENT_VERSION:-}" "${TARGET_VERSION:-}" "${UPGRADE_STEP:-updater failed} (exit $code)"
 	fi
+	release_update_lock || true
 	exit "$code"
 }
 
@@ -897,10 +949,13 @@ fi
 case "$ALLOW_DOWNGRADE" in 0|1) ;; *) say_err "NODEPING_AGENT_ALLOW_DOWNGRADE 必须为 0 或 1" "NODEPING_AGENT_ALLOW_DOWNGRADE must be 0 or 1"; exit 2 ;; esac
 case "$START_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) say_err "启动超时必须为正整数" "start timeout must be a positive integer"; exit 2 ;; esac
 case "$READINESS_STABLE_SECONDS" in ''|*[!0-9]*|0) say_err "readiness 稳定窗口必须为正整数" "readiness stable window must be a positive integer"; exit 2 ;; esac
+if ! acquire_update_lock; then
+	exit 75
+fi
+trap cleanup_and_report_failure EXIT
 CURRENT_VERSION="$(current_agent_version || true)"
 TARGET_VERSION="nodeping-agent/$REQUESTED_VERSION"
 tmp_dir="$(mktemp -d)"
-trap cleanup_and_report_failure EXIT
 
 version="$REQUESTED_VERSION"
 if [ "$version" = "latest" ]; then
@@ -1014,7 +1069,7 @@ if [ "$archive_version" != "$version" ] || [ "$binary_version" != "$version" ]; 
 	exit 1
 fi
 
-if [ -x "$INSTALL_PATH" ] && cmp -s "$new_bin" "$INSTALL_PATH"; then
+if [ -x "$ACTIVE_BINARY" ] && cmp -s "$new_bin" "$ACTIVE_BINARY"; then
 	say "nodeping-agent 已是最新版本：$version" "nodeping-agent is already up to date: $version"
 	emit_terminal_upgrade_event "up_to_date" "$CURRENT_VERSION" "$TARGET_VERSION" "binary already matches requested version"
 	exit 0
@@ -1023,8 +1078,12 @@ fi
 UPGRADE_STEP="installing release $version"
 emit_upgrade_progress 80 "$UPGRADE_STEP"
 
-if [ -x "$INSTALL_PATH" ]; then
-	install -m 0755 "$INSTALL_PATH" "$BACKUP_PATH"
+backup_source="$ACTIVE_BINARY"
+if [ ! -x "$backup_source" ]; then
+	backup_source="$INSTALL_PATH"
+fi
+if [ -x "$backup_source" ]; then
+	install -m 0755 "$backup_source" "$BACKUP_PATH"
 	say "已备份旧版 nodeping-agent 到 $BACKUP_PATH" "backed up previous nodeping-agent to $BACKUP_PATH"
 fi
 
@@ -1035,10 +1094,23 @@ if command -v setcap >/dev/null 2>&1; then
 fi
 say "已安装 nodeping-agent $version 到 $INSTALL_PATH" "installed nodeping-agent $version to $INSTALL_PATH"
 
+if [ -n "$ACTIVATION_FILE" ]; then
+	mkdir -p "$(dirname "$ACTIVATION_FILE")"
+	activation_tmp="${ACTIVATION_FILE}.new.$$"
+	printf '%s\n' "$TARGET_VERSION" > "$activation_tmp"
+	chmod 0600 "$activation_tmp"
+	mv -f "$activation_tmp" "$ACTIVATION_FILE"
+	say "已写入容器激活标记：$ACTIVATION_FILE" "wrote container activation marker: $ACTIVATION_FILE"
+fi
+
 UPGRADE_STEP="restarting $SERVICE_NAME"
 emit_upgrade_progress 90 "$UPGRADE_STEP"
 if restart_with_rollback; then
-	emit_terminal_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$TARGET_VERSION" "update completed"
+	if [ -n "$ACTIVATION_FILE" ]; then
+		emit_terminal_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$TARGET_VERSION" "update staged; container restart pending"
+	else
+		emit_terminal_upgrade_event "update_succeeded" "$CURRENT_VERSION" "$TARGET_VERSION" "update completed"
+	fi
 else
 	exit 1
 fi

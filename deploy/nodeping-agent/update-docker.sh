@@ -7,6 +7,7 @@ SERVICE="${SERVICE:-nodeping-agent}"
 PROJECT_DIRECTORY="${PROJECT_DIRECTORY:-$SCRIPT_DIR}"
 COMPOSE_FILE="${COMPOSE_FILE:-$PROJECT_DIRECTORY/compose.yml}"
 DATA_DIRECTORY="${NODEPING_AGENT_DOCKER_DATA_DIRECTORY:-}"
+RUNTIME_DIRECTORY="${NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY:-}"
 SERVER_URL="${NODEPING_SERVER_URL:-}"
 ALLOW_INSECURE_HTTP="${NODEPING_AGENT_ALLOW_INSECURE_HTTP:-}"
 AGENT_ID="${NODEPING_AGENT_ID:-}"
@@ -15,10 +16,15 @@ PULL_TIMEOUT_SECONDS="${NODEPING_AGENT_DOCKER_PULL_TIMEOUT_SECONDS:-300}"
 READINESS_STABLE_SECONDS="${NODEPING_AGENT_DOCKER_READINESS_STABLE_SECONDS:-10}"
 ALLOW_DOWNGRADE="${NODEPING_AGENT_ALLOW_DOWNGRADE:-0}"
 UPDATE_REQUEST_FILE="${NODEPING_AGENT_DOCKER_REQUEST_FILE:-$PROJECT_DIRECTORY/control/update-request.json}"
+UPDATE_LOCK_DIRECTORY="${NODEPING_AGENT_DOCKER_UPDATE_LOCK_DIRECTORY:-$PROJECT_DIRECTORY/.nodeping-agent-update.lock}"
+UPDATE_LOCK_WAIT_SECONDS="${NODEPING_AGENT_DOCKER_LOCK_WAIT_SECONDS:-5}"
 EVENT_TOKEN=""
 PREVIOUS_COMPOSE_FILE=""
 COMPOSE_UPDATED=0
 ORIGINAL_IMAGE_VERSION=""
+ACTIVE_UPDATE_REQUEST_FILE=""
+UPDATE_REQUEST_SUCCEEDED=0
+UPDATE_LOCK_OWNED=0
 
 say() {
 	printf '%s / %s\n' "$1" "$2"
@@ -26,6 +32,35 @@ say() {
 
 say_err() {
 	printf '%s / %s\n' "$1" "$2" >&2
+}
+
+acquire_update_lock() {
+	local deadline=$((SECONDS + UPDATE_LOCK_WAIT_SECONDS))
+	while ! mkdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null; do
+		if [ "$SECONDS" -ge "$deadline" ]; then
+			say_err "已有 Docker 更新正在执行；升级请求保持未处理，请稍后重试。若主机异常断电，请确认没有更新进程后再删除 $UPDATE_LOCK_DIRECTORY" "another Docker update is already running; the upgrade request was left untouched. Retry later. After an unclean shutdown, confirm no updater is running before removing $UPDATE_LOCK_DIRECTORY"
+			return 1
+		fi
+		sleep 1
+	done
+	if ! printf '%s\n' "$$" > "$UPDATE_LOCK_DIRECTORY/pid"; then
+		rmdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null || true
+		return 1
+	fi
+	UPDATE_LOCK_OWNED=1
+}
+
+release_update_lock() {
+	[ "$UPDATE_LOCK_OWNED" = "1" ] || return 0
+	local owner=""
+	if [ -f "$UPDATE_LOCK_DIRECTORY/pid" ] && [ ! -L "$UPDATE_LOCK_DIRECTORY/pid" ]; then
+		IFS= read -r owner < "$UPDATE_LOCK_DIRECTORY/pid" || true
+	fi
+	if [ "$owner" = "$$" ]; then
+		rm -f "$UPDATE_LOCK_DIRECTORY/pid"
+		rmdir "$UPDATE_LOCK_DIRECTORY" 2>/dev/null || true
+	fi
+	UPDATE_LOCK_OWNED=0
 }
 
 is_loopback_http_url() {
@@ -105,10 +140,28 @@ normalize_requested_image_tag() {
 }
 
 consume_update_request() {
-	[ -r "$UPDATE_REQUEST_FILE" ] || return 0
-	local requested
-	requested="$(json_file_value "$UPDATE_REQUEST_FILE" version || true)"
-	rm -f "$UPDATE_REQUEST_FILE"
+	[ -e "$UPDATE_REQUEST_FILE" ] || return 0
+	if [ ! -f "$UPDATE_REQUEST_FILE" ] || [ -L "$UPDATE_REQUEST_FILE" ]; then
+		say_err "Docker 升级请求必须是普通文件" "Docker upgrade request must be a regular file"
+		rm -f "$UPDATE_REQUEST_FILE" 2>/dev/null || true
+		return 1
+	fi
+	local requested processing_file failed_file
+	processing_file="${UPDATE_REQUEST_FILE}.processing"
+	failed_file="${UPDATE_REQUEST_FILE}.failed"
+	if [ -e "$processing_file" ]; then
+		if [ -f "$processing_file" ] && [ ! -L "$processing_file" ]; then
+			mv -f "$processing_file" "$failed_file"
+		else
+			rm -f "$processing_file" 2>/dev/null || true
+		fi
+	fi
+	if ! mv "$UPDATE_REQUEST_FILE" "$processing_file"; then
+		say_err "无法接管 Docker 升级请求" "could not claim the Docker upgrade request"
+		return 1
+	fi
+	ACTIVE_UPDATE_REQUEST_FILE="$processing_file"
+	requested="$(json_file_value "$ACTIVE_UPDATE_REQUEST_FILE" version || true)"
 	requested="$(normalize_requested_image_tag "$requested")"
 	case "$requested" in
 		''|*[!A-Za-z0-9._-]*)
@@ -117,6 +170,22 @@ consume_update_request() {
 			;;
 	esac
 	set_dotenv_value NODEPING_AGENT_IMAGE_VERSION "$requested"
+}
+
+finalize_update_request() {
+	[ -n "$ACTIVE_UPDATE_REQUEST_FILE" ] || return 0
+	if [ ! -e "$ACTIVE_UPDATE_REQUEST_FILE" ]; then
+		ACTIVE_UPDATE_REQUEST_FILE=""
+		return 0
+	fi
+	if [ "$UPDATE_REQUEST_SUCCEEDED" = "1" ]; then
+		rm -f "$ACTIVE_UPDATE_REQUEST_FILE" || true
+	else
+		if ! mv -f "$ACTIVE_UPDATE_REQUEST_FILE" "${UPDATE_REQUEST_FILE}.failed"; then
+			say_err "无法保留失败的 Docker 升级请求" "could not preserve the failed Docker upgrade request"
+		fi
+	fi
+	ACTIVE_UPDATE_REQUEST_FILE=""
 }
 
 download_file() {
@@ -146,6 +215,57 @@ validate_image() {
 		say_err "$name 不是有效的容器镜像名称" "$name is not a valid container image name"
 		return 1
 	fi
+}
+
+validate_managed_directory() {
+	local name="$1" value="$2"
+	case "$value" in
+		/*) ;;
+		*) say_err "$name 必须是绝对路径" "$name must be an absolute path"; return 1 ;;
+	esac
+	if [[ ! "$value" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+		say_err "$name 包含不支持的字符" "$name contains unsupported characters"
+		return 1
+	fi
+	case "$value" in
+		*/../*|*/..|*/./*|*/.|*//*)
+			say_err "$name 不能包含点路径或重复斜线" "$name must not contain dot components or repeated slashes"
+			return 1
+			;;
+		/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+			say_err "$name 不能指向系统顶层目录" "$name must not point to a top-level system directory"
+			return 1
+			;;
+	esac
+	if [ -L "$value" ]; then
+		say_err "$name 不能是符号链接" "$name must not be a symbolic link"
+		return 1
+	fi
+}
+
+validate_directory_layout() {
+	case "$PROJECT_DIRECTORY" in
+		"$DATA_DIRECTORY"|"$DATA_DIRECTORY"/*)
+			say_err "Agent 数据目录不能等于或包含安装目录" "the Agent data directory must not equal or contain the project directory"
+			return 1
+			;;
+		"$RUNTIME_DIRECTORY"|"$RUNTIME_DIRECTORY"/*)
+			say_err "Agent 运行目录不能等于或包含安装目录" "the Agent runtime directory must not equal or contain the project directory"
+			return 1
+			;;
+	esac
+	case "$DATA_DIRECTORY" in
+		"$RUNTIME_DIRECTORY"|"$RUNTIME_DIRECTORY"/*)
+			say_err "Agent 数据目录与运行目录不能重叠" "the Agent data and runtime directories must not overlap"
+			return 1
+			;;
+	esac
+	case "$RUNTIME_DIRECTORY" in
+		"$DATA_DIRECTORY"/*)
+			say_err "Agent 数据目录与运行目录不能重叠" "the Agent data and runtime directories must not overlap"
+			return 1
+			;;
+	esac
 }
 
 if [ -z "$SERVER_URL" ]; then
@@ -182,6 +302,10 @@ if [ -z "$DATA_DIRECTORY" ]; then
 	DATA_DIRECTORY="$(dotenv_value NODEPING_AGENT_DOCKER_DATA_DIRECTORY)"
 fi
 DATA_DIRECTORY="${DATA_DIRECTORY:-$PROJECT_DIRECTORY/data}"
+if [ -z "$RUNTIME_DIRECTORY" ]; then
+	RUNTIME_DIRECTORY="$(dotenv_value NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY)"
+fi
+RUNTIME_DIRECTORY="${RUNTIME_DIRECTORY:-$PROJECT_DIRECTORY/runtime}"
 SYNC_DEPLOYMENT="${NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT:-$(dotenv_value NODEPING_AGENT_DOCKER_SYNC_DEPLOYMENT)}"
 SYNC_DEPLOYMENT="${SYNC_DEPLOYMENT:-1}"
 case "$DISTRIBUTION_MODE" in
@@ -209,27 +333,23 @@ if [[ ! "$SERVICE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
 	say_err "SERVICE 名称无效" "invalid SERVICE name"
 	exit 2
 fi
-case "$DATA_DIRECTORY" in
-	/*) ;;
-	*) say_err "Agent 数据目录必须是绝对路径" "Agent data directory must be absolute"; exit 2 ;;
-esac
-if [[ ! "$DATA_DIRECTORY" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
-	say_err "Agent 数据目录包含不支持的字符" "Agent data directory contains unsupported characters"
-	exit 2
-fi
-case "$DATA_DIRECTORY" in
-	/|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
-		say_err "Agent 数据目录不能指向系统顶层目录" "Agent data directory must not be a top-level system directory"
-		exit 2
-		;;
-esac
+validate_managed_directory "安装目录" "$PROJECT_DIRECTORY"
+validate_managed_directory "Agent 数据目录" "$DATA_DIRECTORY"
+validate_managed_directory "Agent 运行目录" "$RUNTIME_DIRECTORY"
+validate_directory_layout
 case "$UPDATE_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) say_err "更新超时必须为正整数" "update timeout must be a positive integer"; exit 2 ;; esac
 case "$PULL_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) say_err "镜像拉取超时必须为正整数" "image pull timeout must be a positive integer"; exit 2 ;; esac
 case "$READINESS_STABLE_SECONDS" in ''|*[!0-9]*|0) say_err "readiness 稳定窗口必须为正整数" "readiness stable window must be a positive integer"; exit 2 ;; esac
 case "$ALLOW_DOWNGRADE" in 0|1) ;; *) say_err "NODEPING_AGENT_ALLOW_DOWNGRADE 必须为 0 或 1" "NODEPING_AGENT_ALLOW_DOWNGRADE must be 0 or 1"; exit 2 ;; esac
+case "$UPDATE_LOCK_WAIT_SECONDS" in ''|*[!0-9]*) say_err "更新锁等待时间必须为非负整数" "update lock wait must be a non-negative integer"; exit 2 ;; esac
 
 cd "$PROJECT_DIRECTORY"
+if ! acquire_update_lock; then
+	exit 75
+fi
+trap 'finalize_update_request || true; release_update_lock || true' EXIT
 set_dotenv_value NODEPING_AGENT_DOCKER_DATA_DIRECTORY "$DATA_DIRECTORY"
+set_dotenv_value NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY "$RUNTIME_DIRECTORY"
 
 ORIGINAL_IMAGE_VERSION="${NODEPING_AGENT_IMAGE_VERSION:-$(dotenv_value NODEPING_AGENT_IMAGE_VERSION)}"
 if ! consume_update_request; then
@@ -267,7 +387,7 @@ cleanup_compose_backup() {
 	fi
 }
 
-trap cleanup_compose_backup EXIT
+trap 'cleanup_compose_backup || true; finalize_update_request || true; release_update_lock || true' EXIT
 
 sync_default_compose() {
 	[ "$SYNC_DEPLOYMENT" = "1" ] || return 0
@@ -328,26 +448,55 @@ canonical_container_id() {
 }
 
 legacy_container_id() {
-	local id candidate_server
+	local id candidate_server expected_project
 	id="$(container_id)"
 	if [ -n "$id" ]; then
 		printf '%s' "$id"
 		return 0
 	fi
-	for id in $(docker ps -q --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
+	expected_project="$(expected_legacy_compose_project)"
+	for id in $(docker ps -q --filter "label=com.docker.compose.service=$SERVICE" --filter "label=com.docker.compose.project=$expected_project" 2>/dev/null || true); do
+		container_matches_compose_project "$id" "$expected_project" || continue
 		candidate_server="$(container_server_url "$id")"
 		if [ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ]; then
 			printf '%s' "$id"
 			return 0
 		fi
 	done
-	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
+	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" --filter "label=com.docker.compose.project=$expected_project" 2>/dev/null || true); do
+		container_matches_compose_project "$id" "$expected_project" || continue
 		candidate_server="$(container_server_url "$id")"
 		if [ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ]; then
 			printf '%s' "$id"
 			return 0
 		fi
 	done
+}
+
+expected_legacy_compose_project() {
+	local project
+	project="${COMPOSE_PROJECT_NAME:-$(dotenv_value COMPOSE_PROJECT_NAME)}"
+	project="${project:-nodeping-agent}"
+	if [[ ! "$project" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+		say_err "无法安全识别旧 Docker Compose 项目：$project" "could not safely identify the legacy Docker Compose project: $project"
+		return 1
+	fi
+	printf '%s' "$project"
+}
+
+container_compose_project() {
+	local id="$1"
+	docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$id" 2>/dev/null || true
+}
+
+container_compose_service() {
+	local id="$1"
+	docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$id" 2>/dev/null || true
+}
+
+container_matches_compose_project() {
+	local id="$1" project="$2"
+	[ "$(container_compose_project "$id")" = "$project" ] && [ "$(container_compose_service "$id")" = "$SERVICE" ]
 }
 
 container_server_url() {
@@ -357,7 +506,7 @@ container_server_url() {
 }
 
 normalize_data_directory_permissions() {
-	install -d -m 0700 "$DATA_DIRECTORY" || return 1
+	mkdir -p "$DATA_DIRECTORY" || return 1
 	chown 0:0 "$DATA_DIRECTORY" || return 1
 	chmod 0700 "$DATA_DIRECTORY" || return 1
 	local filename path
@@ -371,6 +520,27 @@ normalize_data_directory_permissions() {
 		chown 0:0 "$path" || return 1
 		chmod 0600 "$path" || return 1
 	done
+}
+
+normalize_runtime_directory_permissions() {
+	local marker="$RUNTIME_DIRECTORY/.nodeping-agent-docker-runtime" existing
+	if [ -e "$RUNTIME_DIRECTORY" ] && { [ ! -d "$RUNTIME_DIRECTORY" ] || [ -L "$RUNTIME_DIRECTORY" ]; }; then
+		say_err "Agent 运行路径不是普通目录：$RUNTIME_DIRECTORY" "Agent runtime path is not a regular directory: $RUNTIME_DIRECTORY"
+		return 1
+	fi
+	if [ -d "$RUNTIME_DIRECTORY" ] && { [ ! -f "$marker" ] || [ -L "$marker" ] || ! grep -Fqx "Managed by NodePing Docker installer" "$marker"; }; then
+		for existing in "$RUNTIME_DIRECTORY"/* "$RUNTIME_DIRECTORY"/.[!.]* "$RUNTIME_DIRECTORY"/..?*; do
+			if [ -e "$existing" ] || [ -L "$existing" ]; then
+				say_err "拒绝接管未标记的非空 Agent 运行目录：$RUNTIME_DIRECTORY" "refusing to take over an unmarked non-empty Agent runtime directory: $RUNTIME_DIRECTORY"
+				return 1
+			fi
+		done
+	fi
+	mkdir -p "$RUNTIME_DIRECTORY" || return 1
+	chown 0:0 "$RUNTIME_DIRECTORY" || return 1
+	chmod 0700 "$RUNTIME_DIRECTORY" || return 1
+	printf '%s\n' "Managed by NodePing Docker installer" > "$marker"
+	chmod 0600 "$marker"
 }
 
 data_directory_has_complete_identity() {
@@ -418,17 +588,23 @@ migrate_legacy_agent_state() {
 }
 
 cleanup_duplicate_agent_containers() {
-	local current_id="$1" current_canonical_id id candidate_canonical_id candidate_server removed=0
+	local current_id="$1" current_canonical_id current_project id candidate_canonical_id candidate_server removed=0
 	current_canonical_id="$(canonical_container_id "$current_id")"
 	if [ -z "$current_canonical_id" ]; then
 		say_err "无法确认当前 Agent 容器，已跳过重复容器清理" "could not identify the current Agent container; duplicate cleanup was skipped"
 		return 1
 	fi
-	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" 2>/dev/null || true); do
+	current_project="$(container_compose_project "$current_canonical_id")"
+	if [ -z "$current_project" ]; then
+		say_err "无法确认当前 Agent 的 Docker Compose 项目，已跳过重复容器清理" "could not identify the current Agent Docker Compose project; duplicate cleanup was skipped"
+		return 1
+	fi
+	for id in $(docker ps -aq --filter "label=com.docker.compose.service=$SERVICE" --filter "label=com.docker.compose.project=$current_project" 2>/dev/null || true); do
 		[ -n "$id" ] || continue
 		candidate_canonical_id="$(canonical_container_id "$id")"
 		[ -n "$candidate_canonical_id" ] || continue
 		[ "$candidate_canonical_id" != "$current_canonical_id" ] || continue
+		container_matches_compose_project "$candidate_canonical_id" "$current_project" || continue
 		candidate_server="$(container_server_url "$candidate_canonical_id")"
 		[ -n "$candidate_server" ] && [ "$candidate_server" = "${SERVER_URL%/}" ] || continue
 		if docker rm -f "$candidate_canonical_id" >/dev/null; then
@@ -443,7 +619,7 @@ cleanup_duplicate_agent_containers() {
 container_agent_version() {
 	local id="$1"
 	if [ -n "$id" ]; then
-		docker exec "$id" /usr/local/bin/nodeping-agent -version 2>/dev/null | sed -n 's/.*version=\([^ ]*\).*/nodeping-agent\/\1/p' | head -n 1 || true
+		docker exec "$id" /bin/sh -c 'binary=/opt/nodeping-agent/nodeping-agent; [ -x "$binary" ] || binary=/usr/local/lib/nodeping-agent/nodeping-agent; "$binary" -version' 2>/dev/null | sed -n 's/.*version=\([^ ]*\).*/nodeping-agent\/\1/p' | head -n 1 || true
 	fi
 }
 
@@ -464,7 +640,7 @@ container_is_ready() {
 	state="$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || true)"
 	case "$state" in
 		'true healthy') return 0 ;;
-		'true none') docker exec "$id" /usr/local/bin/nodeping-agent liveness >/dev/null 2>&1 ;;
+		'true none') docker exec "$id" /usr/local/lib/nodeping-agent/nodeping-agent liveness >/dev/null 2>&1 ;;
 		*) return 1 ;;
 	esac
 }
@@ -572,6 +748,9 @@ emit_upgrade_event() {
 }
 
 before_container="$(legacy_container_id)"
+if ! normalize_runtime_directory_permissions; then
+	exit 1
+fi
 if ! migrate_legacy_agent_state "$before_container"; then
 	say_err "Agent 身份状态迁移失败，已停止更新以避免创建重复节点" "Agent identity migration failed; update stopped to avoid creating a duplicate node"
 	exit 1
@@ -652,7 +831,11 @@ else
 fi
 
 expected_version="$TARGET_VERSION"
-if [ "$TARGET_TAG" = "latest" ]; then expected_version=""; fi
+if [ -x "$RUNTIME_DIRECTORY/nodeping-agent" ] && [ -n "$CURRENT_VERSION" ]; then
+	expected_version="$CURRENT_VERSION"
+elif [ "$TARGET_TAG" = "latest" ]; then
+	expected_version=""
+fi
 if ! NEW_VERSION="$(wait_container_ready "$expected_version")"; then
 	rollback_docker "updated container did not become stably ready with the requested version" || true
 	exit 1
@@ -686,3 +869,4 @@ fi
 
 say "Docker 部署已更新" "docker deployment updated"
 compose ps "$SERVICE"
+UPDATE_REQUEST_SUCCEEDED=1
