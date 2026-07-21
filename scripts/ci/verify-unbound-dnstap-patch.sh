@@ -261,6 +261,7 @@ cmake --install "${PROTOBUF_BUILD}"
     CXXFLAGS="-O2 -g0" \
     ./Configure \
     --prefix="${OPENSSL_LOGICAL_PREFIX}" \
+    --libdir=lib \
     --openssldir="${OPENSSL_LOGICAL_PREFIX}/ssl" \
     no-docs \
     no-module \
