@@ -15,6 +15,10 @@ UPDATE_LOCK_DIRECTORY="${NODEPING_AGENT_UPDATE_LOCK_DIRECTORY:-$(dirname "$INSTA
 SIGNING_PUBLIC_KEY="${NODEPING_AGENT_MINISIGN_PUBLIC_KEY:-}"
 REQUIRE_SIGNATURE="${NODEPING_AGENT_REQUIRE_SIGNATURE:-auto}"
 SIGNATURE_REQUIRED_FROM="${NODEPING_AGENT_SIGNATURE_REQUIRED_FROM:-}"
+MINISIGN_BIN="${NODEPING_AGENT_MINISIGN_BIN:-$(dirname "$INSTALL_PATH")/minisign}"
+# Upstream 0.12 Linux archive, verified against the public release key documented by jedisct1/minisign.
+MINISIGN_BOOTSTRAP_VERSION="0.12"
+MINISIGN_BOOTSTRAP_ARCHIVE_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
 DISTRIBUTION_MODE="${NODEPING_AGENT_DISTRIBUTION_MODE:-cn}"
 ALLOW_DOWNGRADE="${NODEPING_AGENT_ALLOW_DOWNGRADE:-0}"
 START_TIMEOUT_SECONDS="${NODEPING_AGENT_START_TIMEOUT_SECONDS:-20}"
@@ -358,10 +362,10 @@ clear_release_downloads() {
 download_verified_release_set() {
 	local release_base_url="$1" directory="$2" artifact="$3" checksums="$4" manifest="$5"
 	local release_version="$6" artifact_os="$7" artifact_arch="$8" signature_required="$9"
-	local source_id source_mode source_base source_query extra origin expected actual manifest_available signed_file
+	local source_id source_mode source_base source_query _extra origin expected actual manifest_available signed_file
 	local metadata_timeout artifact_timeout source_deadline proxy_deadline=$((SECONDS + 300))
 	RELEASE_MANIFEST_AVAILABLE=0
-	while IFS=$'\t' read -r source_id source_mode source_base source_query extra || [ -n "${source_id:-}" ]; do
+	while IFS=$'\t' read -r source_id source_mode source_base source_query _extra || [ -n "${source_id:-}" ]; do
 		[ -n "${source_id:-}" ] || continue
 		if [ "$source_mode" = "direct" ]; then
 			[ "$source_id" = "direct" ] || continue
@@ -517,22 +521,92 @@ cleanup_and_report_failure() {
 verify_signature() {
 	local artifact_path="$1"
 	local signature_path="$2"
+	local verifier
 	if [ -z "$SIGNING_PUBLIC_KEY" ]; then
 		say_err "签名校验需要 NODEPING_AGENT_MINISIGN_PUBLIC_KEY" "signature verification requires NODEPING_AGENT_MINISIGN_PUBLIC_KEY"
 		return 1
 	fi
-	if ! command -v minisign >/dev/null 2>&1; then
-		say_err "配置 NODEPING_AGENT_MINISIGN_PUBLIC_KEY 时需要安装 minisign" "minisign is required when NODEPING_AGENT_MINISIGN_PUBLIC_KEY is configured"
+	if ! verifier="$(find_minisign)"; then
+		say_err "找不到可用的 minisign 验证器" "no usable minisign verifier was found"
 		return 1
 	fi
-	minisign -Vm "$artifact_path" -x "$signature_path" -P "$SIGNING_PUBLIC_KEY"
+	"$verifier" -Vm "$artifact_path" -x "$signature_path" -P "$SIGNING_PUBLIC_KEY"
 }
 
-ensure_minisign() {
-	if command -v minisign >/dev/null 2>&1; then
-		return 0
+find_minisign() {
+	local candidate
+	if [ -x "$MINISIGN_BIN" ] && [ ! -d "$MINISIGN_BIN" ]; then
+		candidate="$MINISIGN_BIN"
+	elif command -v minisign >/dev/null 2>&1; then
+		candidate="$(command -v minisign)"
+	else
+		return 1
 	fi
-	say "签名校验需要 minisign，正在尝试通过系统包管理器安装" "minisign is required for signature verification; attempting installation through the system package manager"
+	"$candidate" -v >/dev/null 2>&1 || return 1
+	printf '%s\n' "$candidate"
+}
+
+download_bootstrap_minisign() {
+	local directory="$1"
+	local destination="$directory/minisign-${MINISIGN_BOOTSTRAP_VERSION}-linux.tar.gz"
+	local origin="https://github.com/jedisct1/minisign/releases/download/${MINISIGN_BOOTSTRAP_VERSION}/minisign-${MINISIGN_BOOTSTRAP_VERSION}-linux.tar.gz"
+	local source_id source_mode source_base source_query _extra actual timeout_seconds source_deadline
+	local proxy_deadline=$((SECONDS + 120))
+	while IFS=$'\t' read -r source_id source_mode source_base source_query _extra || [ -n "${source_id:-}" ]; do
+		[ -n "${source_id:-}" ] || continue
+		if [ "$source_mode" = "direct" ]; then
+			timeout_seconds=30
+			source_deadline=0
+		else
+			[[ "$source_id" =~ ^[0-9]+$ ]] || continue
+			[ "$SECONDS" -lt "$proxy_deadline" ] || continue
+			timeout_seconds=20
+			source_deadline="$proxy_deadline"
+		fi
+		if download_release_source_file "$source_mode" "$source_base" "$source_query" "$origin" "$destination" "$timeout_seconds" "$source_deadline"; then
+			actual="$(sha256_value "$destination")"
+			if [ "$actual" = "$MINISIGN_BOOTSTRAP_ARCHIVE_SHA256" ]; then
+				return 0
+			fi
+		fi
+	done < <(release_download_sources)
+	rm -f "$destination"
+	return 1
+}
+
+install_bootstrap_minisign() {
+	local directory="$1"
+	local upstream_arch member expected_binary_sha256 archive extracted target_tmp actual
+	case "$(uname -m)" in
+		x86_64|amd64)
+			upstream_arch="x86_64"
+			expected_binary_sha256="2c74dffcc1c9a5ee55957c60971998ace2b89f22585631594ec2152c588af8db"
+			;;
+		aarch64|arm64)
+			upstream_arch="aarch64"
+			expected_binary_sha256="cec9f88be8c975af76854a53b4d49c3d257feae38d916edb0d16fb55aacd3000"
+			;;
+		*) return 1 ;;
+	esac
+	say "本机未安装 minisign，正在获取经过固定哈希校验的官方验证器" "minisign is not installed; fetching the official verifier protected by pinned hashes"
+	download_bootstrap_minisign "$directory" || return 1
+	archive="$directory/minisign-${MINISIGN_BOOTSTRAP_VERSION}-linux.tar.gz"
+	member="minisign-linux/$upstream_arch/minisign"
+	extracted="$directory/minisign-${MINISIGN_BOOTSTRAP_VERSION}-$upstream_arch"
+	tar -xOzf "$archive" "$member" > "$extracted" || return 1
+	actual="$(sha256_value "$extracted")"
+	[ "$actual" = "$expected_binary_sha256" ] || return 1
+	chmod 0755 "$extracted"
+	"$extracted" -v >/dev/null 2>&1 || return 1
+	install -d -m 0755 "$(dirname "$MINISIGN_BIN")"
+	target_tmp="${MINISIGN_BIN}.new.$$"
+	install -m 0755 "$extracted" "$target_tmp"
+	"$target_tmp" -v >/dev/null 2>&1 || { rm -f "$target_tmp"; return 1; }
+	mv -f "$target_tmp" "$MINISIGN_BIN"
+	say "已安装 NodePing 管理的 minisign 验证器" "installed the NodePing-managed minisign verifier"
+}
+
+install_minisign_package() {
 	if command -v apt-get >/dev/null 2>&1; then
 		DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y minisign || true
 	elif command -v dnf >/dev/null 2>&1; then
@@ -544,10 +618,22 @@ ensure_minisign() {
 	elif command -v pacman >/dev/null 2>&1; then
 		pacman -S --noconfirm --needed minisign || true
 	fi
-	if command -v minisign >/dev/null 2>&1; then
+}
+
+ensure_minisign() {
+	local directory="$1"
+	if find_minisign >/dev/null; then
 		return 0
 	fi
-	say_err "无法自动安装 minisign；请先用系统包管理器安装后重试" "failed to install minisign automatically; install it with the system package manager and retry"
+	if install_bootstrap_minisign "$directory" && find_minisign >/dev/null; then
+		return 0
+	fi
+	say "无法使用固定哈希的静态验证器，正在尝试系统包管理器" "the pinned static verifier is unavailable; trying the system package manager"
+	install_minisign_package
+	if find_minisign >/dev/null; then
+		return 0
+	fi
+	say_err "无法准备 minisign 验证器；发布签名校验未降级" "failed to prepare a minisign verifier; release signature verification was not downgraded"
 	return 1
 }
 
@@ -997,7 +1083,7 @@ if [ "$SIGNATURE_REQUIRED" = "1" ] && [ -z "$SIGNING_PUBLIC_KEY" ]; then
 fi
 if [ "$SIGNATURE_REQUIRED" = "1" ]; then
 	UPGRADE_STEP="enforcing release signatures for $version"
-	ensure_minisign || exit 1
+	ensure_minisign "$tmp_dir" || exit 1
 fi
 
 TARGET_VERSION="nodeping-agent/$version"

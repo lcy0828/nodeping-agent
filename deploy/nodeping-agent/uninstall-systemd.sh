@@ -41,7 +41,7 @@ for unit in \
 	rm -f "/etc/systemd/system/$unit"
 done
 
-rm -f "$INSTALL_BIN" "$INSTALL_BIN.previous" "$UPDATE_BIN" "$DOCKER_UPDATE_BIN"
+rm -f "$INSTALL_BIN" "$INSTALL_BIN.previous" "$UPDATE_BIN" "$DOCKER_UPDATE_BIN" "$INSTALL_DIR/minisign"
 rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true
 systemctl daemon-reload
 

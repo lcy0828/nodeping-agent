@@ -154,7 +154,7 @@ sudo systemctl enable --now nodeping-agent-update.timer
 
 升级前会备份当前二进制到 `/opt/nodeping-agent/nodeping-agent.previous`。如果新版本安装后 systemd 服务没有在超时时间内恢复 active，脚本会自动回滚上一版并重启。
 
-可选 minisign 签名校验：
+可选 minisign 签名校验（Linux amd64/arm64 无需预装 `minisign`，安装器会下载并校验固定版本的官方静态验证器）：
 
 ```bash
 NODEPING_AGENT_MINISIGN_PUBLIC_KEY='RWQ...' \
