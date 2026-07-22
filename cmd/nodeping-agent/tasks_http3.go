@@ -175,7 +175,7 @@ func runHTTP3RequestWithResolver(ctx context.Context, method string, target stri
 	client := &http.Client{
 		Transport:     transport,
 		Timeout:       deadlineTimeout(ctx, 10*time.Second),
-		CheckRedirect: safeHTTPRedirectPolicy(resolver.allowPrivate),
+		CheckRedirect: safeHTTPRedirectPolicy(httpRedirectPolicy{allowPrivate: resolver.allowPrivate}),
 	}
 	started := time.Now()
 	resp, err := client.Do(req)

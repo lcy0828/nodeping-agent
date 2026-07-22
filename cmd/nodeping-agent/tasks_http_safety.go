@@ -14,6 +14,11 @@ import (
 
 var errUnsafeHTTPDestination = errUnsafeProbeDestination
 
+type httpRedirectPolicy struct {
+	allowPrivate        bool
+	allowHTTPSDowngrade bool
+}
+
 func safeHTTPTransport(ctx context.Context, originalHost string, allowPrivate bool) *http.Transport {
 	resolver := &probeTargetResolver{allowPrivate: allowPrivate, cache: make(map[string]netip.Addr)}
 	return safeHTTPTransportWithResolver(originalHost, resolver)
@@ -47,13 +52,13 @@ func safeDialContext(ctx context.Context, network string, address string, allowP
 	return resolver.dialContext(ctx, network, address)
 }
 
-func safeHTTPRedirectPolicy(allowPrivate bool) func(*http.Request, []*http.Request) error {
+func safeHTTPRedirectPolicy(policy httpRedirectPolicy) func(*http.Request, []*http.Request) error {
 	return func(req *http.Request, via []*http.Request) error {
-		return checkSafeHTTPRedirect(req, via, allowPrivate)
+		return checkSafeHTTPRedirect(req, via, policy)
 	}
 }
 
-func checkSafeHTTPRedirect(req *http.Request, via []*http.Request, allowPrivate bool) error {
+func checkSafeHTTPRedirect(req *http.Request, via []*http.Request, policy httpRedirectPolicy) error {
 	if len(via) >= 5 {
 		return errors.New("stopped after 5 redirects")
 	}
@@ -65,7 +70,7 @@ func checkSafeHTTPRedirect(req *http.Request, via []*http.Request, allowPrivate 
 		return errors.New("redirect target must use http or https")
 	}
 	if len(via) > 0 && via[len(via)-1] != nil && via[len(via)-1].URL != nil &&
-		strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && scheme == "http" {
+		strings.EqualFold(via[len(via)-1].URL.Scheme, "https") && scheme == "http" && !policy.allowHTTPSDowngrade {
 		return errors.New("HTTPS redirect downgrade is not allowed")
 	}
 	for _, header := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
@@ -78,7 +83,7 @@ func checkSafeHTTPRedirect(req *http.Request, via []*http.Request, allowPrivate 
 	if _, err := validateProbePort(defaultURLPort(req.URL)); err != nil {
 		return err
 	}
-	if allowPrivate {
+	if policy.allowPrivate {
 		return nil
 	}
 	if strings.EqualFold(host, "localhost") {
