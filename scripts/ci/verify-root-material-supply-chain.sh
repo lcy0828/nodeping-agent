@@ -7,7 +7,7 @@ export TZ=UTC
 umask 077
 
 readonly ROOT_HINTS_URL="https://www.internic.net/domain/named.root"
-readonly ROOT_HINTS_SHA256="cfc5bdedab77e5ad0af9250db1bd701af79cb361a0e150721f468d524eb557fd"
+readonly ROOT_HINTS_SHA256="34414163f8bf6ec5b2bbc66f75c48fb40031b54a38bd8a9b6a5b4dcc45b28e66"
 readonly ROOT_ANCHORS_URL="https://data.iana.org/root-anchors/root-anchors.xml"
 readonly ROOT_ANCHORS_SHA256="3ccaab38830025ee0a0f6c1f25769427544f81ea2865aa860468f3ef5278b908"
 readonly ROOT_ANCHORS_SIGNATURE_URL="https://data.iana.org/root-anchors/root-anchors.p7s"
