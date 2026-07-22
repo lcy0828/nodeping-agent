@@ -15,7 +15,7 @@ import (
 func deadlineTimeout(ctx context.Context, fallback time.Duration) time.Duration {
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
-		if remaining > 0 {
+		if remaining > 0 && (fallback <= 0 || remaining < fallback) {
 			return remaining
 		}
 	}
