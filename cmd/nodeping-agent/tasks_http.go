@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/netip"
@@ -47,25 +48,32 @@ func runHTTPRequestWithResponsePolicy(ctx context.Context, method string, target
 		method = http.MethodGet
 	}
 	target = strings.TrimSpace(target)
-	if _, err := validateHTTPProbeURL(target, false); err != nil {
-		return 0, "", nil, err
-	}
-	trace := &httpTimingTrace{}
-	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace.clientTrace()), method, target, strings.NewReader(body))
+	parsedTarget, err := validateHTTPProbeURL(target, false)
 	if err != nil {
 		return 0, "", nil, err
 	}
+	if resolver == nil {
+		resolver = newProbeTargetResolver(options)
+	}
 	originalHost := originalHostOption(options)
+	if originalHost != "" {
+		parsedTarget, err = composeHTTPProbeTarget(ctx, parsedTarget, originalHost, resolver)
+		if err != nil {
+			return 0, "", nil, err
+		}
+	}
+	trace := &httpTimingTrace{}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace.clientTrace()), method, parsedTarget.String(), strings.NewReader(body))
+	if err != nil {
+		return 0, "", nil, err
+	}
 	if originalHost != "" {
 		req.Host = originalHost
 	}
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
-	if resolver == nil {
-		resolver = newProbeTargetResolver(options)
-	}
-	transport := safeHTTPTransportWithResolver(originalHost, resolver)
+	transport := safeHTTPTransportWithResolver("", resolver)
 	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Timeout:   deadlineTimeout(ctx, 10*time.Second),
@@ -142,6 +150,38 @@ func runHTTPRequestWithResponsePolicy(ctx context.Context, method string, target
 		result["body_bytes"] = maxBodyBytes
 	}
 	return latency, responseIP, result, nil
+}
+
+func composeHTTPProbeTarget(ctx context.Context, target *url.URL, originalHost string, resolver *probeTargetResolver) (*url.URL, error) {
+	if target == nil {
+		return nil, errors.New("HTTP target URL is invalid")
+	}
+	if resolver == nil {
+		return nil, errors.New("HTTP target resolver is required")
+	}
+	host, err := validateProbeHost(strings.Trim(originalHost, "[]"))
+	if err != nil {
+		return nil, err
+	}
+	if strings.EqualFold(strings.TrimSuffix(target.Hostname(), "."), strings.TrimSuffix(host, ".")) {
+		return target, nil
+	}
+	connectIP, err := resolver.resolveHost(ctx, target.Hostname())
+	if err != nil {
+		return nil, err
+	}
+	if err := resolver.pinHost(host, connectIP); err != nil {
+		return nil, err
+	}
+
+	composed := *target
+	composed.Host = host
+	if port := target.Port(); port != "" {
+		composed.Host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		composed.Host = "[" + host + "]"
+	}
+	return &composed, nil
 }
 
 func extractPublicIPsFromHTTPBody(body []byte) []string {

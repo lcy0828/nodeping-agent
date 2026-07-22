@@ -117,6 +117,39 @@ func trustedPrivateTargetTask(options map[string]any) bool {
 		strings.EqualFold(strings.TrimSpace(stringOptionAny(options, "health_check_kind")), "service_http")
 }
 
+func (r *probeTargetResolver) pinHost(host string, addr netip.Addr) error {
+	if r == nil {
+		return errors.New("probe target resolver is required")
+	}
+	if r.familyErr != nil {
+		return r.familyErr
+	}
+	validatedHost, err := validateProbeHost(host)
+	if err != nil {
+		return err
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() {
+		return errors.New("probe target address is invalid")
+	}
+	if r.family != probeIPFamilyAny && probeIPFamilyForAddr(addr) != r.family {
+		return fmt.Errorf("%w: target %q is %s but the task requires %s", errProbeIPFamilyMismatch, host, probeIPFamilyForAddr(addr).displayName(), r.family.displayName())
+	}
+	normalizedHost := strings.ToLower(strings.TrimSuffix(validatedHost, "."))
+	if !r.allowPrivate && (strings.EqualFold(normalizedHost, "localhost") || !isPublicProbeAddr(addr)) {
+		return errUnsafeProbeDestination
+	}
+
+	cacheKey := r.family.String() + "\x00" + normalizedHost
+	r.mu.Lock()
+	if r.cache == nil {
+		r.cache = make(map[string]netip.Addr)
+	}
+	r.cache[cacheKey] = addr
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *probeTargetResolver) resolveHost(ctx context.Context, host string) (netip.Addr, error) {
 	if r.familyErr != nil {
 		return netip.Addr{}, r.familyErr
