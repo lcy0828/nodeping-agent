@@ -6,6 +6,8 @@ BACKUP_PATH="${NODEPING_AGENT_BACKUP_PATH:-/opt/nodeping-agent/nodeping-agent.pr
 FALLBACK_PATH="${NODEPING_AGENT_FALLBACK_PATH:-/usr/local/lib/nodeping-agent/nodeping-agent}"
 ACTIVATION_FILE="${NODEPING_AGENT_ACTIVATION_FILE:-/var/lib/nodeping-agent/updates/activation.pending}"
 STABLE_SECONDS="${NODEPING_AGENT_ACTIVATION_STABLE_SECONDS:-20}"
+UPGRADE_SCRIPT="${NODEPING_AGENT_UPGRADE_SCRIPT:-/usr/local/bin/nodeping-agent-update}"
+PROMOTE_LEGACY_DOCKER_UPGRADE="${NODEPING_AGENT_PROMOTE_LEGACY_DOCKER_UPGRADE:-false}"
 
 case "$STABLE_SECONDS" in
 	''|*[!0-9]*|0) STABLE_SECONDS=20 ;;
@@ -13,6 +15,24 @@ esac
 
 mkdir -p "$(dirname "$ACTIVE_PATH")" "$(dirname "$ACTIVATION_FILE")"
 chmod 0700 "$(dirname "$ACTIVE_PATH")" "$(dirname "$ACTIVATION_FILE")" 2>/dev/null || true
+
+promote_legacy_docker_upgrade_mode() {
+	case "$PROMOTE_LEGACY_DOCKER_UPGRADE" in
+		1|true) ;;
+		*) return ;;
+	esac
+	[ "${NODEPING_INSTALL_MODE:-}" = "docker" ] || return
+	case "${NODEPING_AGENT_UPGRADE_MODE:-}" in
+		request_file|request-file|path) ;;
+		*) return ;;
+	esac
+	[ -x "$UPGRADE_SCRIPT" ] || return
+	NODEPING_AGENT_UPGRADE_MODE=container
+	export NODEPING_AGENT_UPGRADE_MODE
+	printf '%s\n' "promoted legacy Docker request-file upgrades to the container updater" >&2
+}
+
+promote_legacy_docker_upgrade_mode
 
 binary_version() {
 	"$1" -version 2>/dev/null | sed -n 's/.*version=\([^ ]*\).*/nodeping-agent\/\1/p' | head -n 1
@@ -95,7 +115,6 @@ while :; do
 	stable_pid=$!
 
 	wait "$child_pid"
-	status=$?
 	kill "$stable_pid" 2>/dev/null || true
 	wait "$stable_pid" 2>/dev/null || true
 	stable_pid=""

@@ -40,7 +40,8 @@ COPY deploy/nodeping-agent/container-entrypoint.sh /usr/local/bin/nodeping-agent
 RUN chmod 0755 \
     /usr/local/lib/nodeping-agent/nodeping-agent \
     /usr/local/bin/nodeping-agent-update \
-    /usr/local/bin/nodeping-agent-entrypoint
+    /usr/local/bin/nodeping-agent-entrypoint \
+    && ln -s /usr/local/lib/nodeping-agent/nodeping-agent /usr/local/bin/nodeping-agent
 
 ENV NODEPING_AGENT_TOKEN_FILE=/var/lib/nodeping-agent/agent-token
 ENV NODEPING_INSTALL_MODE=docker

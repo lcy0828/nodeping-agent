@@ -4,10 +4,27 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Annotated Agent release tag to publish
+        required: true
+        type: string
+      confirm_incompatible_upgrade:
+        description: Exact incompatible-upgrade confirmation required by the compatibility gate
+        required: false
+        type: string
 
 permissions:
   contents: write
   packages: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+
+concurrency:
+  group: agent-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -16,6 +33,19 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify agent release tag
+        run: ./scripts/release-tag.sh verify agent "$RELEASE_TAG"
+
+      - name: Enforce previous-version upgrade compatibility
+        env:
+          NODEPING_AGENT_RELEASE_TRIGGER: ${{ github.event_name }}
+          NODEPING_AGENT_RELEASE_ACTOR: ${{ github.actor }}
+          NODEPING_AGENT_INCOMPATIBLE_CONFIRMATION: ${{ inputs.confirm_incompatible_upgrade }}
+        run: ./scripts/agent-upgrade-compatibility.sh gate "$RELEASE_TAG"
 
       - name: Lint workflows and shell scripts
         run: ./scripts/ci/lint-agent-workflows.sh
@@ -25,6 +55,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Test Agent upgrade and Docker supervisor behavior
+        run: go test -count=1 ./cmd/nodeping-agent ./deploy/nodeping-agent
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Verify previous-version Docker image probes
+        run: ./scripts/ci/test-agent-image-compatibility.sh "$RELEASE_TAG"
 
       - name: Install native supply-chain dependencies
         run: |
@@ -80,12 +119,12 @@ jobs:
 
       - name: Build release artifacts
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.RELEASE_TAG }}
         run: ./scripts/build-nodeping-agent.sh
 
       - name: Sign release artifacts
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.RELEASE_TAG }}
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
         run: |
           test -n "$MINISIGN_SECRET_KEY"
@@ -107,13 +146,14 @@ jobs:
       - name: Upload GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
-            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_*.tar.gz
-            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_*.tar.gz.minisig
-            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_checksums.txt
-            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_checksums.txt.minisig
-            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_manifest.json
-            dist/nodeping-agent/${{ github.ref_name }}/nodeping-agent_${{ github.ref_name }}_manifest.json.minisig
+            dist/nodeping-agent/${{ env.RELEASE_TAG }}/nodeping-agent_${{ env.RELEASE_TAG }}_*.tar.gz
+            dist/nodeping-agent/${{ env.RELEASE_TAG }}/nodeping-agent_${{ env.RELEASE_TAG }}_*.tar.gz.minisig
+            dist/nodeping-agent/${{ env.RELEASE_TAG }}/nodeping-agent_${{ env.RELEASE_TAG }}_checksums.txt
+            dist/nodeping-agent/${{ env.RELEASE_TAG }}/nodeping-agent_${{ env.RELEASE_TAG }}_checksums.txt.minisig
+            dist/nodeping-agent/${{ env.RELEASE_TAG }}/nodeping-agent_${{ env.RELEASE_TAG }}_manifest.json
+            dist/nodeping-agent/${{ env.RELEASE_TAG }}/nodeping-agent_${{ env.RELEASE_TAG }}_manifest.json.minisig
           generate_release_notes: true
 
       - name: Prune non-release assets
@@ -122,7 +162,7 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const tag = context.ref.replace('refs/tags/', '');
+            const tag = process.env.RELEASE_TAG;
             const release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
             const keep = new RegExp(`^nodeping-agent_${tag}_(?:.+\\.tar\\.gz|checksums\\.txt|manifest\\.json)(?:\\.minisig)?$`);
             for (const asset of release.data.assets) {
@@ -139,9 +179,6 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -151,7 +188,7 @@ jobs:
 
       - name: Build and push Docker image
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.RELEASE_TAG }}
           IMAGE: ghcr.io/lcy0828/nodeping-agent
           PUSH: "1"
           PLATFORMS: linux/amd64,linux/arm64

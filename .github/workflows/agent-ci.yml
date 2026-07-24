@@ -16,9 +16,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Lint workflows and shell scripts
         run: ./scripts/ci/lint-agent-workflows.sh
+
+      - name: Verify release and upgrade compatibility policies
+        run: |
+          ./scripts/release-tag_test.sh
+          ./scripts/agent-upgrade-compatibility_test.sh
+          ./scripts/agent-upgrade-compatibility.sh lint
 
   native-dns:
     name: Native DNS (${{ matrix.target }})
@@ -43,6 +51,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -135,6 +145,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -166,4 +178,12 @@ jobs:
 
       - name: Build Docker image
         run: |
-          VERSION=ci-${GITHUB_SHA::7} IMAGE=ghcr.io/lcy0828/nodeping-agent ./scripts/build-nodeping-agent-image.sh
+          version="ci-${GITHUB_SHA::7}"
+          image="ghcr.io/lcy0828/nodeping-agent:${version}"
+          VERSION="$version" \
+            IMAGE=ghcr.io/lcy0828/nodeping-agent \
+            NO_LATEST=1 \
+            ./scripts/build-nodeping-agent-image.sh
+          NODEPING_AGENT_COMPATIBILITY_IMAGE="$image" \
+            NODEPING_AGENT_COMPATIBILITY_SKIP_BUILD=1 \
+            ./scripts/ci/test-agent-image-compatibility.sh latest "$version"

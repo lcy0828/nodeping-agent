@@ -191,6 +191,7 @@ func TestComposeUsesRestrictedRootForRawSockets(t *testing.T) {
 		"healthcheck:",
 		"test: [CMD, /usr/local/lib/nodeping-agent/nodeping-agent, liveness]",
 		"NODEPING_AGENT_UPGRADE_MODE: ${NODEPING_AGENT_UPGRADE_MODE:-container}",
+		"NODEPING_AGENT_PROMOTE_LEGACY_DOCKER_UPGRADE: ${NODEPING_AGENT_PROMOTE_LEGACY_DOCKER_UPGRADE:-true}",
 		"NODEPING_AGENT_UPGRADE_SCRIPT: /usr/local/bin/nodeping-agent-update",
 		"NODEPING_AGENT_INSTALL_PATH: /opt/nodeping-agent/nodeping-agent",
 		"NODEPING_AGENT_ACTIVATION_FILE: /var/lib/nodeping-agent/updates/activation.pending",
@@ -229,6 +230,7 @@ func TestInstallDockerConfiguresInContainerUpgrade(t *testing.T) {
 		"NODEPING_AGENT_DOCKER_DATA_DIRECTORY=\"%s\"",
 		"NODEPING_AGENT_DOCKER_RUNTIME_DIRECTORY=\"%s\"",
 		"NODEPING_AGENT_UPGRADE_MODE=\"container\"",
+		"NODEPING_AGENT_PROMOTE_LEGACY_DOCKER_UPGRADE=\"true\"",
 		"in-container Agent updater",
 	} {
 		if !strings.Contains(text, required) {
@@ -693,6 +695,104 @@ func TestContainerEntrypointRollsBackFailedCandidate(t *testing.T) {
 	if err != nil || !strings.Contains(string(output), "v1.0.0") {
 		t.Fatalf("active binary was not rolled back: %v %s", err, output)
 	}
+}
+
+func TestContainerEntrypointPromotesLegacyDockerUpgradeMode(t *testing.T) {
+	directory := t.TempDir()
+	runtimeDirectory := filepath.Join(directory, "runtime")
+	stateDirectory := filepath.Join(directory, "state")
+	if err := os.MkdirAll(runtimeDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fallbackPath := filepath.Join(runtimeDirectory, "fallback")
+	upgradeScript := filepath.Join(runtimeDirectory, "update")
+	activationPath := filepath.Join(stateDirectory, "activation.pending")
+	logPath := filepath.Join(directory, "mode.log")
+	writeExecutable(t, fallbackPath, "#!/bin/sh\nif [ \"${1:-}\" = -version ]; then echo 'nodeping-agent version=v0.1.0'; exit 0; fi\nprintf '%s\\n' \"${NODEPING_AGENT_UPGRADE_MODE:-}\" > \"$SUPERVISOR_LOG\"\ntrap 'exit 0' TERM INT HUP\nwhile :; do sleep 1; done\n")
+	writeExecutable(t, upgradeScript, "#!/bin/sh\nexit 0\n")
+
+	command := exec.Command("sh", "container-entrypoint.sh")
+	command.Env = append(os.Environ(),
+		"NODEPING_INSTALL_MODE=docker",
+		"NODEPING_AGENT_UPGRADE_MODE=request_file",
+		"NODEPING_AGENT_PROMOTE_LEGACY_DOCKER_UPGRADE=true",
+		"NODEPING_AGENT_UPGRADE_SCRIPT="+upgradeScript,
+		"NODEPING_AGENT_INSTALL_PATH="+filepath.Join(runtimeDirectory, "nodeping-agent"),
+		"NODEPING_AGENT_BACKUP_PATH="+filepath.Join(runtimeDirectory, "nodeping-agent.previous"),
+		"NODEPING_AGENT_FALLBACK_PATH="+fallbackPath,
+		"NODEPING_AGENT_ACTIVATION_FILE="+activationPath,
+		"NODEPING_AGENT_ACTIVATION_STABLE_SECONDS=5",
+		"SUPERVISOR_LOG="+logPath,
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.Process != nil {
+			_ = command.Process.Signal(os.Interrupt)
+			_, _ = command.Process.Wait()
+		}
+	})
+	waitForFileText(t, logPath, "container", 5*time.Second)
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("entrypoint did not stop cleanly: %v", err)
+	}
+	command.Process = nil
+}
+
+func TestContainerEntrypointDoesNotPromoteWithoutBridgeFlag(t *testing.T) {
+	directory := t.TempDir()
+	runtimeDirectory := filepath.Join(directory, "runtime")
+	stateDirectory := filepath.Join(directory, "state")
+	if err := os.MkdirAll(runtimeDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fallbackPath := filepath.Join(runtimeDirectory, "fallback")
+	upgradeScript := filepath.Join(runtimeDirectory, "update")
+	activationPath := filepath.Join(stateDirectory, "activation.pending")
+	logPath := filepath.Join(directory, "mode.log")
+	writeExecutable(t, fallbackPath, "#!/bin/sh\nif [ \"${1:-}\" = -version ]; then echo 'nodeping-agent version=v0.1.0'; exit 0; fi\nprintf '%s\\n' \"${NODEPING_AGENT_UPGRADE_MODE:-}\" > \"$SUPERVISOR_LOG\"\ntrap 'exit 0' TERM INT HUP\nwhile :; do sleep 1; done\n")
+	writeExecutable(t, upgradeScript, "#!/bin/sh\nexit 0\n")
+
+	command := exec.Command("sh", "container-entrypoint.sh")
+	command.Env = append(os.Environ(),
+		"NODEPING_INSTALL_MODE=docker",
+		"NODEPING_AGENT_UPGRADE_MODE=request_file",
+		"NODEPING_AGENT_PROMOTE_LEGACY_DOCKER_UPGRADE=false",
+		"NODEPING_AGENT_UPGRADE_SCRIPT="+upgradeScript,
+		"NODEPING_AGENT_INSTALL_PATH="+filepath.Join(runtimeDirectory, "nodeping-agent"),
+		"NODEPING_AGENT_BACKUP_PATH="+filepath.Join(runtimeDirectory, "nodeping-agent.previous"),
+		"NODEPING_AGENT_FALLBACK_PATH="+fallbackPath,
+		"NODEPING_AGENT_ACTIVATION_FILE="+activationPath,
+		"NODEPING_AGENT_ACTIVATION_STABLE_SECONDS=5",
+		"SUPERVISOR_LOG="+logPath,
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if command.Process != nil {
+			_ = command.Process.Signal(os.Interrupt)
+			_, _ = command.Process.Wait()
+		}
+	})
+	waitForFileText(t, logPath, "request_file", 5*time.Second)
+	if err := command.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err != nil {
+		t.Fatalf("entrypoint did not stop cleanly: %v", err)
+	}
+	command.Process = nil
 }
 
 func TestContainerEntrypointRollsBackInvalidCandidateBeforeFallback(t *testing.T) {

@@ -143,12 +143,18 @@ fi
 cd "${REPOSITORY_ROOT}"
 "${ACTIONLINT_BINARY}" -no-color -shellcheck="${SHELLCHECK_BINARY}"
 for script_path in \
+  scripts/agent-upgrade-compatibility.sh \
+  scripts/agent-upgrade-compatibility_test.sh \
+  scripts/release-tag.sh \
+  scripts/release-tag_test.sh \
   scripts/ci/lint-agent-workflows.sh \
+  scripts/ci/test-agent-image-compatibility.sh \
   scripts/ci/verify-unbound-dnstap-patch.sh \
   scripts/ci/verify-unbound-dnstap-reproducible.sh \
   scripts/ci/verify-unbound-helper-metadata.sh \
   scripts/ci/verify-root-material-supply-chain.sh \
-  scripts/ci/verify-unbound-source-provenance.sh; do
+  scripts/ci/verify-unbound-source-provenance.sh \
+  deploy/nodeping-agent/container-entrypoint.sh; do
   "${SHELLCHECK_BINARY}" -x "${script_path}"
 done
 
